@@ -233,24 +233,28 @@ class DeepVQE(nn.Module):
 
 
 if __name__ == "__main__":
-    model = DeepVQE().eval()
-    x = torch.randn(1, 257, 63, 2)
+    print(torch.cuda.is_available())
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    model = DeepVQE().eval().to(device)
+
+    x = torch.randn(1, 257, 63, 2, device=device)
     _ = model(x)
 
-    x = torch.randn(2, 257, 63, 2)
+    x = torch.randn(2, 257, 63, 2, device=device)
     y = model(x)
     assert y.shape == x.shape
 
-    ab = AlignBlock(32, 32, delay=5)
-    mic = torch.randn(2, 32, 10, 17)
-    ref = torch.randn(2, 32, 10, 17)
+    ab = AlignBlock(32, 32, delay=5).to(device)
+    mic = torch.randn(2, 32, 10, 17, device=device)
+    ref = torch.randn(2, 32, 10, 17, device=device)
     out = ab(mic, ref)
     assert out.shape == (2, 32, 10, 17)
 
-    ab = AlignBlock(32, 16, delay=5)
-    out = ab(mic, ref)
-    assert out.shape == (2, 16, 10, 17)
-
+    ab2 = AlignBlock(32, 16, delay=5).to(device)
+    out2 = ab2(mic, ref)
+    assert out2.shape == (2, 16, 10, 17)
 
     from ptflops import get_model_complexity_info
 
@@ -260,9 +264,9 @@ if __name__ == "__main__":
     print(flops, params)
 
     # Causality check
-    a = torch.randn(1, 257, 100, 2)
-    b = torch.randn(1, 257, 100, 2)
-    c = torch.randn(1, 257, 100, 2)
+    a = torch.randn(1, 257, 100, 2, device=device)
+    b = torch.randn(1, 257, 100, 2, device=device)
+    c = torch.randn(1, 257, 100, 2, device=device)
     x1 = torch.cat([a, b], dim=2)
     x2 = torch.cat([a, c], dim=2)
     y1 = model(x1)

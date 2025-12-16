@@ -11,7 +11,11 @@ dependencies = [
     "onnxruntime==1.19.2",
     "onnxsim==0.4.36",
     "ptflops==0.7.3",
+    "soundfile>=0.13.1",
     "torch==2.9.1",
 ]
 
 [tool.uv]
+
+[tool.uv.sources]
+torch = { path = "torch-2.9.1+cu130-cp311-cp311-win_amd64.whl" }
