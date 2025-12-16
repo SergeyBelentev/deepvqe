@@ -194,11 +194,17 @@ class DeepVQE(nn.Module):
     Two-input DeepVQE for ref-conditioned cancellation:
       mic: (B,F,T,2)
       ref: (B,F,T,2)
-      out: (B,F,T,2)  # enhanced mic STFT => dub-only
+      out: (B,F,T,2)
     """
 
-    def __init__(self, delay_frames: int = 80, align_hidden: int = 64) -> None:
+    def __init__(
+        self,
+        n_fft: int = 1536,          # <-- важно: под 48k fullband
+        delay_frames: int = 80,
+        align_hidden: int = 64,
+    ) -> None:
         super().__init__()
+        self.n_fft = n_fft
         self.fe = FE()
 
         # shared encoders
@@ -211,7 +217,20 @@ class DeepVQE(nn.Module):
         self.align1 = AlignBlock(in_channels=64, hidden_channels=align_hidden, delay=delay_frames)
         self.fuse1 = nn.Conv2d(64 + align_hidden, 64, kernel_size=1)
 
-        self.bottle = Bottleneck(128 * 9, 64 * 9)
+        # ---- dynamic F5 computation ----
+        F_in = n_fft // 2 + 1
+        with torch.no_grad():
+            dummy = torch.zeros(1, 2, 8, F_in)  # (B,2,T,F)
+            y = self.enblock1(dummy)
+            y = self.enblock2(y)
+            y = self.enblock3(y)
+            y = self.enblock4(y)
+            y = self.enblock5(y)
+            F5 = y.shape[-1]
+        self.F5 = F5
+        # -------------------------------
+
+        self.bottle = Bottleneck(128 * F5, 64 * F5)
 
         self.deblock5 = DecoderBlock(128, 128)
         self.deblock4 = DecoderBlock(128, 128)
@@ -221,16 +240,14 @@ class DeepVQE(nn.Module):
         self.ccm = CCM()
 
     def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
-        # mic/ref: (B,F,T,2)
-
         mic0 = self.fe(mic)   # (B,2,T,F)
-        ref0 = self.fe(ref)   # (B,2,T,F)
+        ref0 = self.fe(ref)
 
         mic1 = self.enblock1(mic0)  # (B,64,T,F')
-        ref1 = self.enblock1(ref0)  # shared weights
+        ref1 = self.enblock1(ref0)
 
-        ref1a = self.align1(mic1, ref1)  # (B,align_hidden,T,F')
-        mic1f = self.fuse1(torch.cat([mic1, ref1a], dim=1))  # (B,64,T,F')
+        ref1a = self.align1(mic1, ref1)                 # (B,align_hidden,T,F')
+        mic1f = self.fuse1(torch.cat([mic1, ref1a], 1)) # (B,64,T,F')
 
         en2 = self.enblock2(mic1f)
         en3 = self.enblock3(en2)
@@ -239,13 +256,14 @@ class DeepVQE(nn.Module):
 
         z = self.bottle(en5)
 
-        d5 = self.deblock5(z, en5)[..., : en4.shape[-1]]
-        d4 = self.deblock4(d5, en4)[..., : en3.shape[-1]]
-        d3 = self.deblock3(d4, en3)[..., : en2.shape[-1]]
-        d2 = self.deblock2(d3, en2)[..., : mic1f.shape[-1]]
-        d1 = self.deblock1(d2, mic1f)[..., : mic0.shape[-1]]
+        d5 = self.deblock5(z, en5)[..., :en4.shape[-1]]
+        d4 = self.deblock4(d5, en4)[..., :en3.shape[-1]]
+        d3 = self.deblock3(d4, en3)[..., :en2.shape[-1]]
+        d2 = self.deblock2(d3, en2)[..., :mic1f.shape[-1]]
+        d1 = self.deblock1(d2, mic1f)[..., :mic0.shape[-1]]
 
         out = self.ccm(d1, mic)  # (B,F,T,2)
         return out
+
 
 
