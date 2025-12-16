@@ -190,14 +190,26 @@ class CCM(nn.Module):
 
 
 class DeepVQE(nn.Module):
-    def __init__(self) -> None:
+    """
+    Two-input DeepVQE for ref-conditioned cancellation:
+      mic: (B,F,T,2)
+      ref: (B,F,T,2)
+      out: (B,F,T,2)  # enhanced mic STFT => dub-only
+    """
+
+    def __init__(self, delay_frames: int = 80, align_hidden: int = 64) -> None:
         super().__init__()
         self.fe = FE()
+
+        # shared encoders
         self.enblock1 = EncoderBlock(2, 64)
         self.enblock2 = EncoderBlock(64, 128)
         self.enblock3 = EncoderBlock(128, 128)
         self.enblock4 = EncoderBlock(128, 128)
         self.enblock5 = EncoderBlock(128, 128)
+
+        self.align1 = AlignBlock(in_channels=64, hidden_channels=align_hidden, delay=delay_frames)
+        self.fuse1 = nn.Conv2d(64 + align_hidden, 64, kernel_size=1)
 
         self.bottle = Bottleneck(128 * 9, 64 * 9)
 
@@ -208,69 +220,32 @@ class DeepVQE(nn.Module):
         self.deblock1 = DecoderBlock(64, 27)
         self.ccm = CCM()
 
-    def forward(self, x: Tensor) -> Tensor:
-        """x: (B,F,T,2)"""
+    def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
+        # mic/ref: (B,F,T,2)
 
-        en_x0 = self.fe(x)
-        en_x1 = self.enblock1(en_x0)
-        en_x2 = self.enblock2(en_x1)
-        en_x3 = self.enblock3(en_x2)
-        en_x4 = self.enblock4(en_x3)
-        en_x5 = self.enblock5(en_x4)
+        mic0 = self.fe(mic)   # (B,2,T,F)
+        ref0 = self.fe(ref)   # (B,2,T,F)
 
-        en_xr = self.bottle(en_x5)
+        mic1 = self.enblock1(mic0)  # (B,64,T,F')
+        ref1 = self.enblock1(ref0)  # shared weights
 
-        de_x5 = self.deblock5(en_xr, en_x5)[..., : en_x4.shape[-1]]
-        de_x4 = self.deblock4(de_x5, en_x4)[..., : en_x3.shape[-1]]
-        de_x3 = self.deblock3(de_x4, en_x3)[..., : en_x2.shape[-1]]
-        de_x2 = self.deblock2(de_x3, en_x2)[..., : en_x1.shape[-1]]
-        de_x1 = self.deblock1(de_x2, en_x1)[..., : en_x0.shape[-1]]
+        ref1a = self.align1(mic1, ref1)  # (B,align_hidden,T,F')
+        mic1f = self.fuse1(torch.cat([mic1, ref1a], dim=1))  # (B,64,T,F')
 
-        x_enh = self.ccm(de_x1, x)  # (B,F,T,2)
+        en2 = self.enblock2(mic1f)
+        en3 = self.enblock3(en2)
+        en4 = self.enblock4(en3)
+        en5 = self.enblock5(en4)
 
-        return x_enh
+        z = self.bottle(en5)
+
+        d5 = self.deblock5(z, en5)[..., : en4.shape[-1]]
+        d4 = self.deblock4(d5, en4)[..., : en3.shape[-1]]
+        d3 = self.deblock3(d4, en3)[..., : en2.shape[-1]]
+        d2 = self.deblock2(d3, en2)[..., : mic1f.shape[-1]]
+        d1 = self.deblock1(d2, mic1f)[..., : mic0.shape[-1]]
+
+        out = self.ccm(d1, mic)  # (B,F,T,2)
+        return out
 
 
-
-if __name__ == "__main__":
-    print(torch.cuda.is_available())
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = DeepVQE().eval().to(device)
-
-    x = torch.randn(1, 257, 63, 2, device=device)
-    _ = model(x)
-
-    x = torch.randn(2, 257, 63, 2, device=device)
-    y = model(x)
-    assert y.shape == x.shape
-
-    ab = AlignBlock(32, 32, delay=5).to(device)
-    mic = torch.randn(2, 32, 10, 17, device=device)
-    ref = torch.randn(2, 32, 10, 17, device=device)
-    out = ab(mic, ref)
-    assert out.shape == (2, 32, 10, 17)
-
-    ab2 = AlignBlock(32, 16, delay=5).to(device)
-    out2 = ab2(mic, ref)
-    assert out2.shape == (2, 16, 10, 17)
-
-    from ptflops import get_model_complexity_info
-
-    flops, params = get_model_complexity_info(
-        model, (257, 63, 2), as_strings=True, print_per_layer_stat=False, verbose=True
-    )
-    print(flops, params)
-
-    # Causality check
-    a = torch.randn(1, 257, 100, 2, device=device)
-    b = torch.randn(1, 257, 100, 2, device=device)
-    c = torch.randn(1, 257, 100, 2, device=device)
-    x1 = torch.cat([a, b], dim=2)
-    x2 = torch.cat([a, c], dim=2)
-    y1 = model(x1)
-    y2 = model(x2)
-    print((y1[:, :, :100, :] - y2[:, :, :100, :]).abs().max())
-    print((y1[:, :, 100:, :] - y2[:, :, 100:, :]).abs().max())
-        
