@@ -1,17 +1,10 @@
-"""DeepVQE model definition kept for PyTorch 2.9.1 with NumPy 2.3.5 utilities."""
-
 from __future__ import annotations
-
 from typing import Final
-
 import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
-
-
-__all__ = ["DeepVQE", "FE", "AlignBlock", "ResidualBlock", "EncoderBlock", "DecoderBlock"]
 
 
 FLOAT_EPS: Final[float] = torch.finfo(torch.float32).eps
@@ -41,7 +34,7 @@ class FE(nn.Module):
 
         x_mag = torch.linalg.vector_norm(x, dim=-1, keepdim=True)
         x_c = torch.div(x, x_mag.pow(1 - self.c) + FLOAT_EPS)
-        return torch.moveaxis(x_c, -1, 1).contiguous()
+        return x_c.permute(0, 3, 2, 1).contiguous()
 
 
 class ResidualBlock(nn.Module):
@@ -67,6 +60,7 @@ class AlignBlock(nn.Module):
         super().__init__()
         self.pconv_mic = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_ref = nn.Conv2d(in_channels, hidden_channels, 1)
+        self.pconv_val = nn.Conv2d(in_channels, hidden_channels, 1)
         self.unfold = nn.Sequential(
             nn.ZeroPad2d([0, 0, delay - 1, 0]),
             nn.Unfold((delay, 1)),
@@ -81,11 +75,12 @@ class AlignBlock(nn.Module):
             x_ref: Tensor with shape ``(B, C, T, F)``.
 
         Returns:
-            Tensor with aligned reference of shape ``(B, C, T, F)``.
+            Tensor with aligned reference of shape ``(B, H, T, F)``.
         """
 
         q_proj = self.pconv_mic(x_mic)  # (B, H, T, F)
         k_proj = self.pconv_ref(x_ref)  # (B, H, T, F)
+        v_proj = self.pconv_val(x_ref)  # (B,H,T,F)
         k_unfold = self.unfold(k_proj)
         k_unfold = k_unfold.view(k_proj.shape[0], k_proj.shape[1], -1, k_proj.shape[2], k_proj.shape[3])
         k_unfold = k_unfold.permute(0, 1, 3, 2, 4).contiguous()
@@ -94,10 +89,11 @@ class AlignBlock(nn.Module):
         att_logits = self.conv(att_logits)  # (B, 1, T, D)
         att = torch.softmax(att_logits, dim=-1)[..., None]  # (B, 1, T, D, 1)
 
-        ref_ctx = self.unfold(x_ref)
-        ref_ctx = ref_ctx.view(k_proj.shape[0], k_proj.shape[1], -1, k_proj.shape[2], k_proj.shape[3])
-        ref_ctx = ref_ctx.permute(0, 1, 3, 2, 4).contiguous()
-        return torch.sum(ref_ctx * att, dim=-2)
+        v_ctx = self.unfold(v_proj)
+        v_ctx = v_ctx.view(v_proj.shape[0], v_proj.shape[1], -1, v_proj.shape[2], v_proj.shape[3])
+        v_ctx = v_ctx.permute(0, 1, 3, 2, 4).contiguous()
+        return torch.sum(v_ctx * att, dim=-2)  # (B,H,T,F)
+
 
 
 class EncoderBlock(nn.Module):
@@ -164,8 +160,10 @@ class CCM(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        ccm_basis = np.array([[1, -0.5, -0.5], [0, np.sqrt(3, dtype=np.float32) / 2, -np.sqrt(3, dtype=np.float32) / 2]])
-        self.register_buffer("v", torch.from_numpy(ccm_basis.astype(np.float32)))
+        sqrt3 = np.float32(np.sqrt(3.0))
+        ccm_basis = np.array([[1, -0.5, -0.5], [0, sqrt3 / 2, -sqrt3 / 2]], dtype=np.float32)
+        self.register_buffer("v", torch.from_numpy(ccm_basis))
+
         self.unfold = nn.Sequential(nn.ZeroPad2d([1, 1, 2, 0]), nn.Unfold(kernel_size=(3, 3)))
 
     def forward(self, m: Tensor, x: Tensor) -> Tensor:
@@ -238,6 +236,21 @@ if __name__ == "__main__":
     model = DeepVQE().eval()
     x = torch.randn(1, 257, 63, 2)
     _ = model(x)
+
+    x = torch.randn(2, 257, 63, 2)
+    y = model(x)
+    assert y.shape == x.shape
+
+    ab = AlignBlock(32, 32, delay=5)
+    mic = torch.randn(2, 32, 10, 17)
+    ref = torch.randn(2, 32, 10, 17)
+    out = ab(mic, ref)
+    assert out.shape == (2, 32, 10, 17)
+
+    ab = AlignBlock(32, 16, delay=5)
+    out = ab(mic, ref)
+    assert out.shape == (2, 16, 10, 17)
+
 
     from ptflops import get_model_complexity_info
 
