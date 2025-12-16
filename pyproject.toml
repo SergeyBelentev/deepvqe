@@ -1,0 +1,17 @@
+[project]
+name = "deepvqe"
+version = "0.1.0"
+description = "DeepVQE model implementation with Torch inference utilities"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "einops==0.8.0",
+    "numpy==2.3.5",
+    "onnx==1.17.0",
+    "onnxruntime==1.19.2",
+    "onnxsim==0.4.36",
+    "ptflops==0.7.3",
+    "torch==2.9.1",
+]
+
+[tool.uv]

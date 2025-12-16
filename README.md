@@ -45,13 +45,22 @@ We implement DeepVQE aiming to compare its SE performance with other two SOTA SE
 We are also interested in the inference speed presented in the paper, i.e, a relatively fast speed of 3.66 ms per frame in spite of its large complexity. So we also provide a stream version of DeepVQE, which is utilized to evaluate its inference speed.
 
 ## Requirements
-einops <br/>
-numpy<br/>
-onnx<br/>
-onnxruntime<br/>
-onnxsim<br/>
-ptflops<br/>
-torch==1.11.0<br/>
+This project now uses [uv](https://docs.astral.sh/uv/) for dependency management. Install uv and sync the environment with:
+
+```
+pip install uv
+uv sync
+```
+
+The environment targets Python >=3.11 and pins the following dependencies (managed through `pyproject.toml` / `uv.lock`):
+
+* einops==0.8.0
+* numpy==2.3.5
+* onnx==1.17.0
+* onnxruntime==1.19.2
+* onnxsim==0.4.36
+* ptflops==0.7.3
+* torch==2.9.1
 
 ## Results
 ### 1. SE performance
