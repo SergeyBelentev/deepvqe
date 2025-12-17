@@ -241,6 +241,7 @@ def main():
     ap.add_argument("--manifest", required=True, help="CSV/TSV: mix_path,ref_path,target_path")
     ap.add_argument("--save-dir", default="ckpt_48k")
     ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--save_every", type=int, default=5)
 
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--segment-sec", type=float, default=4.0)
@@ -277,11 +278,16 @@ def main():
         ds,
         batch_size=args.batch,
         shuffle=True,
-        drop_last=True,
+        drop_last=(len(ds) >= args.batch),
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
         collate_fn=collate,
     )
+    if len(dl) == 0:
+        raise RuntimeError(
+            f"DataLoader has 0 batches: len(ds)={len(ds)}, batch={args.batch}. "
+            f"Use --batch 1 or disable drop_last."
+        )
 
     model = DeepVQE(
         delay_frames=args.delay_frames,
@@ -382,6 +388,9 @@ def main():
 
         avg = running / max(1, len(dl))
         print(f"epoch {epoch:03d} | loss {avg:.4f}")
+        si_sdr_db = (-loss_time).item()
+        print(f"si_sdr={si_sdr_db:.2f}dB | mag={loss_mag1.item():.4f} | mr={loss_mr.item():.4f} | total={loss.item():.4f}")
+
 
         ckpt = {
             "epoch": epoch,
