@@ -58,6 +58,7 @@ class AlignBlock(nn.Module):
 
     def __init__(self, in_channels: int, hidden_channels: int, delay: int = 100) -> None:
         super().__init__()
+        self.delay = delay
         self.pconv_mic = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_ref = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_val = nn.Conv2d(in_channels, hidden_channels, 1)
@@ -67,32 +68,30 @@ class AlignBlock(nn.Module):
         )
         self.conv = nn.Sequential(nn.ZeroPad2d([1, 1, 4, 0]), nn.Conv2d(hidden_channels, 1, (5, 3)))
 
-    def forward(self, x_mic: Tensor, x_ref: Tensor) -> Tensor:
-        """Align reference signal to microphone input.
-
-        Args:
-            x_mic: Tensor with shape ``(B, C, T, F)``.
-            x_ref: Tensor with shape ``(B, C, T, F)``.
-
-        Returns:
-            Tensor with aligned reference of shape ``(B, H, T, F)``.
-        """
-
-        q_proj = self.pconv_mic(x_mic)  # (B, H, T, F)
-        k_proj = self.pconv_ref(x_ref)  # (B, H, T, F)
+    def forward(self, x_mic: Tensor, x_ref: Tensor, return_att: bool = False):
+        q_proj = self.pconv_mic(x_mic)  # (B,H,T,F)
+        k_proj = self.pconv_ref(x_ref)  # (B,H,T,F)
         v_proj = self.pconv_val(x_ref)  # (B,H,T,F)
-        k_unfold = self.unfold(k_proj)
-        k_unfold = k_unfold.view(k_proj.shape[0], k_proj.shape[1], -1, k_proj.shape[2], k_proj.shape[3])
-        k_unfold = k_unfold.permute(0, 1, 3, 2, 4)
 
-        att_logits = torch.sum(q_proj.unsqueeze(-2) * k_unfold, dim=-1)  # (B, H, T, D)
-        att_logits = self.conv(att_logits)  # (B, 1, T, D)
-        att = torch.softmax(att_logits, dim=-1)[..., None]  # (B, 1, T, D, 1)
+        k_unfold = self.unfold(k_proj)  # (B,H*D, T*F)
+        B, H, T, F = k_proj.shape
+        D = self.delay
+        k_unfold = k_unfold.view(B, H, D, T, F).permute(0, 1, 3, 2, 4)  # (B,H,T,D,F)
+
+        # вместо q.unsqueeze(-2) * k_unfold -> sum(...): делаем matmul без гигантского intermediate
+        att_logits = torch.matmul(k_unfold, q_proj.unsqueeze(-1)).squeeze(-1)  # (B,H,T,D)
+
+        att_logits = self.conv(att_logits)            # (B,1,T,D)
+        att = torch.softmax(att_logits, dim=-1)       # (B,1,T,D)
 
         v_ctx = self.unfold(v_proj)
-        v_ctx = v_ctx.view(v_proj.shape[0], v_proj.shape[1], -1, v_proj.shape[2], v_proj.shape[3])
-        v_ctx = v_ctx.permute(0, 1, 3, 2, 4)
-        return torch.sum(v_ctx * att, dim=-2)  # (B,H,T,F)
+        v_ctx = v_ctx.view(B, H, D, T, F).permute(0, 1, 3, 2, 4)        # (B,H,T,D,F)
+
+        ctx = torch.matmul(att.unsqueeze(-2), v_ctx).squeeze(-2)        # (B,H,T,F)
+
+        if return_att:
+            return ctx, att
+        return ctx
 
 
 
@@ -243,6 +242,18 @@ class DeepVQE(nn.Module):
         self.deblock1 = DecoderBlock(64, 27)
         self.ccm = CCM()
 
+    def _align_ref_ri(self, ref_ri: Tensor, att: Tensor) -> Tensor:
+        # ref_ri: (B,F,T,2), att: (B,1,T,D)
+        B, F, T, _ = ref_ri.shape
+        D = self.align1.delay
+
+        r = ref_ri.permute(0, 3, 2, 1).contiguous()  # (B,2,T,F)
+        r_unf = self.align1.unfold(r)  # (B,2*D, T*F)
+        r_unf = r_unf.view(B, 2, D, T, F).permute(0, 1, 3, 2, 4)  # (B,2,T,D,F)
+
+        aligned = torch.matmul(att.unsqueeze(-2), r_unf).squeeze(-2)  # (B,2,T,F)
+        return aligned.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)
+
     def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
         mic0 = self.fe(mic)   # (B,2,T,F)
         ref0 = self.fe(ref)
@@ -250,7 +261,8 @@ class DeepVQE(nn.Module):
         mic1 = self.enblock1(mic0)  # (B,64,T,F')
         ref1 = self.enblock1(ref0)
 
-        ref1a = self.align1(mic1, ref1)                 # (B,align_hidden,T,F')
+        ref1a, att = self.align1(mic1, ref1, return_att=True)       # (B,align_hidden,T,F')
+        ref_ri_aligned = self._align_ref_ri(ref, att)
         mic1f = self.fuse1(torch.cat([mic1, ref1a], 1)) # (B,64,T,F')
 
         en2 = self.enblock2(mic1f)
@@ -266,7 +278,7 @@ class DeepVQE(nn.Module):
         d2 = self.deblock2(d3, en2)[..., :mic1f.shape[-1]]
         d1 = self.deblock1(d2, mic1f)[..., :mic0.shape[-1]]
 
-        bg = self.ccm(d1, mic)
+        bg = self.ccm(d1, ref_ri_aligned)
         out = mic - bg
 
         # удобно для train: вернуть и out и bg
