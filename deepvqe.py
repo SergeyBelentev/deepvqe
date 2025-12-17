@@ -83,7 +83,7 @@ class AlignBlock(nn.Module):
         v_proj = self.pconv_val(x_ref)  # (B,H,T,F)
         k_unfold = self.unfold(k_proj)
         k_unfold = k_unfold.view(k_proj.shape[0], k_proj.shape[1], -1, k_proj.shape[2], k_proj.shape[3])
-        k_unfold = k_unfold.permute(0, 1, 3, 2, 4).contiguous()
+        k_unfold = k_unfold.permute(0, 1, 3, 2, 4)
 
         att_logits = torch.sum(q_proj.unsqueeze(-2) * k_unfold, dim=-1)  # (B, H, T, D)
         att_logits = self.conv(att_logits)  # (B, 1, T, D)
@@ -91,7 +91,7 @@ class AlignBlock(nn.Module):
 
         v_ctx = self.unfold(v_proj)
         v_ctx = v_ctx.view(v_proj.shape[0], v_proj.shape[1], -1, v_proj.shape[2], v_proj.shape[3])
-        v_ctx = v_ctx.permute(0, 1, 3, 2, 4).contiguous()
+        v_ctx = v_ctx.permute(0, 1, 3, 2, 4)
         return torch.sum(v_ctx * att, dim=-2)  # (B,H,T,F)
 
 
@@ -197,6 +197,9 @@ class DeepVQE(nn.Module):
       out: (B,F,T,2)
     """
 
+    def set_return_bg(self, flag: bool = True) -> None:
+        self._return_bg = flag
+
     def __init__(
         self,
         n_fft: int = 1536,          # <-- важно: под 48k fullband
@@ -204,6 +207,7 @@ class DeepVQE(nn.Module):
         align_hidden: int = 64,
     ) -> None:
         super().__init__()
+        self._return_bg = False
         self.n_fft = n_fft
         self.fe = FE()
 
@@ -262,7 +266,12 @@ class DeepVQE(nn.Module):
         d2 = self.deblock2(d3, en2)[..., :mic1f.shape[-1]]
         d1 = self.deblock1(d2, mic1f)[..., :mic0.shape[-1]]
 
-        out = self.ccm(d1, mic)  # (B,F,T,2)
+        bg = self.ccm(d1, mic)
+        out = mic - bg
+
+        # удобно для train: вернуть и out и bg
+        if isinstance(getattr(self, "_return_bg", False), bool) and self._return_bg:
+            return out, bg
         return out
 
 
