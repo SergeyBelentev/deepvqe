@@ -1,3 +1,4 @@
+# train.py
 import argparse
 import csv
 from dataclasses import dataclass
@@ -129,10 +130,11 @@ class MRSTFTLoss(nn.Module):
 # -----------------------
 class AecDataset(Dataset):
     # CSV/TSV: mix_path, ref_path, target_path
-    def __init__(self, manifest_path: str, sr: int, segment_sec: float):
+    def __init__(self, manifest_path: str, sr: int, segment_sec: float, repeats: int = 500):
         self.sr = sr
         self.seg_len = int(sr * segment_sec)
         self.items: List[Tuple[str, str, str]] = []
+        self.repeats = max(repeats, len(self.items))
 
         with open(manifest_path, "r", newline="", encoding="utf-8") as f:
             sample = f.read(4096)
@@ -149,10 +151,10 @@ class AecDataset(Dataset):
                 self.items.append((row[0].strip(), row[1].strip(), row[2].strip()))
 
     def __len__(self):
-        return len(self.items)
+        return self.repeats
 
     def __getitem__(self, idx: int):
-        mix_p, ref_p, tgt_p = self.items[idx]
+        mix_p, ref_p, tgt_p = self.items[idx % len(self.items)]
         mix = load_wav_stereo(mix_p, self.sr)  # (2,T)
         ref = load_wav_stereo(ref_p, self.sr)
         tgt = load_wav_stereo(tgt_p, self.sr)

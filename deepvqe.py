@@ -239,7 +239,7 @@ class DeepVQE(nn.Module):
         self.deblock4 = DecoderBlock(128, 128)
         self.deblock3 = DecoderBlock(128, 128)
         self.deblock2 = DecoderBlock(128, 64)
-        self.deblock1 = DecoderBlock(64, 27)
+        self.deblock1 = DecoderBlock(64, 27, is_last=True)
         self.ccm = CCM()
 
     def _align_ref_ri(self, ref_ri: Tensor, att: Tensor) -> Tensor:
