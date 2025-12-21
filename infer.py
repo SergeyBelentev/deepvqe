@@ -120,7 +120,7 @@ def main():
 
     args = ap.parse_args()
 
-    ckpt = torch.load(args.ckpt, map_location="cpu")
+    ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     ckpt_args = ckpt.get("args", {})
 
     sr = int(ckpt_args.get("sr", 48000))
