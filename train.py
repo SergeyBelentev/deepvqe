@@ -365,7 +365,7 @@ def main():
         if not ckpt_path.exists():
             raise FileNotFoundError(f"--resume not found: {ckpt_path}")
 
-        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
         ckpt_args = ckpt.get("args", {}) or {}
 
         _assert_resume_compat(args, ckpt_args)
