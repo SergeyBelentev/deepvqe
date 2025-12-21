@@ -152,6 +152,7 @@ class AecDataset(Dataset):
         self.sr = sr
         self.seg_len = int(sr * segment_sec)
         self.items: List[Tuple[str, str, str]] = []
+        self._load_manifest_data()
 
     def __len__(self):
         return len(self.items)
