@@ -1,9 +1,9 @@
-# train.py
+from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 import soundfile as sf
@@ -67,8 +67,12 @@ class STFT(nn.Module):
         # x: (B,T) fp32 -> (B,F,Tf,2) fp32
         w = self.window.to(device=x.device, dtype=torch.float32)
         X = torch.stft(
-            x, n_fft=self.cfg.n_fft, hop_length=self.cfg.hop, win_length=self.cfg.win,
-            window=w, return_complex=True
+            x,
+            n_fft=self.cfg.n_fft,
+            hop_length=self.cfg.hop,
+            win_length=self.cfg.win,
+            window=w,
+            return_complex=True,
         )
         return torch.view_as_real(X).to(torch.float32)
 
@@ -76,8 +80,12 @@ class STFT(nn.Module):
         w = self.window.to(device=X_ri.device, dtype=torch.float32)
         X = torch.complex(X_ri[..., 0].float(), X_ri[..., 1].float())
         y = torch.istft(
-            X, n_fft=self.cfg.n_fft, hop_length=self.cfg.hop, win_length=self.cfg.win,
-            window=w, length=length
+            X,
+            n_fft=self.cfg.n_fft,
+            hop_length=self.cfg.hop,
+            win_length=self.cfg.win,
+            window=w,
+            length=length,
         )
         return y.to(torch.float32)
 
@@ -130,8 +138,15 @@ class MRSTFTLoss(nn.Module):
 # dataset
 # -----------------------
 class AecDataset(Dataset):
+    # CSV: mix_path, ref_path, target_path   (target_path can be 'None' -> zero target)
+    def __init__(self, manifest_path: str, sr: int, segment_sec: float):
+        self.manifest_path = manifest_path
+        self.sr = sr
+        self.seg_len = int(sr * segment_sec)
+        self.items: List[Tuple[str, str, str]] = []
+        self._load_manifest_data()
 
-    def _load_manifest_data(self):
+    def _load_manifest_data(self) -> None:
         with open(self.manifest_path, "r", newline="", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter=",", skipinitialspace=False)
             for row in reader:
@@ -143,23 +158,15 @@ class AecDataset(Dataset):
                     raise RuntimeError(f"Bad row (need 3 cols): {row}")
                 self.items.append((row[0].strip(), row[1].strip(), row[2].strip()))
 
-    # CSV/TSV: mix_path, ref_path, target_path
-    def __init__(self, manifest_path: str, sr: int, segment_sec: float):
-        self.manifest_path = manifest_path
-        self.sr = sr
-        self.seg_len = int(sr * segment_sec)
-        self.items: List[Tuple[str, str, str]] = []
-        self._load_manifest_data()
-
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.items)
 
     def __getitem__(self, idx: int):
         mix_p, ref_p, tgt_p = self.items[idx]
         mix = load_wav_stereo(mix_p, self.sr)  # (2,T)
-        ref = load_wav_stereo(ref_p, self.sr)
+        ref = load_wav_stereo(ref_p, self.sr)  # (2,T)
 
-        if tgt_p == 'None':
+        if tgt_p == "None":
             max_len = max(mix.shape[-1], ref.shape[-1])
             tgt = mix.new_zeros((2, max_len))
         else:
@@ -177,14 +184,62 @@ def collate(batch):
 
 
 # -----------------------
+# resume helpers
+# -----------------------
+def _move_optimizer_state_to_device(opt: torch.optim.Optimizer, device: torch.device) -> None:
+    for state in opt.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device, non_blocking=True)
+
+
+def _get_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {
+        "torch": torch.random.get_rng_state(),
+        "numpy": np.random.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_all"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _set_rng_state(state: Dict[str, Any]) -> None:
+    if not state:
+        return
+    if "torch" in state and state["torch"] is not None:
+        torch.random.set_rng_state(state["torch"])
+    if "numpy" in state and state["numpy"] is not None:
+        np.random.set_state(state["numpy"])
+    if torch.cuda.is_available() and "cuda_all" in state and state["cuda_all"] is not None:
+        torch.cuda.set_rng_state_all(state["cuda_all"])
+
+
+def _assert_resume_compat(args_now: argparse.Namespace, ckpt_args: Dict[str, Any]) -> None:
+    # Эти параметры определяют размерности STFT и модельных слоёв -> должны совпасть
+    keys = ["sr", "n_fft", "hop", "win", "delay_frames", "align_hidden"]
+    mism = []
+    for k in keys:
+        if k in ckpt_args:
+            v_old = ckpt_args[k]
+            v_new = getattr(args_now, k)
+            if v_old != v_new:
+                mism.append((k, v_old, v_new))
+    if mism:
+        lines = ["Resume arg mismatch (these MUST match to load weights safely):"]
+        for k, old, new in mism:
+            lines.append(f"  - {k}: ckpt={old} vs now={new}")
+        raise RuntimeError("\n".join(lines))
+
+
+# -----------------------
 # train
 # -----------------------
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--manifest", required=True, help="CSV/TSV: mix_path,ref_path,target_path")
+    ap.add_argument("--manifest", required=True, help="CSV: mix_path,ref_path,target_path (target_path can be 'None')")
     ap.add_argument("--save-dir", default="ckpt_48k")
-    ap.add_argument("--epochs", type=int, default=50)
+    ap.add_argument("--epochs", type=int, default=50, help="TOTAL epochs to train to (if resuming: must be > ckpt epoch)")
     ap.add_argument("--save-every-epochs", type=int, default=1)
 
     ap.add_argument("--batch", type=int, default=1)
@@ -205,7 +260,7 @@ def main():
     ap.add_argument("--delay-frames", type=int, default=25)
     ap.add_argument("--align-hidden", type=int, default=64)
 
-    # augment: random ref shift, but quantized to hop (so it’s frame-aligned)
+    # augment: random ref shift, but quantized to hop (frame-aligned)
     ap.add_argument("--ref-shift-ms", type=float, default=0.0, help="±ms, quantized to hop")
 
     # loss weights
@@ -219,14 +274,22 @@ def main():
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--amp-dtype", choices=["bf16", "fp16"], default="bf16")
 
+    # resume
+    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt")
+    ap.add_argument("--resume-nonstrict", action="store_true", help="Allow non-strict model load (not recommended)")
+    ap.add_argument("--reset-opt", action="store_true", help="Do NOT load optimizer state")
+    ap.add_argument("--reset-scaler", action="store_true", help="Do NOT load GradScaler state")
+
     args = ap.parse_args()
 
+    # --- seeds ---
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
 
+    # --- data ---
     ds = AecDataset(args.manifest, sr=args.sr, segment_sec=args.segment_sec)
     dl = DataLoader(
         ds,
@@ -235,17 +298,20 @@ def main():
         drop_last=(len(ds) >= args.batch),
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
         collate_fn=collate,
     )
     print(f"dataset: {len(ds)} items | batch={args.batch} | batches/epoch={len(dl)}")
     if len(dl) == 0:
         raise RuntimeError("DataLoader has 0 batches. Use --batch 1 or add more data.")
 
+    # --- model ---
     model = DeepVQE(n_fft=args.n_fft, delay_frames=args.delay_frames, align_hidden=args.align_hidden).to(device)
     model.train()
     if hasattr(model, "set_return_bg"):
         model.set_return_bg(True)
 
+    # --- stft / loss ---
     stft = STFT(StftCfg(n_fft=args.n_fft, hop=args.hop, win=args.win)).to(device)
 
     mrstft = MRSTFTLoss([
@@ -254,6 +320,7 @@ def main():
         (4096, 960, 4096),
     ]).to(device)
 
+    # --- opt / amp ---
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
     use_amp = args.amp and (device.type == "cuda")
@@ -266,12 +333,59 @@ def main():
     max_shift_frames = int(round((args.ref_shift_ms * 1e-3 * args.sr) / args.hop))
     max_shift_frames = min(max_shift_frames, max(0, args.delay_frames - 1))
 
-    global_step = 0
-    for epoch in range(1, args.epochs + 1):
-        opt.zero_grad(set_to_none=True)
+    # --- resume state ---
+    start_epoch = 1
+    micro_step = 0  # counts minibatches; used for grad_accum phase continuity
 
+    if args.resume is not None:
+        ckpt_path = Path(args.resume)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"--resume not found: {ckpt_path}")
+
+        ckpt = torch.load(str(ckpt_path), map_location="cpu")
+        ckpt_args = ckpt.get("args", {}) or {}
+
+        _assert_resume_compat(args, ckpt_args)
+
+        strict = not args.resume_nonstrict
+        model.load_state_dict(ckpt["model"], strict=strict)
+        print(f"Resumed model from {ckpt_path} (strict={strict})")
+
+        ckpt_epoch = int(ckpt.get("epoch", 0) or 0)
+        if args.epochs <= ckpt_epoch:
+            raise RuntimeError(
+                f"--epochs must be > ckpt epoch when resuming. got --epochs {args.epochs}, ckpt epoch {ckpt_epoch}"
+            )
+        start_epoch = ckpt_epoch + 1
+
+        if (not args.reset_opt) and ("opt" in ckpt) and (ckpt["opt"] is not None):
+            opt.load_state_dict(ckpt["opt"])
+            _move_optimizer_state_to_device(opt, device)
+            print("Resumed optimizer state")
+
+        if (not args.reset_scaler) and (ckpt.get("scaler") is not None) and scaler.is_enabled():
+            scaler.load_state_dict(ckpt["scaler"])
+            print("Resumed GradScaler state")
+
+        micro_step = int(ckpt.get("micro_step", 0) or 0)
+
+        # restore RNG for maximal continuity (optional but полезно)
+        rng_state = ckpt.get("rng_state", None)
+        if isinstance(rng_state, dict):
+            _set_rng_state(rng_state)
+            print("Resumed RNG state")
+
+        print(f"Resume: ckpt_epoch={ckpt_epoch} -> start_epoch={start_epoch} | micro_step={micro_step}")
+
+    # -----------------------
+    # train loop
+    # -----------------------
+    for epoch in range(start_epoch, args.epochs + 1):
+        opt.zero_grad(set_to_none=True)
         run_loss = 0.0
-        for mix, ref, tgt in tqdm(dl, desc=f'Epoch {epoch}'):
+
+        pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True)
+        for mix, ref, tgt in pbar:
             mix = mix.to(device, non_blocking=True)  # (B,2,T)
             ref = ref.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
@@ -286,7 +400,10 @@ def main():
                 sh = int(torch.randint(-max_shift_frames, max_shift_frames + 1, (1,), device=device).item())
                 shift_samp = sh * args.hop
                 if shift_samp > 0:
-                    ref_f = torch.cat([ref_f.new_zeros((ref_f.shape[0], shift_samp)), ref_f[:, : T - shift_samp]], dim=1)
+                    ref_f = torch.cat(
+                        [ref_f.new_zeros((ref_f.shape[0], shift_samp)), ref_f[:, : T - shift_samp]],
+                        dim=1,
+                    )
                 elif shift_samp < 0:
                     s = -shift_samp
                     ref_f = torch.cat([ref_f[:, s:], ref_f.new_zeros((ref_f.shape[0], s))], dim=1)
@@ -328,13 +445,16 @@ def main():
                     + args.w_leak * loss_leak
                 ) / max(1, args.grad_accum)
 
+            # backward
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
             else:
                 loss.backward()
 
-            global_step += 1
-            if global_step % max(1, args.grad_accum) == 0:
+            micro_step += 1
+
+            # optimizer step every grad_accum micro-steps
+            if micro_step % max(1, args.grad_accum) == 0:
                 if args.grad_clip > 0:
                     if scaler.is_enabled():
                         scaler.unscale_(opt)
@@ -349,21 +469,30 @@ def main():
 
             run_loss += float(loss.detach().cpu()) * max(1, args.grad_accum)
 
+            pbar.set_postfix(
+                total=f"{(run_loss / max(1, (pbar.n + 1))):.6f}",
+                lo=f"{float(loss_out.detach().cpu()):.4f}",
+                lb=f"{float(loss_bg.detach().cpu()):.4f}",
+                lmr=f"{float(loss_mr.detach().cpu()):.4f}" if args.w_mrstft > 0 else "0.0000",
+                ll=f"{float(loss_leak.detach().cpu()):.4f}",
+            )
+
         avg = run_loss / max(1, len(dl))
         print(f"epoch {epoch:03d} | total {avg:.6f}")
 
-        ckpt = {
+        ckpt_out = {
             "epoch": epoch,
+            "micro_step": micro_step,
             "model": model.state_dict(),
             "opt": opt.state_dict(),
             "scaler": (scaler.state_dict() if scaler.is_enabled() else None),
             "args": vars(args),
+            "rng_state": _get_rng_state(),
         }
 
-        # save every epoch by default
         if epoch % args.save_every_epochs == 0:
-            torch.save(ckpt, str(Path(args.save_dir) / f"deepvqe_aec48k_e{epoch:03d}.pt"))
-        torch.save(ckpt, str(Path(args.save_dir) / "deepvqe_latest.pt"))
+            torch.save(ckpt_out, str(Path(args.save_dir) / f"deepvqe_aec48k_e{epoch:03d}.pt"))
+        torch.save(ckpt_out, str(Path(args.save_dir) / "deepvqe_latest.pt"))
 
     print("done.")
 
