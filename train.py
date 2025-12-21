@@ -133,10 +133,7 @@ class AecDataset(Dataset):
 
     def _load_manifest_data(self):
         with open(self.manifest_path, "r", newline="", encoding="utf-8") as f:
-            sample = f.read(4096)
-            f.seek(0)
-            dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
-            reader = csv.reader(f, dialect)
+            reader = csv.reader(f, delimiter=",", skipinitialspace=False)
             for row in reader:
                 if not row:
                     continue
