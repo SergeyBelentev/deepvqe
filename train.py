@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 from deepvqe import DeepVQE
 
@@ -129,14 +130,9 @@ class MRSTFTLoss(nn.Module):
 # dataset
 # -----------------------
 class AecDataset(Dataset):
-    # CSV/TSV: mix_path, ref_path, target_path
-    def __init__(self, manifest_path: str, sr: int, segment_sec: float, repeats: int = 500):
-        self.sr = sr
-        self.seg_len = int(sr * segment_sec)
-        self.items: List[Tuple[str, str, str]] = []
-        self.repeats = max(repeats, len(self.items))
 
-        with open(manifest_path, "r", newline="", encoding="utf-8") as f:
+    def _load_manifest_data(self):
+        with open(self.manifest_path, "r", newline="", encoding="utf-8") as f:
             sample = f.read(4096)
             f.seek(0)
             dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
@@ -150,14 +146,27 @@ class AecDataset(Dataset):
                     raise RuntimeError(f"Bad row (need 3 cols): {row}")
                 self.items.append((row[0].strip(), row[1].strip(), row[2].strip()))
 
+    # CSV/TSV: mix_path, ref_path, target_path
+    def __init__(self, manifest_path: str, sr: int, segment_sec: float):
+        self.manifest_path = manifest_path
+        self.sr = sr
+        self.seg_len = int(sr * segment_sec)
+        self.items: List[Tuple[str, str, str]] = []
+
     def __len__(self):
-        return self.repeats
+        return len(self.items)
 
     def __getitem__(self, idx: int):
-        mix_p, ref_p, tgt_p = self.items[idx % len(self.items)]
+        mix_p, ref_p, tgt_p = self.items[idx]
         mix = load_wav_stereo(mix_p, self.sr)  # (2,T)
         ref = load_wav_stereo(ref_p, self.sr)
-        tgt = load_wav_stereo(tgt_p, self.sr)
+
+        if tgt_p == 'None':
+            max_len = max(mix.shape[-1], ref.shape[-1])
+            tgt = mix.new_zeros((2, max_len))
+        else:
+            tgt = load_wav_stereo(tgt_p, self.sr)
+
         mix, ref, tgt = random_crop_same([mix, ref, tgt], length=self.seg_len)
         return mix, ref, tgt
 
@@ -264,7 +273,7 @@ def main():
         opt.zero_grad(set_to_none=True)
 
         run_loss = 0.0
-        for mix, ref, tgt in dl:
+        for mix, ref, tgt in tqdm(dl, desc=f'Epoch {epoch}'):
             mix = mix.to(device, non_blocking=True)  # (B,2,T)
             ref = ref.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)

@@ -13,6 +13,7 @@ dependencies = [
     "ptflops==0.7.3",
     "soundfile>=0.13.1",
     "torch==2.9.1",
+    "tqdm>=4.67.1",
 ]
 
 [tool.uv]
