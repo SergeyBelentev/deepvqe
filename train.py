@@ -3,7 +3,7 @@ import argparse
 import csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Dict, Any
 
 import numpy as np
 import soundfile as sf
@@ -64,7 +64,6 @@ class STFT(nn.Module):
         self.register_buffer("window", torch.hann_window(cfg.win, dtype=torch.float32), persistent=False)
 
     def stft_ri(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,T) fp32 -> (B,F,Tf,2) fp32
         w = self.window.to(device=x.device, dtype=torch.float32)
         X = torch.stft(
             x,
@@ -94,7 +93,6 @@ class STFT(nn.Module):
 # losses
 # -----------------------
 def corr_loss(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # x,y: (B,T)
     x = x - x.mean(dim=-1, keepdim=True)
     y = y - y.mean(dim=-1, keepdim=True)
     num = (x * y).sum(dim=-1).abs()
@@ -103,7 +101,6 @@ def corr_loss(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tens
 
 
 def complex_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    # a,b: (B,F,T,2)
     return (a.float() - b.float()).abs().mean()
 
 
@@ -138,7 +135,7 @@ class MRSTFTLoss(nn.Module):
 # dataset
 # -----------------------
 class AecDataset(Dataset):
-    # CSV: mix_path, ref_path, target_path   (target_path can be 'None' -> zero target)
+    # CSV: mix_path, ref_path, target_path (target_path can be 'None' -> zero target)
     def __init__(self, manifest_path: str, sr: int, segment_sec: float):
         self.manifest_path = manifest_path
         self.sr = sr
@@ -215,7 +212,6 @@ def _set_rng_state(state: Dict[str, Any]) -> None:
 
 
 def _assert_resume_compat(args_now: argparse.Namespace, ckpt_args: Dict[str, Any]) -> None:
-    # Эти параметры определяют размерности STFT и модельных слоёв -> должны совпасть
     keys = ["sr", "n_fft", "hop", "win", "delay_frames", "align_hidden"]
     mism = []
     for k in keys:
@@ -229,6 +225,18 @@ def _assert_resume_compat(args_now: argparse.Namespace, ckpt_args: Dict[str, Any
         for k, old, new in mism:
             lines.append(f"  - {k}: ckpt={old} vs now={new}")
         raise RuntimeError("\n".join(lines))
+
+
+def _setup_tf32(enable: bool, verbose: bool = True) -> None:
+    if not torch.cuda.is_available():
+        if verbose:
+            print("TF32: cuda not available -> ignored")
+        return
+    torch.backends.cuda.matmul.allow_tf32 = bool(enable)
+    torch.backends.cudnn.allow_tf32 = bool(enable)
+    if verbose:
+        print(f"TF32 matmul: {torch.backends.cuda.matmul.allow_tf32}")
+        print(f"TF32 cudnn : {torch.backends.cudnn.allow_tf32}")
 
 
 # -----------------------
@@ -273,6 +281,11 @@ def main():
     # amp
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--amp-dtype", choices=["bf16", "fp16"], default="bf16")
+    ap.add_argument("--amp-cache", action="store_true", help="Enable autocast cache (default: off)")
+
+    # tf32
+    ap.add_argument("--tf32", action="store_true", help="Enable TF32 for matmul/conv (fp32 speedup on Ampere/Ada)")
+    ap.add_argument("--cudnn-benchmark", action="store_true", help="Enable cudnn benchmark (speed, less deterministic)")
 
     # resume
     ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt")
@@ -288,6 +301,13 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
+
+    # TF32 / cudnn benchmark
+    if device.type == "cuda":
+        _setup_tf32(args.tf32, verbose=True)
+        torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+        if args.cudnn_benchmark:
+            print("cudnn.benchmark=True")
 
     # --- data ---
     ds = AecDataset(args.manifest, sr=args.sr, segment_sec=args.segment_sec)
@@ -326,6 +346,9 @@ def main():
     use_amp = args.amp and (device.type == "cuda")
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
+
+    # autocast cache: default OFF (helps VRAM stability)
+    autocast_cache = bool(args.amp_cache)
 
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
@@ -369,7 +392,6 @@ def main():
 
         micro_step = int(ckpt.get("micro_step", 0) or 0)
 
-        # restore RNG for maximal continuity (optional but полезно)
         rng_state = ckpt.get("rng_state", None)
         if isinstance(rng_state, dict):
             _set_rng_state(rng_state)
@@ -417,7 +439,12 @@ def main():
                 bg_true_wav = mix_f - tgt_f
 
             # forward (optional AMP)
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
+            with torch.amp.autocast(
+                device_type="cuda",
+                enabled=use_amp,
+                dtype=amp_dtype,
+                cache_enabled=autocast_cache,
+            ):
                 out = model(mix_ri, ref_ri)
 
             if not (isinstance(out, (tuple, list)) and len(out) == 2):
@@ -434,7 +461,6 @@ def main():
                 loss_bg_stft = complex_l1(bg_ri, bg_true_ri)
                 loss_mr = mrstft(out_wav, tgt_f) if args.w_mrstft > 0 else out_wav.new_tensor(0.0)
 
-                # leak: out should be decorrelated from background (true bg in mic)
                 loss_leak = corr_loss(out_wav, bg_true_wav)
 
                 loss = (
