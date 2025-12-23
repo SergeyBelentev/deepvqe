@@ -372,6 +372,11 @@ def main():
     ap.add_argument("--w-mrstft", type=float, default=0.2)
     ap.add_argument("--w-leak", type=float, default=0.5)
 
+    # mrstft loss settings
+    ap.add_argument("--mrstft-gate-db-low", type=float, default=-55.0)
+    ap.add_argument("--mrstft-gate-db-high", type=float, default=-40.0)
+    ap.add_argument("--mrstft-gate-floor", type=float, default=0.05)
+
     # amp
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--amp-dtype", choices=["bf16", "fp16"], default="bf16")
@@ -428,11 +433,16 @@ def main():
     # --- stft / loss ---
     stft = STFT(StftCfg(n_fft=args.n_fft, hop=args.hop, win=args.win)).to(device)
 
-    mrstft = MRSTFTLoss([
-        (1024, 240, 1024),
-        (2048, 480, 2048),
-        (4096, 960, 4096),
-    ]).to(device)
+    mrstft = MRSTFTLoss(
+        cfgs=[
+            (1024, 240, 1024),
+            (2048, 480, 2048),
+            (4096, 960, 4096),
+        ],
+        gate_db_low=args.mrstft_gate_db_low,
+        gate_db_high=args.mrstft_gate_db_high,
+        gate_floor=args.mrstft_gate_floor,
+    ).to(device)
 
     # --- opt / amp ---
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
