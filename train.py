@@ -130,6 +130,7 @@ class MRSTFTLoss(nn.Module):
         log_clip: float | None = 10.0,
         # magnitude floor for log (prevents -inf and stabilizes logs)
         mag_floor: float = 1e-5,
+        gate_floor: float = 0.05,
     ):
         super().__init__()
         self.cfgs = cfgs
@@ -143,6 +144,8 @@ class MRSTFTLoss(nn.Module):
         self.sc_clip = sc_clip
         self.log_clip = log_clip
         self.mag_floor = float(mag_floor)
+
+        self.gate_floor = float(gate_floor)
 
         for i, (_, _, win) in enumerate(cfgs):
             self.register_buffer(
@@ -166,6 +169,7 @@ class MRSTFTLoss(nn.Module):
         # linear ramp between low..high
         w = (db - self.gate_db_low) / max(1e-6, (self.gate_db_high - self.gate_db_low))
         w = torch.clamp(w, 0.0, 1.0)
+        w = self.gate_floor + (1.0 - self.gate_floor) * w
         if self.gate_detach:
             w = w.detach()
         return w  # (B,)
