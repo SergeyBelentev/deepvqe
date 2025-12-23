@@ -105,29 +105,119 @@ def complex_l1(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
 
 class MRSTFTLoss(nn.Module):
-    def __init__(self, cfgs: List[Tuple[int, int, int]], eps: float = 1e-7):
+    """
+    MRSTFTLoss with silence-robustness:
+      - soft gate by target RMS (dBFS): near-silence => near-zero weight
+      - spectral convergence denominator floor
+      - optional clipping of SC/log terms
+    Drop-in replacement for your current MRSTFTLoss(x, y), where:
+      x = prediction waveform (B,T)
+      y = target waveform      (B,T)
+    """
+
+    def __init__(
+        self,
+        cfgs: List[Tuple[int, int, int]],
+        eps: float = 1e-7,
+        # silence gate in dBFS (target RMS)
+        gate_db_low: float = -55.0,   # below -> MRSTFT weight ~ 0
+        gate_db_high: float = -40.0,  # above -> MRSTFT weight ~ 1
+        gate_detach: bool = True,     # do not backprop through gate
+        # SC denominator floor (in norm units of flattened Ymag)
+        sc_denom_floor: float = 1.0,
+        # safety clips (set None to disable)
+        sc_clip: float | None = 10.0,
+        log_clip: float | None = 10.0,
+        # magnitude floor for log (prevents -inf and stabilizes logs)
+        mag_floor: float = 1e-5,
+    ):
         super().__init__()
         self.cfgs = cfgs
-        self.eps = eps
+        self.eps = float(eps)
+
+        self.gate_db_low = float(gate_db_low)
+        self.gate_db_high = float(gate_db_high)
+        self.gate_detach = bool(gate_detach)
+
+        self.sc_denom_floor = float(sc_denom_floor)
+        self.sc_clip = sc_clip
+        self.log_clip = log_clip
+        self.mag_floor = float(mag_floor)
+
         for i, (_, _, win) in enumerate(cfgs):
-            self.register_buffer(f"window_{i}", torch.hann_window(win, dtype=torch.float32), persistent=False)
+            self.register_buffer(
+                f"window_{i}",
+                torch.hann_window(win, dtype=torch.float32),
+                persistent=False,
+            )
+
+    @staticmethod
+    def _rms_db(x: torch.Tensor, eps: float) -> torch.Tensor:
+        # x: (B,T)
+        rms = torch.sqrt(torch.mean(x * x, dim=-1) + eps)  # (B,)
+        return 20.0 * torch.log10(rms + eps)
+
+    def _gate(self, y: torch.Tensor) -> torch.Tensor:
+        """
+        Soft weight w in [0..1] computed from target RMS dB.
+        y: (B,T)
+        """
+        db = self._rms_db(y, self.eps)  # (B,)
+        # linear ramp between low..high
+        w = (db - self.gate_db_low) / max(1e-6, (self.gate_db_high - self.gate_db_low))
+        w = torch.clamp(w, 0.0, 1.0)
+        if self.gate_detach:
+            w = w.detach()
+        return w  # (B,)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        x,y: (B,T)
+        returns scalar
+        """
         x = x.float()
         y = y.float()
-        total = 0.0
+
+        B = x.shape[0]
+        w_gate = self._gate(y)  # (B,)
+
+        total = x.new_zeros(())
         for i, (n_fft, hop, win) in enumerate(self.cfgs):
             w = getattr(self, f"window_{i}").to(device=x.device, dtype=torch.float32)
+
             X = torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win, window=w, return_complex=True)
             Y = torch.stft(y, n_fft=n_fft, hop_length=hop, win_length=win, window=w, return_complex=True)
-            Xmag = torch.abs(X) + self.eps
-            Ymag = torch.abs(Y) + self.eps
 
-            diff = (Ymag - Xmag).reshape(x.shape[0], -1)
-            ref = Ymag.reshape(x.shape[0], -1)
-            sc = (torch.linalg.vector_norm(diff, dim=1) / (torch.linalg.vector_norm(ref, dim=1) + self.eps)).mean()
-            log_l1 = F.l1_loss(torch.log(Xmag), torch.log(Ymag))
-            total = total + (sc + log_l1)
+            Xmag = torch.abs(X).clamp_min(self.mag_floor)
+            Ymag = torch.abs(Y).clamp_min(self.mag_floor)
+
+            # --- spectral convergence (per-sample) ---
+            diff = (Ymag - Xmag).reshape(B, -1)
+            ref = Ymag.reshape(B, -1)
+
+            diff_norm = torch.linalg.vector_norm(diff, dim=1)  # (B,)
+            ref_norm = torch.linalg.vector_norm(ref, dim=1)    # (B,)
+
+            denom = torch.maximum(ref_norm, ref_norm.new_full(ref_norm.shape, self.sc_denom_floor))
+            sc = diff_norm / (denom + self.eps)  # (B,)
+            if self.sc_clip is not None:
+                sc = sc.clamp_max(float(self.sc_clip))
+
+            # --- log mag L1 (per-sample) ---
+            logX = torch.log(Xmag)
+            logY = torch.log(Ymag)
+            log_abs = torch.abs(logX - logY)  # (B,F,T)
+            log_l1 = log_abs.mean(dim=(1, 2))  # (B,)
+            if self.log_clip is not None:
+                log_l1 = log_l1.clamp_max(float(self.log_clip))
+
+            per = sc + log_l1  # (B,)
+
+            # silence gate: near-silence targets contribute ~0
+            per = per * w_gate
+
+            total = total + per.mean()
+
         return total / max(1, len(self.cfgs))
 
 
