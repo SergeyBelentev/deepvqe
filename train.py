@@ -47,6 +47,79 @@ def random_crop_same(signals: List[torch.Tensor], length: int) -> List[torch.Ten
     return out
 
 
+def apply_ref_timevarying_gain(
+    ref_f: torch.Tensor,  # (N,T) float
+    *,
+    sr: int,
+    prob: float,
+    max_db: float,
+    knot_sec: float = 0.5,
+    smooth_ms: float = 40.0,
+    row_mask: torch.Tensor | None = None,  # bool (N,) or (N,1)
+) -> torch.Tensor:
+    """
+    Плавный time-varying gain только для REF (AGC/mastering drift).
+
+    - узлы каждые knot_sec (по умолчанию 0.5 сек)
+    - линейная интерполяция -> Hann-сглаживание (похоже на spline)
+    - применяется с вероятностью prob ТОЛЬКО к строкам из row_mask
+    - величина в пределах ±max_db
+
+    ref_f: (N,T) где N = B*C (после reshape каналов в batch)
+    row_mask: какие строки (N,) вообще допускаются к аугменту (например, только speech или только no-speech)
+    """
+    if prob <= 0.0 or max_db <= 0.0:
+        return ref_f
+
+    device = ref_f.device
+    N, T = ref_f.shape
+
+    if row_mask is None:
+        eligible = torch.ones((N,), device=device, dtype=torch.bool)
+    else:
+        eligible = row_mask.to(device=device, dtype=torch.bool).view(-1)
+
+    idx = torch.nonzero(eligible, as_tuple=False).flatten()
+    if idx.numel() == 0:
+        return ref_f
+
+    # на этих eligible выбираем подмножество, к которому реально применим дрейф (prob)
+    sel = torch.rand((idx.numel(),), device=device) < float(prob)
+    apply_idx = idx[sel]
+    if apply_idx.numel() == 0:
+        return ref_f
+
+    M = int(apply_idx.numel())
+    knot_samp = max(1, int(round(knot_sec * sr)))
+    K = (T - 1) // knot_samp + 2  # >=2
+
+    # dB узлы: U(-max_db, +max_db)
+    knots_db = (torch.rand((M, K), device=device, dtype=torch.float32) * 2.0 - 1.0) * float(max_db)
+
+    # интерполяция на длину T
+    db_curve = F.interpolate(
+        knots_db[:, None, :], size=T, mode="linear", align_corners=True
+    ).squeeze(1)  # (M,T)
+
+    # сглаживание Hann по dB (low-pass)
+    if smooth_ms > 0.0:
+        L = int(round(smooth_ms * 1e-3 * sr))
+        if L >= 3:
+            if L % 2 == 0:
+                L += 1
+            w = torch.hann_window(L, device=device, dtype=torch.float32)
+            w = w / w.sum().clamp_min(1e-12)
+            db_curve = F.conv1d(db_curve[:, None, :], w[None, None, :], padding=L // 2).squeeze(1)
+
+    # dB -> gain
+    gain = torch.pow(ref_f.new_tensor(10.0), db_curve / 20.0)  # (M,T)
+
+    # применяем inplace только к выбранным строкам
+    ref_f = ref_f.clone()  # чтобы не словить неожиданные alias-эффекты
+    ref_f[apply_idx] = ref_f[apply_idx] * gain
+    return ref_f
+
+
 # -----------------------
 # STFT helper (fp32 only)
 # -----------------------
@@ -257,21 +330,24 @@ class AecDataset(Dataset):
         mix = load_wav_stereo(mix_p, self.sr)  # (2,T)
         ref = load_wav_stereo(ref_p, self.sr)  # (2,T)
 
-        if tgt_p == "None":
+        has_speech = tgt_p != "None"
+
+        if not has_speech:
             max_len = max(mix.shape[-1], ref.shape[-1])
             tgt = mix.new_zeros((2, max_len))
         else:
             tgt = load_wav_stereo(tgt_p, self.sr)
 
         mix, ref, tgt = random_crop_same([mix, ref, tgt], length=self.seg_len)
-        return mix, ref, tgt
+        return mix, ref, tgt, has_speech
 
 
 def collate(batch):
     mix = torch.stack([b[0] for b in batch], dim=0)  # (B,2,T)
     ref = torch.stack([b[1] for b in batch], dim=0)
     tgt = torch.stack([b[2] for b in batch], dim=0)
-    return mix, ref, tgt
+    has_speech = torch.tensor([bool(b[3]) for b in batch], dtype=torch.bool)  # (B,)
+    return mix, ref, tgt, has_speech
 
 
 # -----------------------
@@ -364,6 +440,16 @@ def main():
                           + "Range: [-random_gain_db, +random_gain_db]. Helps loudness robustness."
                           ),
                     )
+
+    # augment: time-varying gain drift for REF only (separately for no-speech vs speech)
+    ap.add_argument("--ref-tv-gain-knot-sec", type=float, default=0.5, help="Knot spacing in seconds (REF drift)")
+    ap.add_argument("--ref-tv-gain-smooth-ms", type=float, default=40.0, help="Smoothing window in ms (REF drift)")
+
+    ap.add_argument("--ref-tv-gain-prob-nospeech", type=float, default=0.2, help="Prob apply REF drift on no-speech segments")
+    ap.add_argument("--ref-tv-gain-db-nospeech", type=float, default=4.0, help="±dB range for REF drift on no-speech")
+
+    ap.add_argument("--ref-tv-gain-prob-speech", type=float, default=0.05, help="Prob apply REF drift on speech segments")
+    ap.add_argument("--ref-tv-gain-db-speech", type=float, default=2.0, help="±dB range for REF drift on speech")
 
     # model alignment
     ap.add_argument("--delay-frames", type=int, default=25)
@@ -518,7 +604,7 @@ def main():
         run_loss = 0.0
 
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True)
-        for mix, ref, tgt in pbar:
+        for mix, ref, tgt, has_speech in pbar:
             mix = mix.to(device, non_blocking=True)  # (B,2,T)
             ref = ref.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
@@ -539,6 +625,35 @@ def main():
                 mix_f = mix_f * gain
                 ref_f = ref_f * gain
                 tgt_f = tgt_f * gain
+
+            # build per-row masks for (B*C) because channels are treated as batch
+            # has_speech: (B,) -> (B*C,)
+            speech_rows = has_speech.to(device=device).repeat_interleave(C)  # bool (B*C,)
+            nospeech_rows = ~speech_rows
+
+            # REF-only time-varying gain drift (AGC/mastering mismatch), separate params
+            if args.ref_tv_gain_prob_nospeech > 0 and args.ref_tv_gain_db_nospeech > 0:
+                ref_f = apply_ref_timevarying_gain(
+                    ref_f,
+                    sr=args.sr,
+                    prob=float(args.ref_tv_gain_prob_nospeech),
+                    max_db=float(args.ref_tv_gain_db_nospeech),
+                    knot_sec=float(args.ref_tv_gain_knot_sec),
+                    smooth_ms=float(args.ref_tv_gain_smooth_ms),
+                    row_mask=nospeech_rows,
+                )
+
+            if args.ref_tv_gain_prob_speech > 0 and args.ref_tv_gain_db_speech > 0:
+                ref_f = apply_ref_timevarying_gain(
+                    ref_f,
+                    sr=args.sr,
+                    prob=float(args.ref_tv_gain_prob_speech),
+                    max_db=float(args.ref_tv_gain_db_speech),
+                    knot_sec=float(args.ref_tv_gain_knot_sec),
+                    smooth_ms=float(args.ref_tv_gain_smooth_ms),
+                    row_mask=speech_rows,
+                )
+
 
             # augment: shift REF input only (simulate unknown delay), quantized to hop
             if max_shift_frames > 0:
