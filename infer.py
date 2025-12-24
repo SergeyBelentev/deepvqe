@@ -25,10 +25,31 @@ def load_wav_stereo(path: str, sr_expected: int) -> torch.Tensor:
     return torch.from_numpy(x).transpose(0, 1).contiguous()  # (2,T)
 
 
-def save_wav_stereo(path: str, y: torch.Tensor, sr: int) -> None:
-    y = y.detach().cpu().numpy().T  # (T,2)
-    y = np.clip(y, -1.0, 1.0)
-    sf.write(path, y, sr)
+def save_wav_stereo(
+    path: str,
+    y: torch.Tensor,
+    sr: int,
+    *,
+    subtype: str = "PCM_24",
+    normalize_if_clip: bool = True,
+    peak_target: float = 0.99,
+) -> None:
+    """
+    y: (2,T) float tensor (обычно fp32)
+    Пишем без клиппинга. Если пик > 1.0 — мягко нормализуем весь сигнал.
+    """
+    y = y.detach().cpu().float()
+
+    # (2,T) -> (T,2)
+    y = y.transpose(0, 1).contiguous()
+
+    peak = float(y.abs().max().item())
+    if normalize_if_clip and peak > 1.0:
+        scale = peak_target / peak
+        y = y * scale
+        print(f"[warn] output peak {peak:.3f} > 1.0 -> scaled by {scale:.6f} to peak~{peak_target}")
+
+    sf.write(path, y.numpy(), sr, subtype=subtype)
 
 
 # -----------------------
@@ -286,7 +307,7 @@ def main():
 
     out = out / (wsum.clamp_min(1e-8)[None, :])
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    save_wav_stereo(args.out, out, sr)
+    save_wav_stereo(args.out, out, sr, subtype='FLOAT')
     print("saved:", args.out)
 
     if args.target is not None:
