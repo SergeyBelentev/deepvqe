@@ -358,6 +358,13 @@ def main():
     ap.add_argument("--hop", type=int, default=480)
     ap.add_argument("--win", type=int, default=1536)
 
+    # augment: random loudness/gain
+    ap.add_argument("--random-gain-db", type=float, default=0.0,
+                    help=("Uniform random gain in dB applied equally to mix/ref/target per (B*C) sample. "
+                          + "Range: [-random_gain_db, +random_gain_db]. Helps loudness robustness."
+                          ),
+                    )
+
     # model alignment
     ap.add_argument("--delay-frames", type=int, default=25)
     ap.add_argument("--align-hidden", type=int, default=64)
@@ -520,6 +527,18 @@ def main():
             mix_f = mix.reshape(B * C, T).float()
             ref_f = ref.reshape(B * C, T).float()
             tgt_f = tgt.reshape(B * C, T).float()
+
+            # augment: random gain (same gain for mix/ref/tgt -> keeps mix = tgt + bg_true consistent)
+            if args.random_gain_db and args.random_gain_db > 0:
+                # sample per row (B*C), keep time dimension broadcastable
+                # db ~ U(-G, +G)
+                db = (torch.rand((mix_f.shape[0], 1), device=device) * 2.0 - 1.0) * float(
+                args.random_gain_db)
+                # gain = 10^(db/20)
+                gain = torch.pow(mix_f.new_tensor(10.0), db / 20.0)  # (B*C,1)
+                mix_f = mix_f * gain
+                ref_f = ref_f * gain
+                tgt_f = tgt_f * gain
 
             # augment: shift REF input only (simulate unknown delay), quantized to hop
             if max_shift_frames > 0:
