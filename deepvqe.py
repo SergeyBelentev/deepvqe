@@ -51,48 +51,89 @@ class ResidualBlock(nn.Module):
         """Run a residual step on ``(B, C, T, F)`` features."""
 
         return self.elu(self.bn(self.conv(self.pad(x)))) + x
-    
-        
-class AlignBlock(nn.Module):
-    """Delay-aware alignment block used by the original DeepVQE paper."""
 
-    def __init__(self, in_channels: int, hidden_channels: int, delay: int = 100) -> None:
+
+class AlignBlock(nn.Module):
+    """
+    Bidirectional delay-aware alignment:
+      For each (t,f) in mic, attends to ref in window [t - past .. t + future].
+
+    Shapes:
+      x_mic, x_ref: (B, C, T, F)
+      returns ctx:  (B, H, T, F)
+      att:         (B, 1, T, K) where K = past + future + 1
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        delay_past: int = 25,
+        delay_future: int = 25,
+        logit_kernel_t: int = 5,
+        logit_kernel_k: int = 3,
+    ) -> None:
         super().__init__()
-        self.delay = delay
+        self.delay_past = int(delay_past)
+        self.delay_future = int(delay_future)
+        self.K = self.delay_past + self.delay_future + 1  # number of candidate lags
+
         self.pconv_mic = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_ref = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_val = nn.Conv2d(in_channels, hidden_channels, 1)
+
+        # Unfold over (T,F) treating T as "height".
+        # Pad top for past, bottom for future => bidirectional time window.
         self.unfold = nn.Sequential(
-            nn.ZeroPad2d([0, 0, delay - 1, 0]),
-            nn.Unfold((delay, 1)),
+            nn.ZeroPad2d([0, 0, self.delay_past, self.delay_future]),
+            nn.Unfold((self.K, 1)),
         )
-        self.conv = nn.Sequential(nn.ZeroPad2d([1, 1, 4, 0]), nn.Conv2d(hidden_channels, 1, (5, 3)))
+
+        # Symmetric smoothing of logits over (T,K).
+        # Original was causal in T (top pad only). Here symmetric.
+        if logit_kernel_t % 2 != 1 or logit_kernel_k % 2 != 1:
+            raise ValueError("logit_kernel_t and logit_kernel_k must be odd for symmetric padding.")
+
+        pad_t = logit_kernel_t // 2
+        pad_k = logit_kernel_k // 2
+
+        self.logit_smoother = nn.Sequential(
+            nn.ZeroPad2d([pad_k, pad_k, pad_t, pad_t]),  # (left,right,top,bottom)
+            nn.Conv2d(hidden_channels, 1, (logit_kernel_t, logit_kernel_k)),
+        )
 
     def forward(self, x_mic: Tensor, x_ref: Tensor, return_att: bool = False):
-        q_proj = self.pconv_mic(x_mic)  # (B,H,T,F)
-        k_proj = self.pconv_ref(x_ref)  # (B,H,T,F)
-        v_proj = self.pconv_val(x_ref)  # (B,H,T,F)
+        # Projections
+        q = self.pconv_mic(x_mic)  # (B,H,T,F)
+        k = self.pconv_ref(x_ref)  # (B,H,T,F)
+        v = self.pconv_val(x_ref)  # (B,H,T,F)
 
-        k_unfold = self.unfold(k_proj)  # (B,H*D, T*F)
-        B, H, T, F = k_proj.shape
-        D = self.delay
-        k_unfold = k_unfold.view(B, H, D, T, F).permute(0, 1, 3, 2, 4)  # (B,H,T,D,F)
+        # Unfold ref along time into K candidates
+        k_unf = self.unfold(k)  # (B, H*K, T*F)
+        B, H, T, F = k.shape
+        K = self.K
+        k_unf = k_unf.view(B, H, K, T, F).permute(0, 1, 3, 2, 4)  # (B,H,T,K,F)
 
-        # вместо q.unsqueeze(-2) * k_unfold -> sum(...): делаем matmul без гигантского intermediate
-        att_logits = torch.matmul(k_unfold, q_proj.unsqueeze(-1)).squeeze(-1)  # (B,H,T,D)
+        # Dot product over F, efficient matmul
+        # (B,H,T,K,F) @ (B,H,T,F,1) -> (B,H,T,K,1) -> (B,H,T,K)
+        att_logits = torch.matmul(k_unf, q.unsqueeze(-1)).squeeze(-1)  # (B,H,T,K)
 
-        att_logits = self.conv(att_logits)            # (B,1,T,D)
-        att = torch.softmax(att_logits, dim=-1)       # (B,1,T,D)
+        # Smooth logits and collapse H->1
+        att_logits = self.logit_smoother(att_logits)  # (B,1,T,K)
 
-        v_ctx = self.unfold(v_proj)
-        v_ctx = v_ctx.view(B, H, D, T, F).permute(0, 1, 3, 2, 4)        # (B,H,T,D,F)
+        # Softmax over candidate lags
+        att = torch.softmax(att_logits, dim=-1)       # (B,1,T,K)
 
-        ctx = torch.matmul(att.unsqueeze(-2), v_ctx).squeeze(-2)        # (B,H,T,F)
+        # Apply attention to V candidates
+        v_unf = self.unfold(v)  # (B, H*K, T*F)
+        v_unf = v_unf.view(B, H, K, T, F).permute(0, 1, 3, 2, 4)  # (B,H,T,K,F)
+
+        # (B,1,T,1,K) @ (B,H,T,K,F) -> (B,H,T,1,F) -> (B,H,T,F)
+        ctx = torch.matmul(att.unsqueeze(-2), v_unf).squeeze(-2)   # (B,H,T,F)
 
         if return_att:
             return ctx, att
         return ctx
-
 
 
 class EncoderBlock(nn.Module):
@@ -201,8 +242,9 @@ class DeepVQE(nn.Module):
 
     def __init__(
         self,
-        n_fft: int = 1536,          # <-- важно: под 48k fullband
-        delay_frames: int = 80,
+        n_fft: int = 1536,
+        delay_past_frames: int = 25,
+        delay_future_frames: int = 25,
         align_hidden: int = 64,
     ) -> None:
         super().__init__()
@@ -217,7 +259,12 @@ class DeepVQE(nn.Module):
         self.enblock4 = EncoderBlock(128, 128)
         self.enblock5 = EncoderBlock(128, 128)
 
-        self.align1 = AlignBlock(in_channels=64, hidden_channels=align_hidden, delay=delay_frames)
+        self.align1 = AlignBlock(
+            in_channels=64,
+            hidden_channels=align_hidden,
+            delay_past=delay_past_frames,
+            delay_future=delay_future_frames
+        )
         self.fuse1 = nn.Conv2d(64 + align_hidden, 64, kernel_size=1)
 
         # ---- dynamic F5 computation ----
@@ -245,11 +292,11 @@ class DeepVQE(nn.Module):
     def _align_ref_ri(self, ref_ri: Tensor, att: Tensor) -> Tensor:
         # ref_ri: (B,F,T,2), att: (B,1,T,D)
         B, F, T, _ = ref_ri.shape
-        D = self.align1.delay
+        K = self.align1.K
 
         r = ref_ri.permute(0, 3, 2, 1).contiguous()  # (B,2,T,F)
         r_unf = self.align1.unfold(r)  # (B,2*D, T*F)
-        r_unf = r_unf.view(B, 2, D, T, F).permute(0, 1, 3, 2, 4)  # (B,2,T,D,F)
+        r_unf = r_unf.view(B, 2, K, T, F)  # (B,2,K,D,F)
 
         aligned = torch.matmul(att.unsqueeze(-2), r_unf).squeeze(-2)  # (B,2,T,F)
         return aligned.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)

@@ -1,4 +1,6 @@
+# train.py
 from __future__ import annotations
+
 import argparse
 import csv
 from dataclasses import dataclass
@@ -43,30 +45,29 @@ def random_crop_same(signals: List[torch.Tensor], length: int) -> List[torch.Ten
     for s in signals:
         if s.shape[-1] < start + length:
             s = F.pad(s, (0, start + length - s.shape[-1]))
-        out.append(s[..., start : start + length])
+        out.append(s[..., start: start + length])
     return out
 
 
 def apply_ref_timevarying_gain(
-    ref_f: torch.Tensor,  # (N,T) float
+    ref_f: torch.Tensor,  # (N,T)
     *,
     sr: int,
     prob: float,
     max_db: float,
     knot_sec: float = 0.5,
     smooth_ms: float = 40.0,
-    row_mask: torch.Tensor | None = None,  # bool (N,) or (N,1)
+    row_mask: torch.Tensor | None = None,  # bool (N,)
 ) -> torch.Tensor:
     """
     Плавный time-varying gain только для REF (AGC/mastering drift).
 
-    - узлы каждые knot_sec (по умолчанию 0.5 сек)
+    - узлы каждые knot_sec
     - линейная интерполяция -> Hann-сглаживание (похоже на spline)
-    - применяется с вероятностью prob ТОЛЬКО к строкам из row_mask
+    - применяется с вероятностью prob только к строкам row_mask
     - величина в пределах ±max_db
 
-    ref_f: (N,T) где N = B*C (после reshape каналов в batch)
-    row_mask: какие строки (N,) вообще допускаются к аугменту (например, только speech или только no-speech)
+    ref_f: (N,T), где N = B*C (каналы слиты в batch)
     """
     if prob <= 0.0 or max_db <= 0.0:
         return ref_f
@@ -78,12 +79,13 @@ def apply_ref_timevarying_gain(
         eligible = torch.ones((N,), device=device, dtype=torch.bool)
     else:
         eligible = row_mask.to(device=device, dtype=torch.bool).view(-1)
+        if eligible.numel() != N:
+            raise RuntimeError(f"row_mask length mismatch: got {eligible.numel()} expected {N}")
 
     idx = torch.nonzero(eligible, as_tuple=False).flatten()
     if idx.numel() == 0:
         return ref_f
 
-    # на этих eligible выбираем подмножество, к которому реально применим дрейф (prob)
     sel = torch.rand((idx.numel(),), device=device) < float(prob)
     apply_idx = idx[sel]
     if apply_idx.numel() == 0:
@@ -93,15 +95,12 @@ def apply_ref_timevarying_gain(
     knot_samp = max(1, int(round(knot_sec * sr)))
     K = (T - 1) // knot_samp + 2  # >=2
 
-    # dB узлы: U(-max_db, +max_db)
     knots_db = (torch.rand((M, K), device=device, dtype=torch.float32) * 2.0 - 1.0) * float(max_db)
 
-    # интерполяция на длину T
     db_curve = F.interpolate(
         knots_db[:, None, :], size=T, mode="linear", align_corners=True
     ).squeeze(1)  # (M,T)
 
-    # сглаживание Hann по dB (low-pass)
     if smooth_ms > 0.0:
         L = int(round(smooth_ms * 1e-3 * sr))
         if L >= 3:
@@ -111,11 +110,9 @@ def apply_ref_timevarying_gain(
             w = w / w.sum().clamp_min(1e-12)
             db_curve = F.conv1d(db_curve[:, None, :], w[None, None, :], padding=L // 2).squeeze(1)
 
-    # dB -> gain
     gain = torch.pow(ref_f.new_tensor(10.0), db_curve / 20.0)  # (M,T)
 
-    # применяем inplace только к выбранным строкам
-    ref_f = ref_f.clone()  # чтобы не словить неожиданные alias-эффекты
+    ref_f = ref_f.clone()
     ref_f[apply_idx] = ref_f[apply_idx] * gain
     return ref_f
 
@@ -183,25 +180,18 @@ class MRSTFTLoss(nn.Module):
       - soft gate by target RMS (dBFS): near-silence => near-zero weight
       - spectral convergence denominator floor
       - optional clipping of SC/log terms
-    Drop-in replacement for your current MRSTFTLoss(x, y), where:
-      x = prediction waveform (B,T)
-      y = target waveform      (B,T)
     """
 
     def __init__(
         self,
         cfgs: List[Tuple[int, int, int]],
         eps: float = 1e-7,
-        # silence gate in dBFS (target RMS)
-        gate_db_low: float = -55.0,   # below -> MRSTFT weight ~ 0
-        gate_db_high: float = -40.0,  # above -> MRSTFT weight ~ 1
-        gate_detach: bool = True,     # do not backprop through gate
-        # SC denominator floor (in norm units of flattened Ymag)
+        gate_db_low: float = -55.0,
+        gate_db_high: float = -40.0,
+        gate_detach: bool = True,
         sc_denom_floor: float = 1.0,
-        # safety clips (set None to disable)
         sc_clip: float | None = 10.0,
         log_clip: float | None = 10.0,
-        # magnitude floor for log (prevents -inf and stabilizes logs)
         mag_floor: float = 1e-5,
         gate_floor: float = 0.05,
     ):
@@ -229,17 +219,11 @@ class MRSTFTLoss(nn.Module):
 
     @staticmethod
     def _rms_db(x: torch.Tensor, eps: float) -> torch.Tensor:
-        # x: (B,T)
         rms = torch.sqrt(torch.mean(x * x, dim=-1) + eps)  # (B,)
         return 20.0 * torch.log10(rms + eps)
 
     def _gate(self, y: torch.Tensor) -> torch.Tensor:
-        """
-        Soft weight w in [0..1] computed from target RMS dB.
-        y: (B,T)
-        """
         db = self._rms_db(y, self.eps)  # (B,)
-        # linear ramp between low..high
         w = (db - self.gate_db_low) / max(1e-6, (self.gate_db_high - self.gate_db_low))
         w = torch.clamp(w, 0.0, 1.0)
         w = self.gate_floor + (1.0 - self.gate_floor) * w
@@ -248,10 +232,6 @@ class MRSTFTLoss(nn.Module):
         return w  # (B,)
 
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        x,y: (B,T)
-        returns scalar
-        """
         x = x.float()
         y = y.float()
 
@@ -268,7 +248,6 @@ class MRSTFTLoss(nn.Module):
             Xmag = torch.abs(X).clamp_min(self.mag_floor)
             Ymag = torch.abs(Y).clamp_min(self.mag_floor)
 
-            # --- spectral convergence (per-sample) ---
             diff = (Ymag - Xmag).reshape(B, -1)
             ref = Ymag.reshape(B, -1)
 
@@ -280,19 +259,14 @@ class MRSTFTLoss(nn.Module):
             if self.sc_clip is not None:
                 sc = sc.clamp_max(float(self.sc_clip))
 
-            # --- log mag L1 (per-sample) ---
             logX = torch.log(Xmag)
             logY = torch.log(Ymag)
-            log_abs = torch.abs(logX - logY)  # (B,F,T)
+            log_abs = torch.abs(logX - logY)
             log_l1 = log_abs.mean(dim=(1, 2))  # (B,)
             if self.log_clip is not None:
                 log_l1 = log_l1.clamp_max(float(self.log_clip))
 
-            per = sc + log_l1  # (B,)
-
-            # silence gate: near-silence targets contribute ~0
-            per = per * w_gate
-
+            per = (sc + log_l1) * w_gate
             total = total + per.mean()
 
         return total / max(1, len(self.cfgs))
@@ -382,7 +356,18 @@ def _set_rng_state(state: Dict[str, Any]) -> None:
 
 
 def _assert_resume_compat(args_now: argparse.Namespace, ckpt_args: Dict[str, Any]) -> None:
-    keys = ["sr", "n_fft", "hop", "win", "delay_frames", "align_hidden"]
+    """
+    Жёсткие параметры, которые ДОЛЖНЫ совпасть, иначе веса/формы разъедутся.
+    """
+    keys = [
+        "sr",
+        "n_fft",
+        "hop",
+        "win",
+        "delay_past_frames",
+        "delay_future_frames",
+        "align_hidden",
+    ]
     mism = []
     for k in keys:
         if k in ckpt_args:
@@ -407,6 +392,37 @@ def _setup_tf32(enable: bool, verbose: bool = True) -> None:
     if verbose:
         print(f"TF32 matmul: {torch.backends.cuda.matmul.allow_tf32}")
         print(f"TF32 cudnn : {torch.backends.cudnn.allow_tf32}")
+
+
+def _resolve_delays(args: argparse.Namespace) -> None:
+    """
+    Поддержка:
+      - --delay-frames (deprecated): выставляет симметрично past=future
+      - --delay-past-frames / --delay-future-frames: явная настройка
+    Внутри args будут гарантированно int past/future.
+    """
+    past = args.delay_past_frames
+    fut = args.delay_future_frames
+    sym = args.delay_frames
+
+    if past is None and fut is None:
+        if sym is not None:
+            past = int(sym)
+            fut = int(sym)
+        else:
+            past = 25
+            fut = 25
+    else:
+        if past is None:
+            past = 25
+        if fut is None:
+            fut = 25
+
+    if past <= 0 or fut <= 0:
+        raise RuntimeError(f"delay frames must be > 0: past={past} future={fut}")
+
+    args.delay_past_frames = int(past)
+    args.delay_future_frames = int(fut)
 
 
 # -----------------------
@@ -435,11 +451,15 @@ def main():
     ap.add_argument("--win", type=int, default=1536)
 
     # augment: random loudness/gain
-    ap.add_argument("--random-gain-db", type=float, default=0.0,
-                    help=("Uniform random gain in dB applied equally to mix/ref/target per (B*C) sample. "
-                          + "Range: [-random_gain_db, +random_gain_db]. Helps loudness robustness."
-                          ),
-                    )
+    ap.add_argument(
+        "--random-gain-db",
+        type=float,
+        default=0.0,
+        help=(
+            "Uniform random gain in dB applied equally to mix/ref/target per (B*C) row. "
+            "Range: [-random_gain_db, +random_gain_db]."
+        ),
+    )
 
     # augment: time-varying gain drift for REF only (separately for no-speech vs speech)
     ap.add_argument("--ref-tv-gain-knot-sec", type=float, default=0.5, help="Knot spacing in seconds (REF drift)")
@@ -451,8 +471,10 @@ def main():
     ap.add_argument("--ref-tv-gain-prob-speech", type=float, default=0.05, help="Prob apply REF drift on speech segments")
     ap.add_argument("--ref-tv-gain-db-speech", type=float, default=2.0, help="±dB range for REF drift on speech")
 
-    # model alignment
-    ap.add_argument("--delay-frames", type=int, default=25)
+    # model alignment (bidirectional)
+    ap.add_argument("--delay-past-frames", type=int, default=None, help="Align search: how many frames into the past")
+    ap.add_argument("--delay-future-frames", type=int, default=None, help="Align search: how many frames into the future")
+    ap.add_argument("--delay-frames", type=int, default=None, help="(deprecated) sets past=future=delay_frames")
     ap.add_argument("--align-hidden", type=int, default=64)
 
     # augment: random ref shift, but quantized to hop (frame-aligned)
@@ -486,6 +508,7 @@ def main():
     ap.add_argument("--reset-scaler", action="store_true", help="Do NOT load GradScaler state")
 
     args = ap.parse_args()
+    _resolve_delays(args)
 
     # --- seeds ---
     torch.manual_seed(args.seed)
@@ -518,10 +541,20 @@ def main():
         raise RuntimeError("DataLoader has 0 batches. Use --batch 1 or add more data.")
 
     # --- model ---
-    model = DeepVQE(n_fft=args.n_fft, delay_frames=args.delay_frames, align_hidden=args.align_hidden).to(device)
+    model = DeepVQE(
+        n_fft=args.n_fft,
+        delay_past_frames=args.delay_past_frames,
+        delay_future_frames=args.delay_future_frames,
+        align_hidden=args.align_hidden,
+    ).to(device)
     model.train()
     if hasattr(model, "set_return_bg"):
         model.set_return_bg(True)
+
+    print(
+        f"model: n_fft={args.n_fft} | delay_past_frames={args.delay_past_frames} "
+        f"| delay_future_frames={args.delay_future_frames} | align_hidden={args.align_hidden}"
+    )
 
     # --- stft / loss ---
     stft = STFT(StftCfg(n_fft=args.n_fft, hop=args.hop, win=args.win)).to(device)
@@ -544,18 +577,19 @@ def main():
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
 
-    # autocast cache: default OFF (helps VRAM stability)
     autocast_cache = bool(args.amp_cache)
 
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-    # ref shift quantization to hop
+    # ref shift quantization to hop + clamp by align window
     max_shift_frames = int(round((args.ref_shift_ms * 1e-3 * args.sr) / args.hop))
-    max_shift_frames = min(max_shift_frames, max(0, args.delay_frames - 1))
+    max_shift_frames = max(0, max_shift_frames)
+    max_allowed = max(0, min(args.delay_past_frames, args.delay_future_frames) - 1)
+    max_shift_frames = min(max_shift_frames, max_allowed)
 
     # --- resume state ---
     start_epoch = 1
-    micro_step = 0  # counts minibatches; used for grad_accum phase continuity
+    micro_step = 0
 
     if args.resume is not None:
         ckpt_path = Path(args.resume)
@@ -614,24 +648,19 @@ def main():
             ref_f = ref.reshape(B * C, T).float()
             tgt_f = tgt.reshape(B * C, T).float()
 
-            # augment: random gain (same gain for mix/ref/tgt -> keeps mix = tgt + bg_true consistent)
+            # augment: random gain (same for mix/ref/tgt row-wise)
             if args.random_gain_db and args.random_gain_db > 0:
-                # sample per row (B*C), keep time dimension broadcastable
-                # db ~ U(-G, +G)
-                db = (torch.rand((mix_f.shape[0], 1), device=device) * 2.0 - 1.0) * float(
-                args.random_gain_db)
-                # gain = 10^(db/20)
-                gain = torch.pow(mix_f.new_tensor(10.0), db / 20.0)  # (B*C,1)
+                db = (torch.rand((mix_f.shape[0], 1), device=device) * 2.0 - 1.0) * float(args.random_gain_db)
+                gain = torch.pow(mix_f.new_tensor(10.0), db / 20.0)
                 mix_f = mix_f * gain
                 ref_f = ref_f * gain
                 tgt_f = tgt_f * gain
 
-            # build per-row masks for (B*C) because channels are treated as batch
-            # has_speech: (B,) -> (B*C,)
-            speech_rows = has_speech.to(device=device).repeat_interleave(C)  # bool (B*C,)
+            # per-row speech/nospeech masks (B*C,)
+            speech_rows = has_speech.to(device=device).repeat_interleave(C)
             nospeech_rows = ~speech_rows
 
-            # REF-only time-varying gain drift (AGC/mastering mismatch), separate params
+            # REF-only time-varying drift
             if args.ref_tv_gain_prob_nospeech > 0 and args.ref_tv_gain_db_nospeech > 0:
                 ref_f = apply_ref_timevarying_gain(
                     ref_f,
@@ -654,8 +683,7 @@ def main():
                     row_mask=speech_rows,
                 )
 
-
-            # augment: shift REF input only (simulate unknown delay), quantized to hop
+            # augment: shift REF (frame-aligned)
             if max_shift_frames > 0:
                 sh = int(torch.randint(-max_shift_frames, max_shift_frames + 1, (1,), device=device).item())
                 shift_samp = sh * args.hop
@@ -668,7 +696,7 @@ def main():
                     s = -shift_samp
                     ref_f = torch.cat([ref_f[:, s:], ref_f.new_zeros((ref_f.shape[0], s))], dim=1)
 
-            # STFT in fp32
+            # STFT fp32
             with torch.amp.autocast(device_type="cuda", enabled=False):
                 mix_ri = stft.stft_ri(mix_f)  # (B*2,F,Tf,2)
                 ref_ri = stft.stft_ri(ref_f)
@@ -676,7 +704,7 @@ def main():
                 bg_true_ri = mix_ri - tgt_ri
                 bg_true_wav = mix_f - tgt_f
 
-            # forward (optional AMP)
+            # forward
             with torch.amp.autocast(
                 device_type="cuda",
                 enabled=use_amp,
@@ -698,7 +726,6 @@ def main():
                 loss_bg = F.l1_loss(bg_wav, bg_true_wav)
                 loss_bg_stft = complex_l1(bg_ri, bg_true_ri)
                 loss_mr = mrstft(out_wav, tgt_f) if args.w_mrstft > 0 else out_wav.new_tensor(0.0)
-
                 loss_leak = corr_loss(out_wav, bg_true_wav)
 
                 loss = (
@@ -717,7 +744,6 @@ def main():
 
             micro_step += 1
 
-            # optimizer step every grad_accum micro-steps
             if micro_step % max(1, args.grad_accum) == 0:
                 if args.grad_clip > 0:
                     if scaler.is_enabled():
@@ -744,13 +770,17 @@ def main():
         avg = run_loss / max(1, len(dl))
         print(f"epoch {epoch:03d} | total {avg:.6f}")
 
+        # сохраняем args без deprecated delay_frames
+        args_to_save = vars(args).copy()
+        args_to_save.pop("delay_frames", None)
+
         ckpt_out = {
             "epoch": epoch,
             "micro_step": micro_step,
             "model": model.state_dict(),
             "opt": opt.state_dict(),
             "scaler": (scaler.state_dict() if scaler.is_enabled() else None),
-            "args": vars(args),
+            "args": args_to_save,
             "rng_state": _get_rng_state(),
         }
 

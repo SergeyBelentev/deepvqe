@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import argparse
 from pathlib import Path
 from typing import Literal, Tuple
@@ -30,25 +31,25 @@ def save_wav_stereo(
     y: torch.Tensor,
     sr: int,
     *,
-    subtype: str = "PCM_24",
+    subtype: str = "FLOAT",
     normalize_if_clip: bool = True,
     peak_target: float = 0.99,
 ) -> None:
     """
-    y: (2,T) float tensor (обычно fp32)
-    Пишем без клиппинга. Если пик > 1.0 — мягко нормализуем весь сигнал.
+    y: (2,T) float tensor
+    Без клиппинга: если subtype PCM_* и пик > 1.0 — мягко нормализуем.
+    Для subtype FLOAT можно не нормализовать вообще, но оставим поведение единым.
     """
     y = y.detach().cpu().float()
+    y = y.transpose(0, 1).contiguous()  # (T,2)
 
-    # (2,T) -> (T,2)
-    y = y.transpose(0, 1).contiguous()
-
-    peak = float(y.abs().max().item())
+    peak = float(y.abs().max().item()) if y.numel() else 0.0
     if normalize_if_clip and peak > 1.0:
         scale = peak_target / peak
         y = y * scale
         print(f"[warn] output peak {peak:.3f} > 1.0 -> scaled by {scale:.6f} to peak~{peak_target}")
 
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     sf.write(path, y.numpy(), sr, subtype=subtype)
 
 
@@ -76,7 +77,6 @@ class STFT(torch.nn.Module):
         self.register_buffer("window", torch.hann_window(win, dtype=torch.float32), persistent=False)
 
     def stft_ri(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,T) fp32
         X = torch.stft(
             x,
             n_fft=self.n_fft,
@@ -88,7 +88,7 @@ class STFT(torch.nn.Module):
         return torch.view_as_real(X).to(torch.float32)
 
     def istft_ri(self, X_ri: torch.Tensor, length: int) -> torch.Tensor:
-        X = torch.complex(X_ri[..., 0], X_ri[..., 1])
+        X = torch.complex(X_ri[..., 0].float(), X_ri[..., 1].float())
         y = torch.istft(
             X,
             n_fft=self.n_fft,
@@ -105,7 +105,7 @@ class STFT(torch.nn.Module):
 # -----------------------
 def make_fade_window(chunk_len: int, fade_len: int, device: torch.device) -> torch.Tensor:
     """
-    1D window for overlap-add: linear fade in/out.
+    Linear fade-in/out window for overlap-add.
     Returns (chunk_len,) float32.
     """
     w = torch.ones(chunk_len, device=device, dtype=torch.float32)
@@ -140,24 +140,19 @@ def run_one_chunk(
 
     C, Tc = mix_chunk.shape
 
-    # treat channels as batch
-    mix_f = mix_chunk.reshape(C, Tc).to(torch.float32)  # (2,Tc)
+    mix_f = mix_chunk.reshape(C, Tc).to(torch.float32)
     ref_f = ref_chunk.reshape(C, Tc).to(torch.float32)
 
-    # STFT always fp32
     mix_ri = stft_mod.stft_ri(mix_f)  # (2,F,Tf,2)
     ref_ri = stft_mod.stft_ri(ref_f)
 
-    # model forward maybe in bf16/fp16 to save VRAM
     with torch.amp.autocast(device_type="cuda", enabled=use_amp, dtype=amp_dtype):
         out_ri = model(mix_ri, ref_ri)
 
-    # If model returns (out,bg), take out
     if isinstance(out_ri, (tuple, list)) and len(out_ri) == 2:
         out_ri = out_ri[0]
 
-    # ISTFT fp32
-    out_wav = stft_mod.istft_ri(out_ri.to(torch.float32), length=Tc)  # (2,Tc)
+    out_wav = stft_mod.istft_ri(out_ri, length=Tc)  # (2,Tc)
     return out_wav
 
 
@@ -183,9 +178,7 @@ def _match_lengths(
 
     if mode == "crop":
         T = min(Tm, Tr)
-        mix = mix[:, :T]
-        ref = ref[:, :T]
-        return mix, ref
+        return mix[:, :T], ref[:, :T]
 
     if mode == "pad":
         T = max(Tm, Tr)
@@ -211,6 +204,28 @@ def _pad_or_trim_to_chunk(x: torch.Tensor, chunk_len: int) -> torch.Tensor:
     return x
 
 
+def _read_model_params_from_ckpt(ckpt_args: dict) -> tuple[int, int, int, int, int, int]:
+    """
+    Returns: sr, n_fft, hop, win, delay_past_frames, delay_future_frames, align_hidden
+    Compatible with older ckpt that had only delay_frames (symmetric).
+    """
+    sr = int(ckpt_args.get("sr", 48000))
+    n_fft = int(ckpt_args.get("n_fft", 1536))
+    hop = int(ckpt_args.get("hop", 480))
+    win = int(ckpt_args.get("win", 1536))
+    align_hidden = int(ckpt_args.get("align_hidden", 64))
+
+    if "delay_past_frames" in ckpt_args or "delay_future_frames" in ckpt_args:
+        dp = int(ckpt_args.get("delay_past_frames", 25))
+        df = int(ckpt_args.get("delay_future_frames", 25))
+    else:
+        # legacy symmetric
+        d = int(ckpt_args.get("delay_frames", 25))
+        dp, df = d, d
+
+    return sr, n_fft, hop, win, dp, df, align_hidden
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -233,27 +248,33 @@ def main():
         help="How to handle mix/ref length mismatch: crop to min length or pad to max length",
     )
 
-    # amp for inference (saves VRAM; bf16 usually ok on 4080)
+    # amp for inference
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--amp-dtype", choices=["bf16", "fp16"], default="bf16")
+
+    # output subtype
+    ap.add_argument("--out-subtype", default="FLOAT", choices=["FLOAT", "PCM_24", "PCM_16"])
 
     args = ap.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     ckpt_args = ckpt.get("args", {}) or {}
 
-    sr = int(ckpt_args.get("sr", 48000))
-    n_fft = int(ckpt_args.get("n_fft", 1536))
-    hop = int(ckpt_args.get("hop", 480))
-    win = int(ckpt_args.get("win", 1536))
-    delay_frames = int(ckpt_args.get("delay_frames", 25))
-    align_hidden = int(ckpt_args.get("align_hidden", 64))
+    sr, n_fft, hop, win, delay_past_frames, delay_future_frames, align_hidden = _read_model_params_from_ckpt(ckpt_args)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     print("device:", device)
-    print(f"stft: n_fft={n_fft} hop={hop} win={win} | model: delay_frames={delay_frames} align_hidden={align_hidden}")
+    print(
+        f"stft: n_fft={n_fft} hop={hop} win={win} | "
+        f"model: delay_past_frames={delay_past_frames} delay_future_frames={delay_future_frames} align_hidden={align_hidden}"
+    )
 
-    model = DeepVQE(n_fft=n_fft, delay_frames=delay_frames, align_hidden=align_hidden).to(device)
+    model = DeepVQE(
+        n_fft=n_fft,
+        delay_past_frames=delay_past_frames,
+        delay_future_frames=delay_future_frames,
+        align_hidden=align_hidden,
+    ).to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
 
@@ -267,7 +288,8 @@ def main():
     mix, ref = _match_lengths(mix, ref, mode=args.length_mode)
 
     C, T = mix.shape
-    assert C == 2
+    if C != 2:
+        raise RuntimeError(f"Expected stereo (2,T), got {tuple(mix.shape)}")
 
     chunk_len = int(round(args.chunk_sec * sr))
     overlap_len = int(round(args.overlap_sec * sr))
@@ -293,32 +315,32 @@ def main():
         mix_chunk = mix[:, pos:end]
         ref_chunk = ref[:, pos:end]
 
-        # ensure EXACT chunk_len for both
         mix_chunk = _pad_or_trim_to_chunk(mix_chunk, chunk_len)
         ref_chunk = _pad_or_trim_to_chunk(ref_chunk, chunk_len)
 
         out_chunk = run_one_chunk(model, stft_mod, mix_chunk, ref_chunk, use_amp, amp_dtype)  # (2,chunk_len)
 
         valid_len = min(chunk_len, T - pos)
-        out[:, pos : pos + valid_len] += out_chunk[:, :valid_len] * fade[:valid_len]
-        wsum[pos : pos + valid_len] += fade[:valid_len]
+        out[:, pos: pos + valid_len] += out_chunk[:, :valid_len] * fade[:valid_len]
+        wsum[pos: pos + valid_len] += fade[:valid_len]
 
         pos += step
 
     out = out / (wsum.clamp_min(1e-8)[None, :])
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    save_wav_stereo(args.out, out, sr, subtype='FLOAT')
+
+    save_wav_stereo(args.out, out, sr, subtype=args.out_subtype)
     print("saved:", args.out)
 
     if args.target is not None:
         tgt = load_wav_stereo(args.target, sr).to(device)
-        # match target length to output for metrics
+
         if tgt.shape[1] != out.shape[1]:
             Tm = min(tgt.shape[1], out.shape[1])
             tgt = tgt[:, :Tm]
             out_m = out[:, :Tm]
         else:
             out_m = out
+
         s0 = si_sdr_1d(out_m[0], tgt[0])
         s1 = si_sdr_1d(out_m[1], tgt[1])
         print(f"SI-SDR L={s0:.2f} dB | R={s1:.2f} dB | avg={(s0+s1)/2:.2f} dB")
