@@ -275,14 +275,81 @@ class MRSTFTLoss(nn.Module):
 # -----------------------
 # dataset
 # -----------------------
+def _sf_num_frames_and_sr(path: str) -> tuple[int, int]:
+    info = sf.info(path)
+    return int(info.frames), int(info.samplerate)
+
+
+def _load_wav_stereo_segment(path: str, sr_expected: int, start: int, length: int) -> torch.Tensor:
+    """
+    Read exactly [start : start+length) from file (stereo), pad zeros if out of bounds.
+    Returns: (2, length) float32
+    """
+    if length <= 0:
+        return torch.zeros((2, 0), dtype=torch.float32)
+
+    with sf.SoundFile(path, "r") as f:
+        if f.samplerate != sr_expected:
+            raise RuntimeError(f"SR mismatch for {path}: got {f.samplerate}, expected {sr_expected}")
+
+        frames = int(f.frames)
+        # if start beyond EOF -> silence
+        if start >= frames:
+            x = np.zeros((0, f.channels), dtype=np.float32)
+        else:
+            start_clamped = max(0, start)
+            f.seek(start_clamped)
+            x = f.read(frames=length, dtype="float32", always_2d=True)
+
+    # ensure stereo
+    if x.ndim == 1:
+        x = x[:, None]
+    if x.shape[1] == 1:
+        x = np.repeat(x, 2, axis=1)
+    else:
+        x = x[:, :2]
+
+    # pad to exact length
+    if x.shape[0] < length:
+        pad = length - x.shape[0]
+        x = np.vstack([x, np.zeros((pad, 2), dtype=np.float32)])
+
+    return torch.from_numpy(x).transpose(0, 1).contiguous()  # (2,T)
+
+
 class AecDataset(Dataset):
-    # CSV: mix_path, ref_path, target_path (target_path can be 'None' -> zero target)
-    def __init__(self, manifest_path: str, sr: int, segment_sec: float):
+    """
+    CSV: mix_path, ref_path, target_path (target_path can be 'None' -> zero target)
+
+    - short example (min_len < long_threshold_sec): behaves like old code (random_crop_same over full signals)
+    - long example: creates multiple virtual items (sliding windows), so long files contribute more segments.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str,
+        sr: int,
+        segment_sec: float,
+        *,
+        long_threshold_sec: float = 6.0,
+        long_hop_sec: float | None = None,
+        long_jitter_sec: float = 0.0,
+    ):
         self.manifest_path = manifest_path
         self.sr = sr
-        self.seg_len = int(sr * segment_sec)
-        self.items: List[Tuple[str, str, str]] = []
+        self.seg_len = int(round(sr * segment_sec))
+
+        self.long_threshold_len = int(round(sr * long_threshold_sec))
+        self.long_hop_len = int(round(sr * (long_hop_sec if long_hop_sec is not None else segment_sec)))
+        self.long_hop_len = max(1, self.long_hop_len)
+
+        self.long_jitter_len = int(round(sr * long_jitter_sec))
+        self.long_jitter_len = max(0, self.long_jitter_len)
+
+        self.items: List[tuple[str, str, str]] = []
+        self.index: List[tuple[int, int]] = []  # (base_item_idx, start_sample) ; start_sample=-1 means "short mode"
         self._load_manifest_data()
+        self._build_index()
 
     def _load_manifest_data(self) -> None:
         with open(self.manifest_path, "r", newline="", encoding="utf-8") as f:
@@ -296,24 +363,102 @@ class AecDataset(Dataset):
                     raise RuntimeError(f"Bad row (need 3 cols): {row}")
                 self.items.append((row[0].strip(), row[1].strip(), row[2].strip()))
 
+    def _min_aligned_len(self, mix_p: str, ref_p: str, tgt_p: str) -> int:
+        """
+        For long-window indexing we prefer the region where all signals exist (avoid padding).
+        """
+        mix_n, mix_sr = _sf_num_frames_and_sr(mix_p)
+        ref_n, ref_sr = _sf_num_frames_and_sr(ref_p)
+        if mix_sr != self.sr or ref_sr != self.sr:
+            raise RuntimeError(f"SR mismatch in manifest: {mix_p} sr={mix_sr}, {ref_p} sr={ref_sr}, expected {self.sr}")
+
+        if tgt_p != "None":
+            tgt_n, tgt_sr = _sf_num_frames_and_sr(tgt_p)
+            if tgt_sr != self.sr:
+                raise RuntimeError(f"SR mismatch in manifest: {tgt_p} sr={tgt_sr}, expected {self.sr}")
+            return min(mix_n, ref_n, tgt_n)
+
+        return min(mix_n, ref_n)
+
+    def _build_index(self) -> None:
+        self.index.clear()
+
+        for i, (mix_p, ref_p, tgt_p) in enumerate(self.items):
+            min_len = self._min_aligned_len(mix_p, ref_p, tgt_p)
+
+            # short mode: behave like old logic
+            if min_len < self.long_threshold_len:
+                self.index.append((i, -1))
+                continue
+
+            # long mode: build sliding windows over the whole aligned region
+            if min_len <= self.seg_len:
+                # still just one window
+                self.index.append((i, 0))
+                continue
+
+            max_start = min_len - self.seg_len
+            starts = list(range(0, max_start + 1, self.long_hop_len))
+
+            # ensure tail coverage (may create overlap)
+            if starts[-1] != max_start:
+                starts.append(max_start)
+
+            for s in starts:
+                self.index.append((i, int(s)))
+
+        if not self.index:
+            raise RuntimeError("Dataset index is empty. Check manifest or files.")
+
+        print(
+            f"[AecDataset] base_items={len(self.items)} virtual_items={len(self.index)} | "
+            f"seg_len={self.seg_len} long_thr={self.long_threshold_len} hop={self.long_hop_len} jitter={self.long_jitter_len}"
+        )
+
     def __len__(self) -> int:
-        return len(self.items)
+        return len(self.index)
 
     def __getitem__(self, idx: int):
-        mix_p, ref_p, tgt_p = self.items[idx]
-        mix = load_wav_stereo(mix_p, self.sr)  # (2,T)
-        ref = load_wav_stereo(ref_p, self.sr)  # (2,T)
+        base_i, start = self.index[idx]
+        mix_p, ref_p, tgt_p = self.items[base_i]
+        has_speech = (tgt_p != "None")
 
-        has_speech = tgt_p != "None"
+        # short mode: keep previous behavior (loads full audio)
+        if start < 0:
+            mix = load_wav_stereo(mix_p, self.sr)
+            ref = load_wav_stereo(ref_p, self.sr)
+            if not has_speech:
+                max_len = max(mix.shape[-1], ref.shape[-1])
+                tgt = mix.new_zeros((2, max_len))
+            else:
+                tgt = load_wav_stereo(tgt_p, self.sr)
+
+            mix, ref, tgt = random_crop_same([mix, ref, tgt], length=self.seg_len)
+            return mix, ref, tgt, has_speech
+
+        # long mode: windowed reading (reads only segment)
+        # optional jitter for diversity
+        if self.long_jitter_len > 0:
+            # symmetric jitter
+            j = int(torch.randint(-self.long_jitter_len, self.long_jitter_len + 1, (1,)).item())
+        else:
+            j = 0
+
+        # clamp to valid range based on aligned length
+        min_len = self._min_aligned_len(mix_p, ref_p, tgt_p)
+        max_start = max(0, min_len - self.seg_len)
+        start_j = int(max(0, min(max_start, start + j)))
+
+        mix = _load_wav_stereo_segment(mix_p, self.sr, start_j, self.seg_len)
+        ref = _load_wav_stereo_segment(ref_p, self.sr, start_j, self.seg_len)
 
         if not has_speech:
-            max_len = max(mix.shape[-1], ref.shape[-1])
-            tgt = mix.new_zeros((2, max_len))
+            tgt = mix.new_zeros((2, self.seg_len))
         else:
-            tgt = load_wav_stereo(tgt_p, self.sr)
+            tgt = _load_wav_stereo_segment(tgt_p, self.sr, start_j, self.seg_len)
 
-        mix, ref, tgt = random_crop_same([mix, ref, tgt], length=self.seg_len)
         return mix, ref, tgt, has_speech
+
 
 
 def collate(batch):
@@ -436,6 +581,14 @@ def main():
     ap.add_argument("--epochs", type=int, default=50, help="TOTAL epochs to train to (if resuming: must be > ckpt epoch)")
     ap.add_argument("--save-every-epochs", type=int, default=1)
 
+    # Dataset args
+    ap.add_argument("--long-threshold-sec", type=float, default=6.0,
+                    help="If min(mix/ref/tgt) longer than this -> use sliding windows over the whole file")
+    ap.add_argument("--long-hop-sec", type=float, default=None,
+                    help="Hop between windows for long examples. Default: segment-sec (no overlap). Use smaller for overlap.")
+    ap.add_argument("--long-jitter-sec", type=float, default=0.0,
+                    help="Random jitter added to each long-window start (seconds). Clamped to valid range.")
+
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--segment-sec", type=float, default=4.0)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -525,7 +678,14 @@ def main():
             print("cudnn.benchmark=True")
 
     # --- data ---
-    ds = AecDataset(args.manifest, sr=args.sr, segment_sec=args.segment_sec)
+    ds = AecDataset(
+        args.manifest,
+        sr=args.sr,
+        segment_sec=args.segment_sec,
+        long_threshold_sec=args.long_threshold_sec,
+        long_hop_sec=args.long_hop_sec,
+        long_jitter_sec=args.long_jitter_sec,
+    )
     dl = DataLoader(
         ds,
         batch_size=args.batch,
