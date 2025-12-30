@@ -79,6 +79,9 @@ class AlignBlockBi(nn.Module):
         *,
         force_contiguous_windows: bool = True,   # <- главный тумблер "жри VRAM, но быстрее"
         softmax_fp32: bool = True,               # стабильность softmax
+        contig_k: bool = True,
+        contig_v: bool = False,
+        ctx_mode: str = "loop"
     ) -> None:
         super().__init__()
         if delay_past < 0 or delay_future < 0:
@@ -105,46 +108,44 @@ class AlignBlockBi(nn.Module):
             nn.Conv2d(hidden_channels, 1, (logit_kernel_t, logit_kernel_k)),
         )
 
+        self.contig_k = contig_k
+        self.contig_v = contig_v
+        assert ctx_mode in ("loop", "matmul")
+        self.ctx_mode = ctx_mode
 
-    def _time_windows(self, x: Tensor) -> Tensor:
-        """
-        x: (B,H,T,F)
-        -> (B,H,T,K,F)
 
-        Tensor.unfold inserts window dim at the end, so:
-          x_pad.unfold(time) -> (B,H,T,F,K)
-        then permute -> (B,H,T,K,F)
-        """
-        x_pad = nn.functional.pad(x, (0, 0, self.delay_past, self.delay_future))   # pad time only
-        x_win = x_pad.unfold(dimension=2, size=self.K, step=1)         # (B,H,T,F,K)
-        x_win = x_win.permute(0, 1, 2, 4, 3)                           # (B,H,T,K,F)
-        if self.force_contiguous_windows:
-            # <-- тут ты “покупаешь” скорость за VRAM: окна материализуются
-            x_win = x_win.contiguous()
-        return x_win
+    def _time_windows(self, x: Tensor, make_contig: bool) -> Tensor:
+        x_pad = nn.functional.pad(x, (0, 0, self.delay_past, self.delay_future))      # (B,H,T+p+f,F)
+        x_win = x_pad.unfold(dimension=2, size=self.K, step=1)            # (B,H,T,F,K)
+        x_win = x_win.permute(0, 1, 2, 4, 3)                              # (B,H,T,K,F)
+        return x_win.contiguous() if make_contig else x_win
 
     def forward(self, x_mic: Tensor, x_ref: Tensor, return_att: bool = False):
         q = self.pconv_mic(x_mic)   # (B,H,T,F)
-        k = self.pconv_ref(x_ref)   # (B,H,T,F)
-        v = self.pconv_val(x_ref)   # (B,H,T,F)
+        k = self.pconv_ref(x_ref)
+        v = self.pconv_val(x_ref)
 
-        k_win = self._time_windows(k)  # (B,H,T,K,F)
-        v_win = self._time_windows(v)  # (B,H,T,K,F)
+        B, H, T, Freq = q.shape
+        K = self.K
 
-        # logits: (B,H,T,K) = (B,H,T,K,F) @ (B,H,T,F,1)
-        att_logits = torch.matmul(k_win, q.unsqueeze(-1)).squeeze(-1)  # (B,H,T,K)
+        # --- logits fast ---
+        k_win = self._time_windows(k, make_contig=self.contig_k)          # (B,H,T,K,F)
+        att_logits = torch.matmul(k_win, q.unsqueeze(-1)).squeeze(-1)     # (B,H,T,K)
+        att_logits = self.logit_smoother(att_logits)                      # (B,1,T,K)
+        att = torch.softmax(att_logits.float(), dim=-1).to(att_logits.dtype)
 
-        # smooth + collapse H->1
-        att_logits = self.logit_smoother(att_logits)  # (B,1,T,K)
-
-        # softmax по K
-        if self.softmax_fp32:
-            att = torch.softmax(att_logits.float(), dim=-1).to(att_logits.dtype)
+        # --- ctx ---
+        if self.ctx_mode == "matmul":
+            v_win = self._time_windows(v, make_contig=self.contig_v)
+            ctx = torch.matmul(att.unsqueeze(-2), v_win).squeeze(-2)      # (B,H,T,F)
         else:
-            att = torch.softmax(att_logits, dim=-1)
-
-        # ctx: (B,H,T,F) = (B,1,T,1,K) @ (B,H,T,K,F)
-        ctx = torch.matmul(att.unsqueeze(-2), v_win).squeeze(-2)  # (B,H,T,F)
+            # loop only once over K, without v_win materialization
+            v_pad = nn.functional.pad(v, (0, 0, self.delay_past, self.delay_future))  # (B,H,T+p+f,F)
+            ctx = q.new_zeros((B, H, T, Freq))
+            for i in range(K):
+                v_i = v_pad[:, :, i:i+T, :]                               # (B,H,T,F)
+                w_i = att[:, 0, :, i].unsqueeze(1).unsqueeze(-1)          # (B,1,T,1)
+                ctx = ctx + v_i * w_i
 
         if return_att:
             return ctx, att
