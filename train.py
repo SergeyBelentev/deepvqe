@@ -383,7 +383,15 @@ class AecDataset(Dataset):
     def _build_index(self) -> None:
         self.index.clear()
 
-        for i, (mix_p, ref_p, tgt_p) in enumerate(self.items):
+        pbar = tqdm(
+            enumerate(self.items),
+            total=len(self.items),
+            desc="Build index",
+            unit="file",
+            dynamic_ncols=True,
+        )
+
+        for i, (mix_p, ref_p, tgt_p) in pbar:
             min_len = self._min_aligned_len(mix_p, ref_p, tgt_p)
 
             # short mode: behave like old logic

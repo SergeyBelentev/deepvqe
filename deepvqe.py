@@ -290,16 +290,26 @@ class DeepVQE(nn.Module):
         self.ccm = CCM()
 
     def _align_ref_ri(self, ref_ri: Tensor, att: Tensor) -> Tensor:
-        # ref_ri: (B,F,T,2), att: (B,1,T,D)
+        # ref_ri: (B, F, T, 2)
+        # att:    (B, 1, T, K)
         B, F, T, _ = ref_ri.shape
         K = self.align1.K
 
-        r = ref_ri.permute(0, 3, 2, 1).contiguous()  # (B,2,T,F)
-        r_unf = self.align1.unfold(r)  # (B,2*D, T*F)
-        r_unf = r_unf.view(B, 2, K, T, F)  # (B,2,K,D,F)
+        r = ref_ri.permute(0, 3, 2, 1).contiguous()  # (B, 2, T, F)
+        r_unf = self.align1.unfold(r)  # (B, 2*K, T*F)
 
-        aligned = torch.matmul(att.unsqueeze(-2), r_unf).squeeze(-2)  # (B,2,T,F)
-        return aligned.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)
+        # (B, 2*K, T*F) -> (B, 2, K, T, F) -> (B, 2, T, K, F)
+        r_unf = (
+            r_unf.view(B, 2, K, T, F)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+
+        # att.unsqueeze(-2): (B, 1, T, 1, K)
+        # r_unf:             (B, 2, T, K, F)
+        aligned = torch.matmul(att.unsqueeze(-2), r_unf).squeeze(-2)  # (B, 2, T, F)
+
+        return aligned.permute(0, 3, 2, 1).contiguous()  # (B, F, T, 2)
 
     def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
         mic0 = self.fe(mic)   # (B,2,T,F)
