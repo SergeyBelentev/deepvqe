@@ -55,63 +55,93 @@ class ResidualBlock(nn.Module):
 
 class AlignBlockBi(nn.Module):
     """
-    Bidirectional delay-aware align:
-      - смотрим в прошлое и будущее относительно текущего фрейма
-      - D = past + future + 1
-      - окна делаем через Tensor.unfold (view), без nn.Unfold (без огромных аллокаций)
+    Bidirectional delay-aware alignment (memory-efficient):
+
+      For each (t,f) in mic attends to ref frames in window:
+        [t - delay_past .. t + delay_future]
+      K = delay_past + delay_future + 1
+
+    Shapes:
+      x_mic/x_ref: (B, C, T, F)
+      ctx:         (B, H, T, F)
+      att:         (B, 1, T, K)
     """
 
-    def __init__(self, in_channels: int, hidden_channels: int, delay_past: int, delay_future: int) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_channels: int,
+        delay_past: int = 25,
+        delay_future: int = 25,
+        logit_kernel_t: int = 5,
+        logit_kernel_k: int = 3,
+    ) -> None:
         super().__init__()
         if delay_past < 0 or delay_future < 0:
             raise ValueError("delay_past/delay_future must be >= 0")
 
         self.delay_past = int(delay_past)
         self.delay_future = int(delay_future)
-        self.D = self.delay_past + self.delay_future + 1
+        self.K = self.delay_past + self.delay_future + 1  # num candidate lags
 
         self.pconv_mic = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_ref = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_val = nn.Conv2d(in_channels, hidden_channels, 1)
 
-        # сверточка по (time, delay) для сглаживания логитов
-        self.conv = nn.Sequential(
-            nn.ZeroPad2d([1, 1, 4, 0]),  # (left,right,top,bottom) по (delay,time)
-            nn.Conv2d(hidden_channels, 1, (5, 3)),
+        # Сглаживание логитов по (T, K) симметричное.
+        if (logit_kernel_t % 2) != 1 or (logit_kernel_k % 2) != 1:
+            raise ValueError("logit_kernel_t/logit_kernel_k must be odd for symmetric padding.")
+
+        pad_t = logit_kernel_t // 2
+        pad_k = logit_kernel_k // 2
+        self.logit_smoother = nn.Sequential(
+            nn.ZeroPad2d([pad_k, pad_k, pad_t, pad_t]),  # (left,right,top,bottom) for (K,T)
+            nn.Conv2d(hidden_channels, 1, (logit_kernel_t, logit_kernel_k)),
         )
 
-    def _make_time_windows(self, x: Tensor) -> Tensor:
+    # (если где-то в коде у тебя осталось .D — оставим алиас)
+    @property
+    def D(self) -> int:
+        return self.K
+
+    def _time_windows(self, x: Tensor) -> Tensor:
         """
         x: (B,H,T,F)
-        return: (B,H,T,D,F) view
+        returns: (B,H,T,K,F) view
+
+        ВАЖНО: Tensor.unfold по dimension=2 (time) вернёт (B,H,T,F,K),
+        поэтому делаем permute -> (B,H,T,K,F).
         """
-        # pad по времени (dim=2). Для F.pad у (B,H,T,F) последняя пара dims: (T,F)
-        x_pad = nn.functional.pad(x, (0, 0, self.delay_past, self.delay_future))  # pad time
-        # unfold по time dim=2: получаем (B,H,T,D,F) (view)
-        return x_pad.unfold(dimension=2, size=self.D, step=1)
+        # pad only time dimension
+        x_pad = nn.functional.pad(x, (0, 0, self.delay_past, self.delay_future))  # (B,H,T+past+future,F)
+
+        # unfold over time => (B,H,T,F,K)
+        x_win = x_pad.unfold(dimension=2, size=self.K, step=1)
+
+        # reorder => (B,H,T,K,F)
+        return x_win.permute(0, 1, 2, 4, 3)
 
     def forward(self, x_mic: Tensor, x_ref: Tensor, return_att: bool = False):
-        """
-        x_mic/x_ref: (B,C,T,F)
-        return ctx: (B,H,T,F) и att: (B,1,T,D)
-        """
-        q_proj = self.pconv_mic(x_mic)  # (B,H,T,F)
-        k_proj = self.pconv_ref(x_ref)  # (B,H,T,F)
-        v_proj = self.pconv_val(x_ref)  # (B,H,T,F)
+        # Projections
+        q = self.pconv_mic(x_mic)  # (B,H,T,F)
+        k = self.pconv_ref(x_ref)  # (B,H,T,F)
+        v = self.pconv_val(x_ref)  # (B,H,T,F)
 
-        k_win = self._make_time_windows(k_proj)  # (B,H,T,D,F) view
-        v_win = self._make_time_windows(v_proj)  # (B,H,T,D,F) view
+        # Windows (view)
+        k_win = self._time_windows(k)  # (B,H,T,K,F)
+        v_win = self._time_windows(v)  # (B,H,T,K,F)
 
-        # logits: (B,H,T,D) без giant intermediate
-        # sum over F
-        att_logits = torch.einsum("bhtf,bhtdf->bhtd", q_proj, k_win)
+        # logits: (B,H,T,K)  via matmul over F
+        # (B,H,T,K,F) @ (B,H,T,F,1) -> (B,H,T,K,1) -> (B,H,T,K)
+        att_logits = torch.matmul(k_win, q.unsqueeze(-1)).squeeze(-1)
 
-        # conv expects (B,C,H,W) => (B,H,T,D)
-        att_logits = self.conv(att_logits)          # (B,1,T,D)
-        att = torch.softmax(att_logits, dim=-1)     # (B,1,T,D)
+        # smooth + collapse H->1
+        att_logits = self.logit_smoother(att_logits)      # (B,1,T,K)
+        att = torch.softmax(att_logits, dim=-1)           # (B,1,T,K)
 
-        # ctx: (B,H,T,F) weighted sum over D
-        ctx = torch.einsum("b1td,bhtdf->bhtf", att, v_win)
+        # ctx: weighted sum over K
+        # (B,1,T,1,K) @ (B,H,T,K,F) -> (B,H,T,1,F) -> (B,H,T,F)
+        ctx = torch.matmul(att.unsqueeze(-2), v_win).squeeze(-2)
 
         if return_att:
             return ctx, att
@@ -273,23 +303,36 @@ class DeepVQE(nn.Module):
 
     def _align_ref_ri(self, ref_ri: Tensor, att: Tensor) -> Tensor:
         """
+        Align full-resolution complex ref by attention computed on encoder features.
+
         ref_ri: (B,F,T,2)
-        att:    (B,1,T,D)
+        att:    (B,1,T,K)  where K = delay_past + delay_future + 1
+        returns aligned_ref_ri: (B,F,T,2)
         """
-        B, F, T, _ = ref_ri.shape
-        D = self.align1.D
+        B, Freq, T, _ = ref_ri.shape
+        K = self.align1.K
         p = self.align1.delay_past
         q = self.align1.delay_future
 
-        r = ref_ri.permute(0, 3, 2, 1).contiguous()  # (B,2,T,F)
+        # (B,F,T,2) -> (B,2,T,F)
+        r = ref_ri.permute(0, 3, 2, 1).contiguous()
 
-        # pad time then unfold (view): (B,2,T,D,F)
+        # pad time, then unfold over time:
+        # r_pad: (B,2,T+p+q,F)
         r_pad = nn.functional.pad(r, (0, 0, p, q))
-        r_win = r_pad.unfold(dimension=2, size=D, step=1)  # (B,2,T,D,F)
 
-        aligned = torch.einsum("b1td,bctdf->bctf", att, r_win)  # (B,2,T,F)
+        # unfold => (B,2,T,F,K)  !!! K last
+        r_win = r_pad.unfold(dimension=2, size=K, step=1)
 
-        return aligned.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)
+        # reorder => (B,2,T,K,F)
+        r_win = r_win.permute(0, 1, 2, 4, 3)
+
+        # weighted sum over K:
+        # (B,1,T,1,K) @ (B,2,T,K,F) -> (B,2,T,1,F) -> (B,2,T,F)
+        aligned = torch.matmul(att.unsqueeze(-2), r_win).squeeze(-2)
+
+        # back to (B,F,T,2)
+        return aligned.permute(0, 3, 2, 1).contiguous()
 
     def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
         mic0 = self.fe(mic)   # (B,2,T,F)
