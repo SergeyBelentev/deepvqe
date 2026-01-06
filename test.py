@@ -22,7 +22,8 @@ class Model:
         self.n_fft = None
         self.hop = None
         self.win = None
-        self.delay_frames = None
+        self.delay_past_frames = None
+        self.delay_future_frames = None
         self.align_hidden = None
         self.epoch = None
 
@@ -37,13 +38,15 @@ class Model:
         self.n_fft = int(ckpt_args.get("n_fft", 1536))
         self.hop = int(ckpt_args.get("hop", 480))
         self.win = int(ckpt_args.get("win", 1536))
-        self.delay_frames = int(ckpt_args.get("delay_frames", 25))
+        self.delay_past_frames = int(ckpt_args.get("delay_past_frames", 25))
+        self.delay_future_frames = int(ckpt_args.get("delay_future_frames", 25))
         self.align_hidden = int(ckpt_args.get("align_hidden", 64))
         self.epoch = int(ckpt.get("epoch", 0) or 0)
 
         self.model = DeepVQE(
             n_fft=self.n_fft,
-            delay_frames=self.delay_frames,
+            delay_past_frames=self.delay_past_frames,
+            delay_future_frames=self.delay_future_frames,
             align_hidden=self.align_hidden
         ).to(self.device)
         self.model.load_state_dict(ckpt["model"], strict=True)
@@ -134,7 +137,7 @@ class Model:
 ckpt_base_path = Path('ckpt_48k').resolve()
 
 
-ckpts = [ckpt_base_path / f'deepvqe_aec48k_e{str(e).zfill(3)}.pt' for e in range(8, 11)]
+ckpts = [ckpt_base_path / f'deepvqe_aec48k_e{str(e).zfill(3)}.pt' for e in range(3, 5)]
 
 models = [Model(ckpt) for ckpt in ckpts]
 

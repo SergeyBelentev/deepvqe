@@ -55,12 +55,13 @@ class ResidualBlock(nn.Module):
 
 class AlignBlockBi(nn.Module):
     """
-    Bidirectional delay-aware alignment.
+    Bidirectional delay-aware alignment WITHOUT unfold().
 
-    FAST path:
-      - build time windows with Tensor.unfold (view)
-      - (optionally) materialize to contiguous to speed up matmul
-      - logits/ctx computed with batched matmul (no Python loop over K)
+    Idea:
+      - pad k/v along time
+      - compute attention logits by shifting k over K lags
+      - do it in small blocks (k_block) to trade speed vs memory
+      - compute ctx similarly (weighted sum of shifted v)
 
     Shapes:
       x_mic/x_ref: (B, C, T, F)
@@ -77,11 +78,9 @@ class AlignBlockBi(nn.Module):
         logit_kernel_t: int = 5,
         logit_kernel_k: int = 3,
         *,
-        force_contiguous_windows: bool = True,   # <- главный тумблер "жри VRAM, но быстрее"
-        softmax_fp32: bool = True,               # стабильность softmax
-        contig_k: bool = True,
-        contig_v: bool = False,
-        ctx_mode: str = "loop"
+        softmax_fp32: bool = True,
+        k_block: int = 8,               # 1..K, чем больше -> быстрее, но больше память
+        accumulate_fp32: bool = True,   # суммирование ctx в fp32
     ) -> None:
         super().__init__()
         if delay_past < 0 or delay_future < 0:
@@ -91,61 +90,84 @@ class AlignBlockBi(nn.Module):
         self.delay_future = int(delay_future)
         self.K = self.delay_past + self.delay_future + 1
 
-        self.force_contiguous_windows = bool(force_contiguous_windows)
+        if (logit_kernel_t % 2) != 1 or (logit_kernel_k % 2) != 1:
+            raise ValueError("logit_kernel_t/logit_kernel_k must be odd for symmetric padding.")
+
         self.softmax_fp32 = bool(softmax_fp32)
+        self.k_block = int(k_block)
+        self.accumulate_fp32 = bool(accumulate_fp32)
 
         self.pconv_mic = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_ref = nn.Conv2d(in_channels, hidden_channels, 1)
         self.pconv_val = nn.Conv2d(in_channels, hidden_channels, 1)
 
-        if (logit_kernel_t % 2) != 1 or (logit_kernel_k % 2) != 1:
-            raise ValueError("logit_kernel_t/logit_kernel_k must be odd for symmetric padding.")
-
         pad_t = logit_kernel_t // 2
         pad_k = logit_kernel_k // 2
         self.logit_smoother = nn.Sequential(
-            nn.ZeroPad2d([pad_k, pad_k, pad_t, pad_t]),  # (left,right,top,bottom) for (K,T)
+            nn.ZeroPad2d([pad_k, pad_k, pad_t, pad_t]),  # pads (K,T) in Conv2d layout
             nn.Conv2d(hidden_channels, 1, (logit_kernel_t, logit_kernel_k)),
         )
 
-        self.contig_k = contig_k
-        self.contig_v = contig_v
-        assert ctx_mode in ("loop", "matmul")
-        self.ctx_mode = ctx_mode
-
-
-    def _time_windows(self, x: Tensor, make_contig: bool) -> Tensor:
-        x_pad = nn.functional.pad(x, (0, 0, self.delay_past, self.delay_future))      # (B,H,T+p+f,F)
-        x_win = x_pad.unfold(dimension=2, size=self.K, step=1)            # (B,H,T,F,K)
-        x_win = x_win.permute(0, 1, 2, 4, 3)                              # (B,H,T,K,F)
-        return x_win.contiguous() if make_contig else x_win
-
     def forward(self, x_mic: Tensor, x_ref: Tensor, return_att: bool = False):
-        q = self.pconv_mic(x_mic)   # (B,H,T,F)
-        k = self.pconv_ref(x_ref)
-        v = self.pconv_val(x_ref)
+        q = self.pconv_mic(x_mic)  # (B,H,T,F)
+        k = self.pconv_ref(x_ref)  # (B,H,T,F)
+        v = self.pconv_val(x_ref)  # (B,H,T,F)
 
         B, H, T, Freq = q.shape
         K = self.K
+        kb = max(1, min(self.k_block, K))
 
-        # --- logits fast ---
-        k_win = self._time_windows(k, make_contig=self.contig_k)          # (B,H,T,K,F)
-        att_logits = torch.matmul(k_win, q.unsqueeze(-1)).squeeze(-1)     # (B,H,T,K)
-        att_logits = self.logit_smoother(att_logits)                      # (B,1,T,K)
-        att = torch.softmax(att_logits.float(), dim=-1).to(att_logits.dtype)
+        # pad time: (B,H,T+p+f,F)
+        k_pad = nn.functional.pad(k, (0, 0, self.delay_past, self.delay_future))
+        v_pad = nn.functional.pad(v, (0, 0, self.delay_past, self.delay_future))
 
-        # --- ctx ---
-        if self.ctx_mode == "matmul":
-            v_win = self._time_windows(v, make_contig=self.contig_v)
-            ctx = torch.matmul(att.unsqueeze(-2), v_win).squeeze(-2)      # (B,H,T,F)
+        # ---------- logits (B,H,T,K) ----------
+        # держим логиты в dtype q (обычно fp32 у тебя), но можно принудить fp32
+        logits_dtype = torch.float32 if self.softmax_fp32 else q.dtype
+        att_logits = q.new_empty((B, H, T, K), dtype=logits_dtype)
+
+        # block-wise по K, чтобы не делать огромных окон
+        q_for = q.to(logits_dtype) if q.dtype != logits_dtype else q
+        for s in range(0, K, kb):
+            e = min(K, s + kb)
+            # stack shifted k: (B,H,T,kb,F)
+            k_blk = torch.stack(
+                [k_pad[:, :, (s+i):(s+i+T), :] for i in range(e - s)],
+                dim=3,
+            ).to(logits_dtype)
+            # dot over F: (B,H,T,kb)
+            att_logits[:, :, :, s:e] = (k_blk * q_for.unsqueeze(3)).sum(dim=-1)
+
+        # smooth logits: Conv2d expects (B,C,T,K) -> OK
+        att_logits = self.logit_smoother(att_logits)  # (B,1,T,K)
+
+        if self.softmax_fp32:
+            att = torch.softmax(att_logits.float(), dim=-1).to(att_logits.dtype)
         else:
-            # loop only once over K, without v_win materialization
-            v_pad = nn.functional.pad(v, (0, 0, self.delay_past, self.delay_future))  # (B,H,T+p+f,F)
-            ctx = q.new_zeros((B, H, T, Freq))
-            for i in range(K):
-                v_i = v_pad[:, :, i:i+T, :]                               # (B,H,T,F)
-                w_i = att[:, 0, :, i].unsqueeze(1).unsqueeze(-1)          # (B,1,T,1)
-                ctx = ctx + v_i * w_i
+            att = torch.softmax(att_logits, dim=-1)
+
+        # ---------- ctx: sum_i att_i * v_shift_i ----------
+        # аккуратно: копим в fp32, потом кастим (у тебя fp32 обучение, но пусть будет надёжно)
+        if self.accumulate_fp32:
+            ctx = q.new_zeros((B, H, T, Freq), dtype=torch.float32)
+            v_for = v_pad.to(torch.float32) if v_pad.dtype != torch.float32 else v_pad
+            att_for = att.to(torch.float32) if att.dtype != torch.float32 else att
+        else:
+            ctx = q.new_zeros((B, H, T, Freq), dtype=q.dtype)
+            v_for = v_pad
+            att_for = att
+
+        for s in range(0, K, kb):
+            e = min(K, s + kb)
+            v_blk = torch.stack(
+                [v_for[:, :, (s+i):(s+i+T), :] for i in range(e - s)],
+                dim=3,  # (B,H,T,kb,F)
+            )
+            w_blk = att_for[:, 0, :, s:e]  # (B,T,kb)
+            ctx = ctx + (v_blk * w_blk[:, None, :, :, None]).sum(dim=3)  # sum over kb
+
+        if self.accumulate_fp32 and q.dtype != torch.float32:
+            ctx = ctx.to(q.dtype)
 
         if return_att:
             return ctx, att
@@ -309,26 +331,37 @@ class DeepVQE(nn.Module):
         """
         ref_ri: (B,F,T,2)
         att:    (B,1,T,K)
-        out:    (B,F,T,2)
+        out:    aligned ref_ri (B,F,T,2)
+
+        Без unfold(): weighted sum of shifted ref_ri по лагам, block-wise.
         """
         B, Freq, T, _ = ref_ri.shape
         K = self.align1.K
         p = self.align1.delay_past
         q = self.align1.delay_future
 
-        r = ref_ri.permute(0, 3, 2, 1).contiguous()  # (B,2,T,F)
+        # (B,2,T,F)
+        r = ref_ri.permute(0, 3, 2, 1).contiguous()
         r_pad = nn.functional.pad(r, (0, 0, p, q))  # (B,2,T+p+q,F)
 
-        r_win = r_pad.unfold(dimension=2, size=K, step=1)  # (B,2,T,F,K)
-        r_win = r_win.permute(0, 1, 2, 4, 3)  # (B,2,T,K,F)
+        kb = max(1, min(getattr(self.align1, "k_block", 8), K))
 
-        if getattr(self.align1, "force_contiguous_windows", False):
-            r_win = r_win.contiguous()
+        # копим в fp32 (даже если когда-то включишь AMP)
+        r_for = r_pad.float()
+        att_for = att.float()
+        aligned = r_for.new_zeros((B, 2, T, Freq), dtype=torch.float32)
 
-        # (B,1,T,1,K) @ (B,2,T,K,F) -> (B,2,T,F)
-        aligned = torch.matmul(att.unsqueeze(-2), r_win).squeeze(-2)
+        for s in range(0, K, kb):
+            e = min(K, s + kb)
+            r_blk = torch.stack(
+                [r_for[:, :, (s + i):(s + i + T), :] for i in range(e - s)],
+                dim=3,  # (B,2,T,kb,F)
+            )
+            w_blk = att_for[:, 0, :, s:e]  # (B,T,kb)
+            aligned = aligned + (r_blk * w_blk[:, None, :, :, None]).sum(dim=3)
 
-        return aligned.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)
+        # back to (B,F,T,2)
+        return aligned.to(ref_ri.dtype).permute(0, 3, 2, 1).contiguous()
 
     def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
         mic0 = self.fe(mic)   # (B,2,T,F)
