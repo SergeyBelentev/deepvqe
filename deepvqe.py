@@ -397,3 +397,74 @@ class DeepVQE(nn.Module):
 
 
 
+class DeepVQEStemSeparator(nn.Module):
+    """
+    Unconditional separator (Phase A/B) on top of DeepVQE backbone.
+    Uses the same FE/Encoder/Decoder + CCM, but applies per-head CCM to MIX.
+
+    Input:  mix_ri (B,F,T,2)
+    Output: stems_ri (B,S,F,T,2) where S = num_heads
+    """
+
+    def __init__(self, n_fft: int = 1536, num_heads: int = 6):
+        super().__init__()
+        self.n_fft = n_fft
+        self.num_heads = int(num_heads)
+
+        self.fe = FE()
+
+        self.enblock1 = EncoderBlock(2, 64)
+        self.enblock2 = EncoderBlock(64, 128)
+        self.enblock3 = EncoderBlock(128, 128)
+        self.enblock4 = EncoderBlock(128, 128)
+        self.enblock5 = EncoderBlock(128, 128)
+
+        # dynamic F5 like in your DeepVQE
+        F_in = n_fft // 2 + 1
+        with torch.no_grad():
+            dummy = torch.zeros(1, 2, 8, F_in)
+            y = self.enblock5(self.enblock4(self.enblock3(self.enblock2(self.enblock1(dummy)))))
+            self.F5 = y.shape[-1]
+
+        self.bottle = Bottleneck(128 * self.F5, 64 * self.F5)
+
+        self.deblock5 = DecoderBlock(128, 128)
+        self.deblock4 = DecoderBlock(128, 128)
+        self.deblock3 = DecoderBlock(128, 128)
+        self.deblock2 = DecoderBlock(128, 64)
+        self.deblock1 = DecoderBlock(64, 27, is_last=True)
+
+        self.ccm = CCM()
+
+        # per-head CCM masks: 27 channels per head
+        self.head = nn.Conv2d(27, 27 * self.num_heads, kernel_size=1)
+
+    def forward(self, mix_ri: Tensor) -> Tensor:
+        # mix_ri: (B,F,T,2)
+        x0 = self.fe(mix_ri)            # (B,2,T,F)
+        x1 = self.enblock1(x0)          # (B,64,T,F')
+        en2 = self.enblock2(x1)
+        en3 = self.enblock3(en2)
+        en4 = self.enblock4(en3)
+        en5 = self.enblock5(en4)
+
+        z = self.bottle(en5)
+
+        d5 = self.deblock5(z, en5)[..., :en4.shape[-1]]
+        d4 = self.deblock4(d5, en4)[..., :en3.shape[-1]]
+        d3 = self.deblock3(d4, en3)[..., :en2.shape[-1]]
+        d2 = self.deblock2(d3, en2)[..., :x1.shape[-1]]
+        d1 = self.deblock1(d2, x1)[..., :x0.shape[-1]]   # (B,27,T,F)
+
+        m = self.head(d1)  # (B,27*S,T,F)
+
+        # Apply CCM per head: batch-flatten heads
+        B, _, T, Freq = m.shape
+        S = self.num_heads
+
+        m2 = rearrange(m, "b (s c) t f -> (b s) c t f", s=S)  # (B*S,27,T,F)
+        x2 = mix_ri.repeat_interleave(S, dim=0)               # (B*S,F,T,2)
+
+        y2 = self.ccm(m2, x2)  # (B*S,F,T,2)
+        y = rearrange(y2, "(b s) f t r -> b s f t r", b=B, s=S)
+        return y
