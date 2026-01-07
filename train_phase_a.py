@@ -382,7 +382,7 @@ def save_ckpt(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError(f"Bad checkpoint format: {path}")
     return ckpt
@@ -390,7 +390,9 @@ def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
 
 def restore_rng(ckpt: Dict[str, Any]) -> None:
     if "rng_state_torch" in ckpt:
-        torch.set_rng_state(ckpt["rng_state_torch"])
+        state = ckpt["rng_state_torch"]
+        state = state.detach().to("cpu")
+        torch.set_rng_state(state)
     if torch.cuda.is_available() and "rng_state_cuda" in ckpt:
         try:
             torch.cuda.set_rng_state_all(ckpt["rng_state_cuda"])
