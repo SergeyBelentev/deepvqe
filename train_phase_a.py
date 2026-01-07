@@ -1,4 +1,3 @@
-# train_phase_a_v2.py
 from __future__ import annotations
 
 import argparse
@@ -26,9 +25,6 @@ def _num_frames_and_sr(path: str) -> tuple[int, int, int]:
 
 
 def _read_stereo_segment(path: str, sr_expected: int, start: int, length: int) -> torch.Tensor:
-    """
-    Returns (2, length) float32, pads with zeros if needed.
-    """
     if length <= 0:
         return torch.zeros((2, 0), dtype=torch.float32)
 
@@ -46,7 +42,6 @@ def _read_stereo_segment(path: str, sr_expected: int, start: int, length: int) -
             f.seek(start_clamped)
             x = f.read(frames=length, dtype="float32", always_2d=True)
 
-    # ensure 2ch
     if x.ndim == 1:
         x = x[:, None]
     if x.shape[1] == 1:
@@ -62,7 +57,7 @@ def _read_stereo_segment(path: str, sr_expected: int, start: int, length: int) -
 
 
 # -----------------------
-# STFT helper (fp32)
+# STFT helper (fp32) — same behavior as your train
 # -----------------------
 @dataclass
 class StftCfg:
@@ -86,6 +81,8 @@ class STFT(nn.Module):
             win_length=self.cfg.win,
             window=w,
             return_complex=True,
+            center=True,
+            pad_mode="reflect",
         )
         return torch.view_as_real(X).to(torch.float32)  # (N,F,Tf,2)
 
@@ -99,6 +96,7 @@ class STFT(nn.Module):
             win_length=self.cfg.win,
             window=w,
             length=length,
+            center=True,
         )
         return y.to(torch.float32)
 
@@ -199,11 +197,11 @@ def load_manifest_csv(path: str) -> List[TrackItem]:
     return items
 
 
-class StemPhaseADataset(Dataset):
+class StemDataset(Dataset):
     """
     Returns RAW (unscaled) segments:
-      full, bass, drums, inst, melody, vocals, is_vocal
-    Scaling + choice of mix-mode is done in training step (so we can mix A/B by probability).
+      full, bass, drums, inst, melody, vocals
+    Scaling + mode selection happens in train loop.
     """
 
     def __init__(
@@ -230,7 +228,6 @@ class StemPhaseADataset(Dataset):
         self._build_index()
 
     def _min_len(self, it: TrackItem) -> int:
-        # We ALWAYS need full + stems (because mix-mode can change per sample)
         paths = [it.full, it.bass, it.drums, it.instruments]
         if it.kind == "vocal":
             if not it.vocals:
@@ -243,7 +240,7 @@ class StemPhaseADataset(Dataset):
 
         mins = None
         for p in paths:
-            n, sr, _ch = _num_frames_and_sr(p)
+            n, sr, _ = _num_frames_and_sr(p)
             if sr != self.sr:
                 raise RuntimeError(f"SR mismatch: {p} sr={sr}, expected {self.sr}")
             mins = n if mins is None else min(mins, n)
@@ -273,7 +270,7 @@ class StemPhaseADataset(Dataset):
             raise RuntimeError("Dataset index is empty. Check audio files / sr / lengths.")
 
         print(
-            f"[StemPhaseADataset] tracks={len(self.items)} virtual_items={len(self.index)} "
+            f"[StemDataset] tracks={len(self.items)} virtual_items={len(self.index)} "
             f"| seg_len={self.seg_len} long_thr={self.long_threshold_len} hop={self.long_hop_len} jitter={self.long_jitter_len}"
         )
 
@@ -292,10 +289,7 @@ class StemPhaseADataset(Dataset):
             else:
                 start_j = int(torch.randint(0, n - self.seg_len + 1, (1,)).item())
         else:
-            if self.long_jitter_len > 0:
-                j = int(torch.randint(-self.long_jitter_len, self.long_jitter_len + 1, (1,)).item())
-            else:
-                j = 0
+            j = int(torch.randint(-self.long_jitter_len, self.long_jitter_len + 1, (1,)).item()) if self.long_jitter_len > 0 else 0
             n = self._min_len(it)
             max_start = max(0, n - self.seg_len)
             start_j = int(max(0, min(max_start, start + j)))
@@ -312,7 +306,7 @@ class StemPhaseADataset(Dataset):
             melody = _read_stereo_segment(it.melody, self.sr, start_j, self.seg_len)  # type: ignore[arg-type]
             vocals = torch.zeros_like(melody)
 
-        return full, bass, drums, inst, melody, vocals, bool(is_vocal)
+        return full, bass, drums, inst, melody, vocals
 
 
 def collate(batch):
@@ -322,27 +316,17 @@ def collate(batch):
     inst = torch.stack([b[3] for b in batch], dim=0)
     melody = torch.stack([b[4] for b in batch], dim=0)
     vocals = torch.stack([b[5] for b in batch], dim=0)
-    is_vocal = torch.tensor([b[6] for b in batch], dtype=torch.bool)  # (B,)
-    return full, bass, drums, inst, melody, vocals, is_vocal
+    return full, bass, drums, inst, melody, vocals
 
 
 # -----------------------
-# Loss
+# Utils
 # -----------------------
 def l1_ri(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a.float() - b.float()).abs().mean()
 
 
-# -----------------------
-# Schedules
-# -----------------------
 def linear_ramp(epoch: int, start: int, end: int, v0: float, v1: float) -> float:
-    """
-    Inclusive endpoints:
-      epoch <= start -> v0
-      epoch >= end   -> v1
-      else linear between
-    """
     if end <= start:
         return float(v1 if epoch >= end else v0)
     if epoch <= start:
@@ -354,28 +338,19 @@ def linear_ramp(epoch: int, start: int, end: int, v0: float, v1: float) -> float
 
 
 def apply_clip_safe_scale(
-    peak_ref: torch.Tensor,  # (B,2,T)
-    signals: List[torch.Tensor],  # each (B,2,T)
+    peak_ref: torch.Tensor,          # (B,2,T)
+    signals: List[torch.Tensor],     # each (B,2,T)
     peak_target: float = 0.98,
     eps: float = 1e-12,
 ) -> List[torch.Tensor]:
-    """
-    Vectorized: for each batch item compute scale based on peak_ref.
-    Behavior: scale only if peak > 1.0 else scale=1.
-    """
-    # p: (B,)
-    p = peak_ref.abs().amax(dim=(1, 2))
+    p = peak_ref.abs().amax(dim=(1, 2))  # (B,)
     scale = torch.ones_like(p)
     mask = p > 1.0
     scale[mask] = float(peak_target) / (p[mask].clamp_min(eps))
-    # reshape to (B,1,1)
     s = scale[:, None, None]
     return [x * s for x in signals]
 
 
-# -----------------------
-# Checkpoint utils
-# -----------------------
 def save_ckpt(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, str(path))
@@ -388,18 +363,47 @@ def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
     return ckpt
 
 
+def _as_uint8_tensor(x) -> Optional[torch.ByteTensor]:
+    if x is None:
+        return None
+    if isinstance(x, torch.Tensor):
+        return x.detach().to("cpu").to(torch.uint8)  # type: ignore[return-value]
+    # если вдруг попалась list[int]
+    try:
+        t = torch.tensor(x, dtype=torch.uint8)
+        return t  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
 def restore_rng(ckpt: Dict[str, Any]) -> None:
-    if "rng_state_torch" in ckpt:
-        state = ckpt["rng_state_torch"]
-        state = state.detach().to("cpu")
-        torch.set_rng_state(state)
-    if torch.cuda.is_available() and "rng_state_cuda" in ckpt:
+    st = _as_uint8_tensor(ckpt.get("rng_state_torch"))
+    if st is not None:
+        torch.set_rng_state(st)
+
+    if torch.cuda.is_available():
+        cuda_states = ckpt.get("rng_state_cuda")
+        if isinstance(cuda_states, list):
+            fixed = []
+            ok = True
+            for s in cuda_states:
+                t = _as_uint8_tensor(s)
+                if t is None:
+                    ok = False
+                    break
+                fixed.append(t)
+            if ok:
+                try:
+                    torch.cuda.set_rng_state_all(fixed)
+                except Exception:
+                    pass
+
+    np_state = ckpt.get("rng_state_numpy")
+    if np_state is not None:
         try:
-            torch.cuda.set_rng_state_all(ckpt["rng_state_cuda"])
+            np.random.set_state(np_state)
         except Exception:
             pass
-    if "rng_state_numpy" in ckpt:
-        np.random.set_state(ckpt["rng_state_numpy"])
 
 
 def capture_rng() -> Dict[str, Any]:
@@ -421,13 +425,13 @@ def main():
     g.add_argument("--root", type=str)
     g.add_argument("--manifest", type=str)
 
-    ap.add_argument("--save-dir", default="ckpt_phase_a")
-    ap.add_argument("--epochs", type=int, default=5)
+    ap.add_argument("--save-dir", default="ckpt_phase_ab_4stem")
+    ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--save-every-epochs", type=int, default=1)
 
-    ap.add_argument("--resume", type=str, default="", help="Path to checkpoint to resume from.")
-    ap.add_argument("--reset-opt", action="store_true", help="If set, do NOT load optimizer state on resume.")
-    ap.add_argument("--reset-rng", action="store_true", help="If set, do NOT restore RNG on resume.")
+    ap.add_argument("--resume", type=str, default="")
+    ap.add_argument("--reset-opt", action="store_true")
+    ap.add_argument("--reset-rng", action="store_true")
 
     ap.add_argument("--sr", type=int, default=48000)
     ap.add_argument("--segment-sec", type=float, default=4.0)
@@ -445,49 +449,49 @@ def main():
     ap.add_argument("--n-fft", type=int, default=1536)
     ap.add_argument("--hop", type=int, default=480)
     ap.add_argument("--win", type=int, default=1536)
-    ap.add_argument("--num-heads", type=int, default=6)  # bass,drums,inst,melody,vocals,fx
 
-    # A->B probability schedule inside Phase A
-    # Mode A: mix=stem_sum, fx=0
-    # Mode B: mix=full,     fx=full-stem_sum
-    ap.add_argument("--ab-start-epoch", type=int, default=1, help="Epoch when ramp starts (prob_B from v0).")
-    ap.add_argument("--ab-end-epoch", type=int, default=5, help="Epoch when ramp ends (prob_B reaches v1).")
-    ap.add_argument("--ab-prob-start", type=float, default=0.0, help="Probability of Mode B at ab-start-epoch.")
-    ap.add_argument("--ab-prob-end", type=float, default=1.0, help="Probability of Mode B at ab-end-epoch.")
+    # HEADS: bass, drums, music(inst+melody), vocals
+    ap.add_argument("--num-heads", type=int, default=4)
 
-    # loss weights
+    # A->B schedule for INPUT mix
+    # Mode A input: mix_in = stem_sum
+    # Mode B input: mix_in = full
+    ap.add_argument("--ab-start-epoch", type=int, default=1)
+    ap.add_argument("--ab-end-epoch", type=int, default=10)
+    ap.add_argument("--ab-prob-start", type=float, default=0.0)
+    ap.add_argument("--ab-prob-end", type=float, default=0.7)  # ВАЖНО: я бы не делал 1.0 сразу
+
+    # losses
     ap.add_argument("--w-stem", type=float, default=1.0)
     ap.add_argument("--w-mix", type=float, default=0.5)
-    ap.add_argument("--w-fx", type=float, default=1.0, help="Weight for fx head (0 in Mode A targets, residual in Mode B).")
-    ap.add_argument("--w-missing", type=float, default=1.0, help="Weight for missing heads (melody on vocal, vocals on novocal).")
+
+    # optional per-head weights
+    ap.add_argument("--w-bass", type=float, default=1.0)
+    ap.add_argument("--w-drums", type=float, default=1.0)
+    ap.add_argument("--w-music", type=float, default=1.0)
+    ap.add_argument("--w-vocals", type=float, default=1.0)
 
     ap.add_argument("--limit-items", type=int, default=0)
     ap.add_argument("--dump-audio-every-epochs", type=int, default=0)
-    ap.add_argument("--dump-dir", type=str, default="dumps_phase_a")
+    ap.add_argument("--dump-dir", type=str, default="dumps_phase_ab_4stem")
 
     args = ap.parse_args()
 
-    if args.num_heads != 6:
-        raise RuntimeError("This script assumes num_heads=6: bass,drums,inst,melody,vocals,fx")
+    if args.num_heads != 4:
+        raise RuntimeError("This script assumes num_heads=4: bass, drums, music(inst+melody), vocals")
 
     device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
     print("device:", device)
 
-    # seeds (only for fresh start; on resume we can restore rng)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    # load items
-    if args.root:
-        items = scan_root_to_items(args.root)
-    else:
-        items = load_manifest_csv(args.manifest)
-
+    items = scan_root_to_items(args.root) if args.root else load_manifest_csv(args.manifest)
     if args.limit_items and args.limit_items > 0:
         items = items[: int(args.limit_items)]
         print(f"[info] limit-items={len(items)}")
 
-    ds = StemPhaseADataset(
+    ds = StemDataset(
         items,
         sr=args.sr,
         segment_sec=args.segment_sec,
@@ -512,14 +516,14 @@ def main():
     stft = STFT(StftCfg(n_fft=args.n_fft, hop=args.hop, win=args.win)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
-    Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+    save_dir = Path(args.save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
     dump_dir = Path(args.dump_dir)
     dump_dir.mkdir(parents=True, exist_ok=True)
 
     start_epoch = 1
     global_step = 0
 
-    # resume
     if args.resume:
         ckpt = load_ckpt(args.resume, device=device)
         model.load_state_dict(ckpt["model"], strict=True)
@@ -528,14 +532,13 @@ def main():
                 opt.load_state_dict(ckpt["opt"])
             except Exception as e:
                 print(f"[warn] failed to load optimizer state: {e}")
-        if (not args.reset_rng) and ("rng_state_torch" in ckpt):
+        if (not args.reset_rng):
             restore_rng(ckpt)
 
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         global_step = int(ckpt.get("global_step", 0))
-
         print(f"[resume] loaded {args.resume}")
-        print(f"[resume] will start from epoch={start_epoch} (ckpt epoch={ckpt.get('epoch', '?')})")
+        print(f"[resume] will start from epoch={start_epoch}")
 
     if start_epoch > args.epochs:
         print(f"[info] nothing to do: start_epoch={start_epoch} > --epochs={args.epochs}")
@@ -543,95 +546,84 @@ def main():
 
     model.train()
 
+    # per-head weights (order: bass, drums, music, vocals)
+    head_w = torch.tensor(
+        [args.w_bass, args.w_drums, args.w_music, args.w_vocals],
+        dtype=torch.float32,
+        device=device,
+    )
+
     for epoch in range(start_epoch, args.epochs + 1):
-        p_mode_b = linear_ramp(
+        p_full = linear_ramp(
             epoch=epoch,
             start=int(args.ab_start_epoch),
             end=int(args.ab_end_epoch),
             v0=float(args.ab_prob_start),
             v1=float(args.ab_prob_end),
         )
-        p_mode_b = float(np.clip(p_mode_b, 0.0, 1.0))
+        p_full = float(np.clip(p_full, 0.0, 1.0))
 
         run = {"stem": 0.0, "mix": 0.0, "total": 0.0}
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True)
 
-        for full, bass, drums, inst, melody, vocals, is_vocal in pbar:
+        for full, bass, drums, inst, melody, vocals in pbar:
             full = full.to(device, non_blocking=True)      # (B,2,T)
             bass = bass.to(device, non_blocking=True)
             drums = drums.to(device, non_blocking=True)
             inst = inst.to(device, non_blocking=True)
             melody = melody.to(device, non_blocking=True)
             vocals = vocals.to(device, non_blocking=True)
-            is_vocal = is_vocal.to(device, non_blocking=True)  # (B,)
 
-            B, C, T = full.shape  # C=2
+            B, C, T = full.shape
 
-            stem_sum = bass + drums + inst + melody + vocals  # (B,2,T)
+            # merge
+            music = inst + melody                       # (B,2,T)
+            stem_sum = bass + drums + music + vocals    # (B,2,T)  <-- THIS is the canonical target mix
 
-            # choose per-example mode
-            # Mode A: mix=stem_sum, fx=0
-            # Mode B: mix=full,     fx=full-stem_sum
-            use_full = (torch.rand((B,), device=device) < p_mode_b)  # (B,)
-            use_full_bc = use_full.repeat_interleave(C, dim=0)       # (B*C,)
+            # choose input mode per example
+            use_full = (torch.rand((B,), device=device) < p_full)  # (B,)
+            mix_in = torch.where(use_full[:, None, None], full, stem_sum)
 
-            mix = torch.where(use_full[:, None, None], full, stem_sum)  # (B,2,T)
-
-            # clip-safe scale based on chosen mix, apply to ALL signals (so relationships stay consistent)
-            full, bass, drums, inst, melody, vocals, stem_sum, mix = apply_clip_safe_scale(
-                peak_ref=mix,
-                signals=[full, bass, drums, inst, melody, vocals, stem_sum, mix],
+            # clip-safe scale based on chosen input, apply to all signals + stem_sum
+            full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
+                peak_ref=mix_in,
+                signals=[full, bass, drums, music, vocals, stem_sum, mix_in],
                 peak_target=0.98,
             )
 
-            fx = torch.where(use_full[:, None, None], (full - stem_sum), torch.zeros_like(full))  # (B,2,T)
-
-            # Flatten channels into batch
+            # flatten (B,2,T) -> (B*C,T)
             def flat(x: torch.Tensor) -> torch.Tensor:
                 return x.reshape(B * C, T).float()
 
-            mix_f = flat(mix)
+            mix_f = flat(mix_in)
             bass_f = flat(bass)
             drums_f = flat(drums)
-            inst_f = flat(inst)
-            melody_f = flat(melody)
+            music_f = flat(music)
             vocals_f = flat(vocals)
-            fx_f = flat(fx)
+            stem_sum_f = flat(stem_sum)
 
-            # STFT targets (fp32, no grad)
             with torch.no_grad():
-                mix_ri = stft.stft_ri(mix_f)  # (B*C,F,Tf,2)
+                mix_ri = stft.stft_ri(mix_f)                # input (B*C,F,Tf,2)
                 tgt = torch.stack(
                     [
                         stft.stft_ri(bass_f),
                         stft.stft_ri(drums_f),
-                        stft.stft_ri(inst_f),
-                        stft.stft_ri(melody_f),
+                        stft.stft_ri(music_f),
                         stft.stft_ri(vocals_f),
-                        stft.stft_ri(fx_f),
                     ],
                     dim=1,
-                )  # (B*C,6,F,Tf,2)
+                )  # (B*C,4,F,Tf,2)
+                stem_sum_ri = stft.stft_ri(stem_sum_f)      # TARGET MIX ALWAYS = stem_sum
 
-            pred = model(mix_ri)  # (B*C,6,F,Tf,2)
+            pred = model(mix_ri)  # (B*C,4,F,Tf,2)
 
-            # head weights per track, then expand to B*C
-            w = torch.ones((B, 6), device=device, dtype=torch.float32)
-            # missing: melody on vocal tracks
-            w[is_vocal, 3] = float(args.w_missing)
-            # missing: vocals on novocal tracks
-            w[~is_vocal, 4] = float(args.w_missing)
-            # fx supervised always (0 or residual)
-            w[:, 5] = float(args.w_fx)
+            # stem loss (weighted per head)
+            diff = (pred.float() - tgt.float()).abs().mean(dim=(2, 3, 4))  # (B*C,4)
+            loss_stem = (diff * head_w[None, :]).sum(dim=1).mean() / head_w.mean().clamp_min(1e-8)
 
-            w_bc = w.repeat_interleave(C, dim=0)  # (B*C,6)
-
-            diff = (pred.float() - tgt.float()).abs().mean(dim=(2, 3, 4))  # (B*C,6)
-            loss_stem = (diff * w_bc).sum() / (w_bc.sum().clamp_min(1e-8))
-
-            # mixture consistency MUST include fx head
+            # mixture consistency: sum(pred_stems) must match stem_sum (not full!)
             mix_hat = pred.sum(dim=1)  # (B*C,F,Tf,2)
-            loss_mix = l1_ri(mix_hat, mix_ri)
+            loss_mix = l1_ri(mix_hat, stem_sum_ri)
 
             loss = float(args.w_stem) * loss_stem + float(args.w_mix) * loss_mix
 
@@ -640,7 +632,6 @@ def main():
             if args.grad_clip and args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.grad_clip))
             opt.step()
-
             global_step += 1
 
             run["stem"] += float(loss_stem.detach().cpu())
@@ -652,10 +643,9 @@ def main():
                 total=f"{run['total']/denom:.6f}",
                 stem=f"{run['stem']/denom:.6f}",
                 mix=f"{run['mix']/denom:.6f}",
-                pB=f"{p_mode_b:.2f}",
+                pFull=f"{p_full:.2f}",
             )
 
-        # checkpoint
         ckpt = {
             "epoch": epoch,
             "global_step": global_step,
@@ -664,17 +654,14 @@ def main():
             "args": vars(args),
             **capture_rng(),
         }
-
-        save_dir = Path(args.save_dir)
         if epoch % int(args.save_every_epochs) == 0:
-            save_ckpt(save_dir / f"phase_a_e{epoch:03d}.pt", ckpt)
-        save_ckpt(save_dir / "phase_a_latest.pt", ckpt)
+            save_ckpt(save_dir / f"phase_ab_4stem_e{epoch:03d}.pt", ckpt)
+        save_ckpt(save_dir / "phase_ab_4stem_latest.pt", ckpt)
 
-        # optional audio dump (first batch, with CURRENT pB sampling)
         if args.dump_audio_every_epochs and (epoch % int(args.dump_audio_every_epochs) == 0):
             model.eval()
             with torch.no_grad():
-                full, bass, drums, inst, melody, vocals, is_vocal = next(iter(dl))
+                full, bass, drums, inst, melody, vocals = next(iter(dl))
                 full = full.to(device)
                 bass = bass.to(device)
                 drums = drums.to(device)
@@ -683,70 +670,46 @@ def main():
                 vocals = vocals.to(device)
 
                 B, C, T = full.shape
-                stem_sum = bass + drums + inst + melody + vocals
+                music = inst + melody
+                stem_sum = bass + drums + music + vocals
 
-                # sample mode for dump
-                use_full = (torch.rand((B,), device=device) < p_mode_b)
-                mix = torch.where(use_full[:, None, None], full, stem_sum)
+                use_full = (torch.rand((B,), device=device) < p_full)
+                mix_in = torch.where(use_full[:, None, None], full, stem_sum)
 
-                full, bass, drums, inst, melody, vocals, stem_sum, mix = apply_clip_safe_scale(
-                    peak_ref=mix,
-                    signals=[full, bass, drums, inst, melody, vocals, stem_sum, mix],
+                full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
+                    peak_ref=mix_in,
+                    signals=[full, bass, drums, music, vocals, stem_sum, mix_in],
                     peak_target=0.98,
                 )
-                fx = torch.where(use_full[:, None, None], (full - stem_sum), torch.zeros_like(full))
 
-                mix_f = mix.reshape(B * C, T).float()
+                mix_f = mix_in.reshape(B * C, T).float()
                 mix_ri = stft.stft_ri(mix_f)
-                pred = model(mix_ri)  # (B*C,6,F,Tf,2)
+                pred = model(mix_ri)  # (B*C,4,F,Tf,2)
 
                 def unflat(y: torch.Tensor) -> torch.Tensor:
                     return y.reshape(B, C, T)
 
-                names = ["bass", "drums", "inst", "melody", "vocals", "fx"]
+                names = ["bass", "drums", "music", "vocals"]
                 for head, name in enumerate(names):
                     y = stft.istft_ri(pred[:, head], length=T)  # (B*C,T)
                     y_st = unflat(y)[0].detach().cpu().transpose(0, 1).numpy()  # (T,2)
                     sf.write(str(dump_dir / f"e{epoch:03d}_ex0_{name}.wav"), y_st, args.sr, subtype="FLOAT")
 
-                # reference dumps
-                sf.write(
-                    str(dump_dir / f"e{epoch:03d}_ex0_mix.wav"),
-                    mix[0].detach().cpu().transpose(0, 1).numpy(),
-                    args.sr,
-                    subtype="FLOAT",
-                )
-                sf.write(
-                    str(dump_dir / f"e{epoch:03d}_ex0_stem_sum.wav"),
-                    stem_sum[0].detach().cpu().transpose(0, 1).numpy(),
-                    args.sr,
-                    subtype="FLOAT",
-                )
-                sf.write(
-                    str(dump_dir / f"e{epoch:03d}_ex0_full.wav"),
-                    full[0].detach().cpu().transpose(0, 1).numpy(),
-                    args.sr,
-                    subtype="FLOAT",
-                )
-                sf.write(
-                    str(dump_dir / f"e{epoch:03d}_ex0_fx_tgt.wav"),
-                    fx[0].detach().cpu().transpose(0, 1).numpy(),
-                    args.sr,
-                    subtype="FLOAT",
-                )
+                # refs
+                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_mix_in.wav"), mix_in[0].cpu().transpose(0, 1).numpy(), args.sr, subtype="FLOAT")
+                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_stem_sum.wav"), stem_sum[0].cpu().transpose(0, 1).numpy(), args.sr, subtype="FLOAT")
+                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_full.wav"), full[0].cpu().transpose(0, 1).numpy(), args.sr, subtype="FLOAT")
 
                 sum_ri = pred.sum(dim=1)
                 sum_w = unflat(stft.istft_ri(sum_ri, length=T))[0].cpu().transpose(0, 1).numpy()
                 sf.write(str(dump_dir / f"e{epoch:03d}_ex0_sum.wav"), sum_w, args.sr, subtype="FLOAT")
 
-                # also write a tiny text note about mode
                 (dump_dir / f"e{epoch:03d}_ex0_mode.txt").write_text(
-                    f"epoch={epoch}\nprob_mode_b={p_mode_b:.4f}\nuse_full_ex0={bool(use_full[0].item())}\n",
+                    f"epoch={epoch}\npFull={p_full:.4f}\nuse_full_ex0={bool(use_full[0].item())}\n",
                     encoding="utf-8",
                 )
 
                 print(f"[dump] wrote wavs to {dump_dir}")
-
             model.train()
 
     print("done.")
