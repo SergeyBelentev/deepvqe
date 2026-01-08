@@ -153,7 +153,7 @@ def infer_ola(
     T_pad = x.shape[1]
 
     # output accumulators (device float32)
-    out = torch.zeros((6, 2, T_pad), device=device, dtype=torch.float32)
+    out = torch.zeros((4, 2, T_pad), device=device, dtype=torch.float32)
     wsum = torch.zeros((1, 1, T_pad), device=device, dtype=torch.float32)
 
     win = make_hann_ola(chunk_len, device=device)  # (chunk_len,)
@@ -172,18 +172,18 @@ def infer_ola(
         # AMP optional (по умолчанию off, как у тебя fp32)
         if use_amp and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                pred = model(mix_ri)  # (2,6,F,Tf,2)
+                pred = model(mix_ri)  # (2,4,F,Tf,2)
         else:
             pred = model(mix_ri)
 
         # ISTFT each head -> (2,chunk_len)
-        # pred layout in your training: (B*C,6,F,Tf,2)
+        # pred layout in your training: (B*C,4,F,Tf,2)
         heads_time: List[torch.Tensor] = []
-        for h in range(6):
+        for h in range(4):
             y = stft.istft_ri(pred[:, h], length=chunk_len)  # (2,chunk_len)
             heads_time.append(y)
 
-        y6 = torch.stack(heads_time, dim=0)  # (6,2,chunk_len)
+        y6 = torch.stack(heads_time, dim=0)  # (4,2,chunk_len)
 
         # apply window and OLA
         y6w = y6 * win.view(1, 1, -1)
@@ -195,8 +195,8 @@ def infer_ola(
     # crop padding and move to CPU
     out = out[:, :, :T].detach().cpu()
 
-    names = ["bass", "drums", "inst", "melody", "vocals", "fx"]
-    return {names[i]: out[i] for i in range(6)}
+    names = ["bass", "drums", "music", "vocals"]
+    return {names[i]: out[i] for i in range(4)}
 
 
 def main():
@@ -235,7 +235,7 @@ def main():
     print(f"[audio] {args.inp} | sr={args.sr} | samples={T} | sec={T/args.sr:.2f}")
 
     # load model + stft
-    model = load_model(args.ckpt, device=device, n_fft=int(args.n_fft), num_heads=6)
+    model = load_model(args.ckpt, device=device, n_fft=int(args.n_fft), num_heads=4)
     stft = STFT(StftCfg(n_fft=int(args.n_fft), hop=int(args.hop), win=int(args.win))).to(device)
 
     # infer
@@ -260,25 +260,19 @@ def main():
 
     if args.write_sum or args.write_sum5:
         # sum heads in time domain (already comes from ISTFT)
-        sum5 = stems["bass"] + stems["drums"] + stems["inst"] + stems["melody"] + stems["vocals"]
-        if args.write_sum5:
-            write_audio(outdir / "sum5.wav", sum5.transpose(0, 1).numpy(), int(args.sr), fmt=args.format)
+        sum5 = stems["bass"] + stems["drums"] + stems["music"] + stems["vocals"]
         if args.write_sum:
-            sum6 = sum5 + stems["fx"]
-            write_audio(outdir / "sum.wav", sum6.transpose(0, 1).numpy(), int(args.sr), fmt=args.format)
+            write_audio(outdir / "sum.wav", sum5.transpose(0, 1).numpy(), int(args.sr), fmt=args.format)
 
     # quick console stats
     def peak(t: torch.Tensor) -> float:
         return float(t.abs().max().item()) if t.numel() else 0.0
 
     print("[done] wrote:")
-    for n in ["bass", "drums", "inst", "melody", "vocals", "fx"]:
+    for n in ["bass", "drums", "music", "vocals"]:
         print(f"  {n:7s} peak={peak(stems[n]):.4f}")
-    if args.write_sum5:
-        print(f"  sum5    peak={peak(sum5):.4f}")
     if args.write_sum:
-        sum6 = sum5 + stems["fx"]
-        print(f"  sum     peak={peak(sum6):.4f}")
+        print(f"  sum     peak={peak(sum5):.4f}")
     print(f"  outdir: {outdir}")
 
 

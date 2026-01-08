@@ -119,6 +119,13 @@ def _is_file(p: Path) -> bool:
     return p.exists() and p.is_file()
 
 
+def str_or_none(p: Path) -> str|None:
+    if _is_file(p):
+        return str(p)
+    else:
+        return
+
+
 def scan_root_to_items(root: str) -> List[TrackItem]:
     root_p = Path(root)
     if not root_p.exists():
@@ -136,18 +143,20 @@ def scan_root_to_items(root: str) -> List[TrackItem]:
         vocals = d / "vocals.wav"
         melody = d / "melody.wav"
 
-        if not (_is_file(full) and _is_file(bass) and _is_file(drums) and _is_file(inst)):
+        if not (_is_file(full)):
+            print('skip', d, 'missing full')
             continue
+
 
         if _is_file(vocals) and not _is_file(melody):
             items.append(
                 TrackItem(
-                    kind="vocal",
+                    kind="vocal", # TODO delete vocal kind
                     full=str(full),
-                    bass=str(bass),
-                    drums=str(drums),
-                    instruments=str(inst),
-                    vocals=str(vocals),
+                    bass=str_or_none(bass),
+                    drums=str_or_none(drums),
+                    instruments=str_or_none(inst),
+                    vocals=str_or_none(vocals),
                     melody=None,
                 )
             )
@@ -156,11 +165,11 @@ def scan_root_to_items(root: str) -> List[TrackItem]:
                 TrackItem(
                     kind="novocal",
                     full=str(full),
-                    bass=str(bass),
-                    drums=str(drums),
-                    instruments=str(inst),
+                    bass=str_or_none(bass),
+                    drums=str_or_none(drums),
+                    instruments=str_or_none(inst),
                     vocals=None,
-                    melody=str(melody),
+                    melody=str_or_none(melody),
                 )
             )
 
@@ -229,6 +238,7 @@ class StemDataset(Dataset):
 
     def _min_len(self, it: TrackItem) -> int:
         paths = [it.full, it.bass, it.drums, it.instruments]
+        paths = list(filter(lambda x: x is not None, paths))
         if it.kind == "vocal":
             if not it.vocals:
                 raise RuntimeError("vocal item missing vocals")
@@ -277,10 +287,15 @@ class StemDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def load_segment(self, full, path: str|None, start_j):
+        if path:
+            return _read_stereo_segment(path, self.sr, start_j, self.seg_len)
+        else:
+            return torch.zeros_like(full)
+
     def __getitem__(self, idx: int):
         item_i, start = self.index[idx]
         it = self.items[item_i]
-        is_vocal = (it.kind == "vocal")
 
         if start < 0:
             n = self._min_len(it)
@@ -295,16 +310,12 @@ class StemDataset(Dataset):
             start_j = int(max(0, min(max_start, start + j)))
 
         full = _read_stereo_segment(it.full, self.sr, start_j, self.seg_len)
-        bass = _read_stereo_segment(it.bass, self.sr, start_j, self.seg_len)
-        drums = _read_stereo_segment(it.drums, self.sr, start_j, self.seg_len)
-        inst = _read_stereo_segment(it.instruments, self.sr, start_j, self.seg_len)
 
-        if is_vocal:
-            vocals = _read_stereo_segment(it.vocals, self.sr, start_j, self.seg_len)  # type: ignore[arg-type]
-            melody = torch.zeros_like(vocals)
-        else:
-            melody = _read_stereo_segment(it.melody, self.sr, start_j, self.seg_len)  # type: ignore[arg-type]
-            vocals = torch.zeros_like(melody)
+        bass = self.load_segment(full, it.bass, start_j)
+        drums = self.load_segment(full, it.drums, start_j)
+        inst = self.load_segment(full, it.instruments, start_j)
+        vocals = self.load_segment(full, it.vocals, start_j)
+        melody = self.load_segment(full, it.melody, start_j)
 
         return full, bass, drums, inst, melody, vocals
 
