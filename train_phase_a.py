@@ -5,16 +5,25 @@ import csv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Any
-
 import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-
 from deepvqe import DeepVQEStemSeparator
+import os, random
 
+
+def seed_worker(worker_id: int) -> None:
+    # seed, который DataLoader назначил воркеру
+    seed = torch.initial_seed() % (2**32)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # очень важно против oversubscription
+    torch.set_num_threads(1)
+    # если используешь torch.set_num_interop_threads — делай это в main, не в воркерах
 
 # -----------------------
 # I/O helpers
@@ -446,6 +455,9 @@ def main():
     ap.add_argument("--reset-opt", action="store_true")
     ap.add_argument("--reset-rng", action="store_true")
 
+    # Enable TF32
+    ap.add_argument("--enable-tf32", action="store_true")
+
     ap.add_argument("--sr", type=int, default=48000)
     ap.add_argument("--segment-sec", type=float, default=4.0)
     ap.add_argument("--long-threshold-sec", type=float, default=6.0)
@@ -454,10 +466,14 @@ def main():
 
     ap.add_argument("--batch", type=int, default=2)
     ap.add_argument("--lr", type=float, default=1e-4)
-    ap.add_argument("--num-workers", type=int, default=0)
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--grad-clip", type=float, default=5.0)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--num-workers", type=int, default=8)
+    ap.add_argument("--prefetch-factor", type=int, default=2)
+    ap.add_argument("--pin-memory", action="store_true", default=True)
+    ap.add_argument("--persistent-workers", action="store_true", default=True)
+    ap.add_argument("--in-order", action="store_true", default=True)
 
     ap.add_argument("--n-fft", type=int, default=1536)
     ap.add_argument("--hop", type=int, default=480)
@@ -490,6 +506,12 @@ def main():
 
     args = ap.parse_args()
 
+    if args.enable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+
     if args.num_heads != 4:
         raise RuntimeError("This script assumes num_heads=4: bass, drums, music(inst+melody), vocals")
 
@@ -513,15 +535,22 @@ def main():
         long_jitter_sec=args.long_jitter_sec,
     )
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     dl = DataLoader(
         ds,
         batch_size=args.batch,
         shuffle=True,
         drop_last=(len(ds) >= args.batch),
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=(args.num_workers > 0),
+        pin_memory=(device.type == "cuda") and args.pin_memory,
+        persistent_workers=(args.num_workers > 0) and args.persistent_workers,
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
+        worker_init_fn=seed_worker if args.num_workers > 0 else None,
+        generator=g,
         collate_fn=collate,
+        in_order=args.in_order,
     )
     print(f"dataset: {len(ds)} segments | batch={args.batch} | batches/epoch={len(dl)}")
 
