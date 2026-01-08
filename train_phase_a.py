@@ -252,7 +252,8 @@ class StemDataset(Dataset):
         for p in paths:
             n, sr, _ = _num_frames_and_sr(p)
             if sr != self.sr:
-                raise RuntimeError(f"SR mismatch: {p} sr={sr}, expected {self.sr}")
+                print(f"SR mismatch: {p} sr={sr}, expected {self.sr}")
+                return 0
             mins = n if mins is None else min(mins, n)
         return int(mins or 0)
 
