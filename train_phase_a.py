@@ -507,6 +507,7 @@ def main():
     args = ap.parse_args()
 
     if args.enable_tf32:
+        print('Activated tf32')
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
