@@ -10,6 +10,8 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
+import math
+import torch.nn.functional as F
 
 from deepvqe import DeepVQEStemSeparator
 
@@ -125,12 +127,17 @@ def infer_ola(
     overlap: float,
     device: torch.device,
     use_amp: bool = False,
+    stitch: str = "ola",          # "ola" | "crop"
+    keep_frac: float = 0.6,       # for crop: 0.50..0.75
+    xfade_ms: float = 0.0,        # for crop: optional small crossfade
 ) -> Dict[str, torch.Tensor]:
     """
     Returns dict head->(2,T) in float32 on CPU.
-    Heads: bass, drums, inst, melody, vocals, fx
+    Heads: bass, drums, music, vocals
     """
     assert 0.0 <= overlap < 1.0
+    if stitch not in ("ola", "crop"):
+        raise ValueError("stitch must be 'ola' or 'crop'")
 
     x = x_stereo.to(device, dtype=torch.float32)
     C, T = x.shape
@@ -140,63 +147,160 @@ def infer_ola(
     if chunk_len <= 0:
         raise ValueError("chunk_sec too small")
 
-    hop_len = int(round(chunk_len * (1.0 - overlap)))
-    hop_len = max(1, hop_len)
+    def pred_to_time(pred: torch.Tensor) -> torch.Tensor:
+        """
+        pred: (2,4,F,Tf,2)
+        returns y: (4,2,chunk_len)
+        """
+        # (4,2,F,Tf,2) -> (8,F,Tf,2)
+        p = pred.permute(1, 0, 2, 3, 4).contiguous()
+        p = p.view(p.shape[0] * p.shape[1], p.shape[2], p.shape[3], p.shape[4])
+        y = stft.istft_ri(p, length=chunk_len)  # (8, chunk_len)
+        y = y.view(4, 2, chunk_len)
+        return y
 
-    # pad so that last frame fits
-    n_chunks = 1 + max(0, (T - 1) // hop_len)
-    total_len = (n_chunks - 1) * hop_len + chunk_len
-    pad = max(0, total_len - T)
-    if pad > 0:
-        x = torch.nn.functional.pad(x, (0, pad))  # (2, T+pad)
-
-    T_pad = x.shape[1]
-
-    # output accumulators (device float32)
-    out = torch.zeros((4, 2, T_pad), device=device, dtype=torch.float32)
-    wsum = torch.zeros((1, 1, T_pad), device=device, dtype=torch.float32)
-
-    win = make_hann_ola(chunk_len, device=device)  # (chunk_len,)
-    win2 = (win * win).view(1, 1, -1)  # power weights for denom
-
-    # loop
-    for i in range(n_chunks):
-        s = i * hop_len
-        e = s + chunk_len
-        chunk = x[:, s:e]  # (2, chunk_len)
-
-        # (B*C,T) where B=1
-        mix_f = chunk.reshape(2, chunk_len)  # already (C,T)
-        mix_ri = stft.stft_ri(mix_f)  # (2,F,Tf,2)
-
-        # AMP optional (по умолчанию off, как у тебя fp32)
+    def run_model_on_chunk(chunk: torch.Tensor) -> torch.Tensor:
+        """
+        chunk: (2,chunk_len) float32 on device
+        returns y: (4,2,chunk_len) float32 on device
+        """
+        mix_ri = stft.stft_ri(chunk)  # (2,F,Tf,2)
         if use_amp and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 pred = model(mix_ri)  # (2,4,F,Tf,2)
         else:
             pred = model(mix_ri)
+        return pred_to_time(pred)
 
-        # ISTFT each head -> (2,chunk_len)
-        # pred layout in your training: (B*C,4,F,Tf,2)
-        heads_time: List[torch.Tensor] = []
-        for h in range(4):
-            y = stft.istft_ri(pred[:, h], length=chunk_len)  # (2,chunk_len)
-            heads_time.append(y)
+    # -----------------------
+    # Mode 1: classic OLA (fixed normalization: wsum += win)
+    # -----------------------
+    if stitch == "ola":
+        hop_len = int(round(chunk_len * (1.0 - overlap)))
+        hop_len = max(1, hop_len)
 
-        y6 = torch.stack(heads_time, dim=0)  # (4,2,chunk_len)
+        # pad so that last frame fits
+        n_chunks = 1 + max(0, (T - 1) // hop_len)
+        total_len = (n_chunks - 1) * hop_len + chunk_len
+        pad = max(0, total_len - T)
+        if pad > 0:
+            x_pad = F.pad(x, (0, pad))  # (2, T+pad)
+        else:
+            x_pad = x
 
-        # apply window and OLA
-        y6w = y6 * win.view(1, 1, -1)
-        out[:, :, s:e] += y6w
-        wsum[:, :, s:e] += win2
+        T_pad = x_pad.shape[1]
 
-    out = out / wsum.clamp_min(1e-8)
+        out = torch.zeros((4, 2, T_pad), device=device, dtype=torch.float32)
+        wsum = torch.zeros((1, 1, T_pad), device=device, dtype=torch.float32)
 
-    # crop padding and move to CPU
+        win = make_hann_ola(chunk_len, device=device)          # (L,)
+        win_v = win.view(1, 1, -1)                              # (1,1,L)
+
+        for i in range(n_chunks):
+            s = i * hop_len
+            e = s + chunk_len
+            chunk = x_pad[:, s:e]                               # (2,L)
+            y = run_model_on_chunk(chunk)                       # (4,2,L)
+
+            out[:, :, s:e] += y * win_v
+            wsum[:, :, s:e] += win_v                            # <<< FIX: sum(win), not sum(win^2)
+
+        out = out / wsum.clamp_min(1e-8)
+        out = out[:, :, :T].detach().cpu()
+
+        names = ["bass", "drums", "music", "vocals"]
+        return {names[i]: out[i] for i in range(4)}
+
+    # -----------------------
+    # Mode 2: crop-stitching (take central 50-75% and stitch)
+    # -----------------------
+    keep_frac = float(keep_frac)
+    if not (0.50 <= keep_frac <= 0.75):
+        raise ValueError("--keep-frac must be in [0.50, 0.75] for crop mode")
+
+    keep_len = int(round(chunk_len * keep_frac))
+    keep_len = max(1, min(keep_len, chunk_len))
+
+    trim_left = (chunk_len - keep_len) // 2
+    trim_right = (chunk_len - keep_len) - trim_left  # may differ by 1 if odd
+
+    # optional crossfade between kept regions
+    xfade_len = int(round(sr * float(xfade_ms) / 1000.0))
+    xfade_len = max(0, min(xfade_len, keep_len // 2))
+
+    # effective hop in output timeline
+    hop_out = keep_len - xfade_len
+    hop_out = max(1, hop_out)
+
+    # choose number of chunks so we fully cover T samples in output
+    if T <= keep_len:
+        n_chunks = 1
+    else:
+        n_chunks = 1 + math.ceil((T - keep_len) / hop_out)
+
+    out_len = (n_chunks - 1) * hop_out + keep_len
+    out = torch.zeros((4, 2, out_len), device=device, dtype=torch.float32)
+
+    if xfade_len > 0:
+        wsum = torch.zeros((1, 1, out_len), device=device, dtype=torch.float32)
+        fade = torch.linspace(0.0, 1.0, xfade_len, device=device, dtype=torch.float32)
+    else:
+        wsum = None
+        fade = None
+
+    def get_chunk_by_start(start: int) -> torch.Tensor:
+        """
+        start can be negative. Returns (2,chunk_len) padded with zeros if needed.
+        """
+        end = start + chunk_len
+        left_pad = max(0, -start)
+        right_pad = max(0, end - T)
+        s0 = max(0, start)
+        e0 = min(T, end)
+        ch = x[:, s0:e0]  # (2, <=chunk_len)
+        if left_pad or right_pad:
+            ch = F.pad(ch, (left_pad, right_pad))
+        # safety
+        if ch.shape[1] != chunk_len:
+            ch = F.pad(ch, (0, max(0, chunk_len - ch.shape[1])))
+            ch = ch[:, :chunk_len]
+        return ch
+
+    for i in range(n_chunks):
+        out_s = i * hop_out
+        out_e = out_s + keep_len
+
+        # align: kept center lands exactly at [out_s:out_e]
+        in_s = out_s - trim_left  # may be negative
+        chunk = get_chunk_by_start(in_s)  # (2,chunk_len)
+
+        y = run_model_on_chunk(chunk)  # (4,2,chunk_len)
+        y_keep = y[:, :, trim_left:trim_left + keep_len]  # (4,2,keep_len)
+
+        if xfade_len <= 0:
+            out[:, :, out_s:out_e] = y_keep
+            continue
+
+        # build per-chunk weights:
+        # - first chunk: no fade-in
+        # - last chunk: no fade-out
+        w = torch.ones((keep_len,), device=device, dtype=torch.float32)
+        if i > 0:
+            w[:xfade_len] = fade
+        if i < n_chunks - 1:
+            w[-xfade_len:] = torch.flip(fade, dims=[0])
+        wv = w.view(1, 1, -1)
+
+        out[:, :, out_s:out_e] += y_keep * wv
+        wsum[:, :, out_s:out_e] += wv  # type: ignore[index]
+
+    if wsum is not None:
+        out = out / wsum.clamp_min(1e-8)
+
     out = out[:, :, :T].detach().cpu()
-
     names = ["bass", "drums", "music", "vocals"]
     return {names[i]: out[i] for i in range(4)}
+
 
 
 def main():
@@ -220,6 +324,26 @@ def main():
     ap.add_argument("--write-mix", action="store_true", help="Also write mix.wav as a copy of input")
     ap.add_argument("--write-sum", action="store_true", help="Also write sum.wav = sum(6 heads)")
     ap.add_argument("--write-sum5", action="store_true", help="Also write sum5.wav = sum(first 5 heads)")
+
+    ap.add_argument(
+        "--stitch",
+        choices=["ola", "crop"],
+        default="ola",
+        help="Stitching mode: 'ola' = overlap-add with Hann (fixed norm), 'crop' = keep central part and stitch",
+    )
+    ap.add_argument(
+        "--keep-frac",
+        type=float,
+        default=0.6,
+        help="(crop) Central fraction of chunk to keep. Must be in [0.50, 0.75].",
+    )
+    ap.add_argument(
+        "--xfade-ms",
+        type=float,
+        default=0.0,
+        help="(crop) Optional crossfade length in milliseconds between kept regions (0 = off).",
+    )
+
 
     args = ap.parse_args()
 
@@ -248,6 +372,9 @@ def main():
         overlap=float(args.overlap),
         device=device,
         use_amp=bool(args.amp),
+        stitch=str(args.stitch),
+        keep_frac=float(args.keep_frac),
+        xfade_ms=float(args.xfade_ms),
     )
 
     # write
