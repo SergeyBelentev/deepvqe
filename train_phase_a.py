@@ -224,6 +224,7 @@ class StemDataset(Dataset):
         long_jitter_sec: float = 0.0,
     ):
         self.items = items
+        self._min_len_cache = {i: self._min_len(it) for i, it in self.items}
         self.sr = int(sr)
         self.seg_len = int(round(self.sr * float(segment_sec)))
 
@@ -260,7 +261,7 @@ class StemDataset(Dataset):
     def _build_index(self) -> None:
         self.index.clear()
         for i, it in enumerate(self.items):
-            n = self._min_len(it)
+            n = self._min_len_cache[i]
             if n <= 0:
                 continue
             if n < self.long_threshold_len:
@@ -299,14 +300,14 @@ class StemDataset(Dataset):
         it = self.items[item_i]
 
         if start < 0:
-            n = self._min_len(it)
+            n = self._min_len_cache[item_i]
             if n <= self.seg_len:
                 start_j = 0
             else:
                 start_j = int(torch.randint(0, n - self.seg_len + 1, (1,)).item())
         else:
             j = int(torch.randint(-self.long_jitter_len, self.long_jitter_len + 1, (1,)).item()) if self.long_jitter_len > 0 else 0
-            n = self._min_len(it)
+            n = self._min_len_cache[item_i]
             max_start = max(0, n - self.seg_len)
             start_j = int(max(0, min(max_start, start + j)))
 
