@@ -233,7 +233,6 @@ class StemDataset(Dataset):
         long_jitter_sec: float = 0.0,
     ):
         self.items = items
-        self._min_len_cache = {it: self._min_len(it) for it in self.items}
         self.sr = int(sr)
         self.seg_len = int(round(self.sr * float(segment_sec)))
 
@@ -243,6 +242,7 @@ class StemDataset(Dataset):
         self.long_jitter_len = int(round(self.sr * float(long_jitter_sec)))
         self.long_jitter_len = max(0, self.long_jitter_len)
 
+        self._min_len_cache = {it: self._min_len(it) for it in self.items}
         self.index: List[Tuple[int, int]] = []
         self._build_index()
 
