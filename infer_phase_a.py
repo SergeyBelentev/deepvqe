@@ -4,8 +4,8 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List
-
+from typing import Dict, Tuple, Optional, List, Any
+from collections import OrderedDict
 import numpy as np
 import soundfile as sf
 import torch
@@ -95,13 +95,41 @@ def write_audio(path: str, y: np.ndarray, sr: int, fmt: str = "float") -> None:
 # -----------------------
 # Model loading
 # -----------------------
-def load_model(ckpt_path: str, device: torch.device, n_fft: int, num_heads: int = 6) -> DeepVQEStemSeparator:
+def _strip_prefix_if_all_keys(state_dict: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    if not state_dict:
+        return state_dict
+    keys = list(state_dict.keys())
+    if all(k.startswith(prefix) for k in keys):
+        return {k[len(prefix):]: v for k, v in state_dict.items()}
+    return state_dict
+
+def _normalize_checkpoint_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    # 1) DDP: "module."
+    sd = _strip_prefix_if_all_keys(state_dict, "module.")
+    # 2) torch.compile иногда даёт "_orig_mod."
+    sd = _strip_prefix_if_all_keys(sd, "_orig_mod.")
+    # 3) бывает комбо "module._orig_mod."
+    sd = _strip_prefix_if_all_keys(sd, "module._orig_mod.")
+    return sd
+
+def load_model(ckpt_path: str, device: torch.device, n_fft: int, num_heads: int = 4):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError(f"Bad checkpoint: {ckpt_path}")
 
     model = DeepVQEStemSeparator(n_fft=n_fft, num_heads=num_heads).to(device)
-    model.load_state_dict(ckpt["model"], strict=True)
+
+    sd = ckpt["model"]
+    if not isinstance(sd, dict):
+        raise RuntimeError("ckpt['model'] is not a state_dict dict")
+
+    # сначала пробуем как есть (на случай если чекпойнт уже “чистый”)
+    try:
+        model.load_state_dict(sd, strict=True)
+    except RuntimeError:
+        sd2 = _normalize_checkpoint_state_dict(sd)
+        model.load_state_dict(sd2, strict=True)
+
     model.eval()
     return model
 
