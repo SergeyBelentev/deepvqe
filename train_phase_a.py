@@ -782,8 +782,8 @@ def main():
             stem_sum = bass + drums + music + vocals    # (B,2,T)  <-- THIS is the canonical target mix
 
             # choose input mode per example
-            use_full = (torch.rand((B,), device=device) < p_full)  # (B,)
-            mix_in = torch.where(use_full[:, None, None], full, stem_sum)
+            use_full = (torch.rand((), device=device) < p_full)
+            mix_in = full if bool(use_full.item()) else stem_sum
 
             # clip-safe scale based on chosen input, apply to all signals + stem_sum
             full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
@@ -902,8 +902,8 @@ def main():
                 music = inst + melody
                 stem_sum = bass + drums + music + vocals
 
-                use_full = (torch.rand((B,), device=device) < p_full)
-                mix_in = torch.where(use_full[:, None, None], full, stem_sum)
+                use_full = (torch.rand((), device=device) < p_full)
+                mix_in = full if bool(use_full.item()) else stem_sum
 
                 full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
                     peak_ref=mix_in,
