@@ -13,6 +13,9 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from deepvqe import DeepVQEStemSeparator
 import os, random
+import boto3
+from botocore.config import Config as BotoConfig
+from boto3.s3.transfer import TransferConfig
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -400,6 +403,70 @@ def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
         raise RuntimeError(f"Bad checkpoint format: {path}")
     return ckpt
 
+def atomic_save_ckpt(path: Path, payload: Dict[str, Any]) -> None:
+    """
+    Пишем через tmp + os.replace, чтобы 'latest' никогда не был наполовину записан.
+    Это особенно важно на spot/при падениях.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, str(tmp))
+    os.replace(str(tmp), str(path))
+
+
+def make_s3_client(
+    *,
+    region: str = "",
+    endpoint_url: str = "",
+    access_key_id: str = "",
+    secret_access_key: str = "",
+    session_token: str = "",
+    profile: str = "",
+):
+    """
+    Если access_key_id/secret_access_key заданы — используем их.
+    Иначе boto3 использует стандартную credential chain:
+      env vars -> shared config/profile -> EC2/ECS role (IMDS) -> ...
+    """
+    cfg = BotoConfig(retries={"max_attempts": 10, "mode": "adaptive"})
+
+    # Session нужен, чтобы корректно поддержать profile и/или явные креды.
+    if profile:
+        sess = boto3.Session(profile_name=profile, region_name=region or None)
+        return sess.client("s3", endpoint_url=(endpoint_url or None), config=cfg)
+
+    # Если дали ключи — используем их явно
+    if access_key_id and secret_access_key:
+        sess = boto3.Session(
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            aws_session_token=(session_token or None),
+            region_name=(region or None),
+        )
+        return sess.client("s3", endpoint_url=(endpoint_url or None), config=cfg)
+
+    # иначе обычная цепочка boto3 (env/role/etc.)
+    sess = boto3.Session(region_name=(region or None))
+    return sess.client("s3", endpoint_url=(endpoint_url or None), config=cfg)
+
+
+
+def upload_to_s3(
+    s3,
+    *,
+    local_path: Path,
+    bucket: str,
+    key: str,
+) -> None:
+    # Мультипарт + параллелизм для больших чекпоинтов
+    tcfg = TransferConfig(
+        multipart_threshold=64 * 1024 * 1024,
+        multipart_chunksize=64 * 1024 * 1024,
+        max_concurrency=8,
+        use_threads=True,
+    )
+    s3.upload_file(str(local_path), bucket, key, Config=tcfg)
+
 
 def _as_uint8_tensor(x) -> Optional[torch.ByteTensor]:
     if x is None:
@@ -520,10 +587,30 @@ def main():
     ap.add_argument("--dump-audio-every-epochs", type=int, default=0)
     ap.add_argument("--dump-dir", type=str, default="dumps_phase_ab_4stem")
 
+    # S3
+    ap.add_argument("--s3-bucket", type=str, default="")
+    ap.add_argument("--s3-prefix", type=str, default="deepvqe_ckpt")  # папка в бакете
+    ap.add_argument("--s3-region", type=str, default="")             # можно пусто на EC2 с ролью
+    ap.add_argument("--s3-endpoint-url", type=str, default="")       # если MinIO/CEPH, иначе пусто
+    ap.add_argument("--s3-upload-latest-only", action="store_true")  # опционально
+    ap.add_argument("--s3-access-key-id", type=str, default="")
+    ap.add_argument("--s3-secret-access-key", type=str, default="")
+
+
     args = ap.parse_args()
 
     is_ddp, rank, world_size, local_rank = ddp_setup()
     is_main = (rank == 0)
+
+    s3 = None
+    if is_main and args.s3_bucket:
+        s3 = make_s3_client(
+            region=args.s3_region,
+            endpoint_url=args.s3_endpoint_url,
+            access_key_id=args.s3_access_key_id,
+            secret_access_key=args.s3_secret_access_key,
+        )
+
 
     if args.enable_tf32:
         print('Activated tf32')
@@ -741,9 +828,35 @@ def main():
             "args": vars(args),
             **capture_rng(),
         }
-        if is_main and (epoch % int(args.save_every_epochs) == 0):
-            save_ckpt(save_dir / f"phase_ab_4stem_e{epoch:03d}.pt", ckpt)
-        save_ckpt(save_dir / "phase_ab_4stem_latest.pt", ckpt)
+
+        latest_path = None
+        epoch_path = None
+        if is_main:
+            latest_path = save_dir / "phase_ab_4stem_latest.pt"
+            atomic_save_ckpt(latest_path, ckpt)
+
+            epoch_path = save_dir / f"phase_ab_4stem_e{epoch:03d}.pt"
+            if epoch % int(args.save_every_epochs) == 0:
+                atomic_save_ckpt(epoch_path, ckpt)
+
+        if is_ddp:
+            dist.barrier()
+
+        # --- UPLOAD (только rank0) ---
+        if is_main and s3 is not None:
+            prefix = args.s3_prefix.strip("/")
+
+            # грузим latest всегда
+            key_latest = f"{prefix}/phase_ab_4stem_latest.pt"
+            upload_to_s3(s3, local_path=latest_path, bucket=args.s3_bucket, key=key_latest)
+
+            # грузим epoch-овый чекпоинт по расписанию (если не включен "только latest")
+            if (not args.s3_upload_latest_only) and (epoch % int(args.save_every_epochs) == 0):
+                key_epoch = f"{prefix}/phase_ab_4stem_e{epoch:03d}.pt"
+                upload_to_s3(s3, local_path=epoch_path, bucket=args.s3_bucket, key=key_epoch)
+
+        if is_ddp:
+            dist.barrier()
 
         if is_main and args.dump_audio_every_epochs and (epoch % int(args.dump_audio_every_epochs) == 0):
             model.eval()

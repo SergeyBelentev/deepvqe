@@ -5,6 +5,7 @@ description = "DeepVQE model implementation with Torch inference utilities"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "boto3>=1.42.24",
     "einops==0.8.0",
     "numpy==2.3.5",
     "onnx==1.17.0",
