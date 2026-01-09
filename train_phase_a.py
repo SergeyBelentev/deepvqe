@@ -681,7 +681,7 @@ def main():
             device_ids=[local_rank],
             output_device=local_rank,
             broadcast_buffers=False,
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             gradient_as_bucket_view=True,
         )
 
