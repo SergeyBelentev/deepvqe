@@ -812,13 +812,14 @@ def main():
             run["mix"] += float(loss_mix.detach().cpu())
             run["total"] += float(loss.detach().cpu())
 
-            denom = max(1, pbar.n + 1)
-            pbar.set_postfix(
-                total=f"{run['total']/denom:.6f}",
-                stem=f"{run['stem']/denom:.6f}",
-                mix=f"{run['mix']/denom:.6f}",
-                pFull=f"{p_full:.2f}",
-            )
+            if is_main:
+                denom = max(1, pbar.n + 1)
+                pbar.set_postfix(
+                    total=f"{run['total']/denom:.6f}",
+                    stem=f"{run['stem']/denom:.6f}",
+                    mix=f"{run['mix']/denom:.6f}",
+                    pFull=f"{p_full:.2f}",
+                )
 
         ckpt = {
             "epoch": epoch,
