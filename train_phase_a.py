@@ -397,11 +397,31 @@ def save_ckpt(path: Path, payload: Dict[str, Any]) -> None:
     torch.save(payload, str(path))
 
 
+def _strip_prefix_if_all_keys(state_dict: Dict[str, Any], prefix: str) -> Dict[str, Any]:
+    if not state_dict:
+        return state_dict
+    keys = list(state_dict.keys())
+    if all(k.startswith(prefix) for k in keys):
+        return {k[len(prefix):]: v for k, v in state_dict.items()}
+    return state_dict
+
+
+def _normalize_checkpoint_state_dict(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    # 1) DDP: "module."
+    sd = _strip_prefix_if_all_keys(state_dict, "module.")
+    # 2) torch.compile иногда даёт "_orig_mod."
+    sd = _strip_prefix_if_all_keys(sd, "_orig_mod.")
+    # 3) бывает комбо "module._orig_mod."
+    sd = _strip_prefix_if_all_keys(sd, "module._orig_mod.")
+    return sd
+
+
 def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError(f"Bad checkpoint format: {path}")
     return ckpt
+
 
 def atomic_save_ckpt(path: Path, payload: Dict[str, Any]) -> None:
     """
@@ -698,7 +718,14 @@ def main():
 
     if args.resume:
         ckpt = load_ckpt(args.resume, device=device)
-        model.load_state_dict(ckpt["model"], strict=True)
+        sd = ckpt["model"]
+        try:
+            model.load_state_dict(sd, strict=True)
+        except RuntimeError:
+            print('Loaded from DDP')
+            sd2 = _normalize_checkpoint_state_dict(sd)
+            model.load_state_dict(sd2, strict=True)
+
         if (not args.reset_opt) and ("opt" in ckpt):
             try:
                 opt.load_state_dict(ckpt["opt"])
@@ -821,10 +848,11 @@ def main():
                     pFull=f"{p_full:.2f}",
                 )
 
+        raw_model = model.module if isinstance(model, DDP) else model
         ckpt = {
             "epoch": epoch,
             "global_step": global_step,
-            "model": model.state_dict(),
+            "model": raw_model.state_dict(),
             "opt": opt.state_dict(),
             "args": vars(args),
             **capture_rng(),
