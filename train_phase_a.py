@@ -716,22 +716,21 @@ def main():
     start_epoch = 1
     global_step = 0
 
+    raw_model = model.module if isinstance(model, DDP) else model
+
     if args.resume:
         ckpt = load_ckpt(args.resume, device=device)
-        sd = ckpt["model"]
-        try:
-            model.load_state_dict(sd, strict=True)
-        except RuntimeError:
-            print('Loaded from DDP')
-            sd2 = _normalize_checkpoint_state_dict(sd)
-            model.load_state_dict(sd2, strict=True)
+
+        sd = _normalize_checkpoint_state_dict(ckpt["model"])
+        raw_model.load_state_dict(sd, strict=True)
 
         if (not args.reset_opt) and ("opt" in ckpt):
             try:
                 opt.load_state_dict(ckpt["opt"])
             except Exception as e:
                 print(f"[warn] failed to load optimizer state: {e}")
-        if (not args.reset_rng):
+
+        if not args.reset_rng:
             restore_rng(ckpt)
 
         start_epoch = int(ckpt.get("epoch", 0)) + 1
