@@ -13,6 +13,22 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from deepvqe import DeepVQEStemSeparator
 import os, random
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+
+def ddp_setup():
+    # torchrun выставит эти env vars
+    if "RANK" not in os.environ:
+        return False, 0, 1, 0  # not distributed
+
+    dist.init_process_group(backend="nccl", init_method="env://")
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return True, rank, world, local_rank
 
 
 def seed_worker(worker_id: int) -> None:
@@ -243,8 +259,8 @@ class StemDataset(Dataset):
         self.long_jitter_len = max(0, self.long_jitter_len)
 
         self.index: List[Tuple[int, int]] = []
+        self._min_len_cache = {i: self._min_len(it) for i, it in enumerate(self.items)}
         self._build_index()
-        self._min_len_cache = {idx: self._min_len(self.items[idx]) for idx, _ in self.index}
 
     def _min_len(self, it: TrackItem) -> int:
         paths = [it.full, it.bass, it.drums, it.instruments]
@@ -270,7 +286,7 @@ class StemDataset(Dataset):
     def _build_index(self) -> None:
         self.index.clear()
         for i, it in enumerate(self.items):
-            n = self._min_len(it)
+            n = self._min_len_cache[i]
             if n <= 0:
                 continue
             if n < self.long_threshold_len:
@@ -506,6 +522,9 @@ def main():
 
     args = ap.parse_args()
 
+    is_ddp, rank, world_size, local_rank = ddp_setup()
+    is_main = (rank == 0)
+
     if args.enable_tf32:
         print('Activated tf32')
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -516,7 +535,7 @@ def main():
     if args.num_heads != 4:
         raise RuntimeError("This script assumes num_heads=4: bass, drums, music(inst+melody), vocals")
 
-    device = torch.device(args.device if (args.device != "cuda" or torch.cuda.is_available()) else "cpu")
+    device = torch.device(f"cuda:{local_rank}" if (is_ddp and torch.cuda.is_available()) else args.device)
     print("device:", device)
 
     torch.manual_seed(args.seed)
@@ -539,10 +558,22 @@ def main():
     g = torch.Generator()
     g.manual_seed(args.seed)
 
+    sampler = None
+    if is_ddp:
+        sampler = DistributedSampler(
+            ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.seed,
+            drop_last=(len(ds) >= args.batch),
+        )
+
     dl = DataLoader(
         ds,
         batch_size=args.batch,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         drop_last=(len(ds) >= args.batch),
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda") and args.pin_memory,
@@ -556,6 +587,17 @@ def main():
     print(f"dataset: {len(ds)} segments | batch={args.batch} | batches/epoch={len(dl)}")
 
     model = DeepVQEStemSeparator(n_fft=args.n_fft, num_heads=args.num_heads).to(device)
+
+    if is_ddp:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=False,
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+        )
+
     stft = STFT(StftCfg(n_fft=args.n_fft, hop=args.hop, win=args.win)).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
@@ -597,6 +639,8 @@ def main():
     )
 
     for epoch in range(start_epoch, args.epochs + 1):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
         p_full = linear_ramp(
             epoch=epoch,
             start=int(args.ab_start_epoch),
@@ -607,7 +651,7 @@ def main():
         p_full = float(np.clip(p_full, 0.0, 1.0))
 
         run = {"stem": 0.0, "mix": 0.0, "total": 0.0}
-        pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True)
+        pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
         for full, bass, drums, inst, melody, vocals in pbar:
             full = full.to(device, non_blocking=True)      # (B,2,T)
@@ -697,11 +741,11 @@ def main():
             "args": vars(args),
             **capture_rng(),
         }
-        if epoch % int(args.save_every_epochs) == 0:
+        if is_main and (epoch % int(args.save_every_epochs) == 0):
             save_ckpt(save_dir / f"phase_ab_4stem_e{epoch:03d}.pt", ckpt)
         save_ckpt(save_dir / "phase_ab_4stem_latest.pt", ckpt)
 
-        if args.dump_audio_every_epochs and (epoch % int(args.dump_audio_every_epochs) == 0):
+        if is_main and args.dump_audio_every_epochs and (epoch % int(args.dump_audio_every_epochs) == 0):
             model.eval()
             with torch.no_grad():
                 full, bass, drums, inst, melody, vocals = next(iter(dl))
@@ -754,6 +798,9 @@ def main():
 
                 print(f"[dump] wrote wavs to {dump_dir}")
             model.train()
+
+    if is_ddp:
+        dist.destroy_process_group()
 
     print("done.")
 
