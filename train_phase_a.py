@@ -787,7 +787,7 @@ def main():
 
             # clip-safe scale based on chosen input, apply to all signals + stem_sum
             full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
-                peak_ref=mix_in,
+                peak_ref=stem_sum,
                 signals=[full, bass, drums, music, vocals, stem_sum, mix_in],
                 peak_target=0.98,
             )
