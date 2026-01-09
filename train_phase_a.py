@@ -130,6 +130,127 @@ class STFT(nn.Module):
 
 
 # -----------------------
+# Multi-Resolution STFT loss (time-domain)
+# -----------------------
+def _parse_int_csv(s: str) -> List[int]:
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+class MRSTFTLoss(nn.Module):
+    """
+    Multi-resolution STFT loss:
+      loss = mean_over_resolutions( sc_weight * spectral_convergence + logmag_weight * logmag_l1 )
+
+    Returns:
+      per-example loss vector: (N,)
+    """
+
+    def __init__(
+        self,
+        n_ffts: List[int],
+        hops: List[int],
+        wins: List[int],
+        *,
+        sc_weight: float = 1.0,
+        logmag_weight: float = 1.0,
+        eps: float = 1e-7,
+        chunk: int = 0,   # 0 -> no chunking
+    ) -> None:
+        super().__init__()
+        if not (len(n_ffts) == len(hops) == len(wins)) or len(n_ffts) == 0:
+            raise ValueError("MRSTFTLoss: n_ffts/hops/wins must have same non-zero length")
+
+        self.cfgs = list(zip([int(x) for x in n_ffts], [int(x) for x in hops], [int(x) for x in wins]))
+        self.sc_weight = float(sc_weight)
+        self.logmag_weight = float(logmag_weight)
+        self.eps = float(eps)
+        self.chunk = int(chunk)
+
+        # windows are buffers so .to(device) moves them once (no per-step copies)
+        for i, (_, _, win) in enumerate(self.cfgs):
+            self.register_buffer(
+                f"window_{i}",
+                torch.hann_window(int(win), dtype=torch.float32),
+                persistent=False,
+            )
+
+    def _one_res_loss(self, x: torch.Tensor, y: torch.Tensor, i: int) -> torch.Tensor:
+        """
+        x,y: (N,T) float32
+        returns: (N,) for one resolution
+        """
+        n_fft, hop, win = self.cfgs[i]
+        w = getattr(self, f"window_{i}").to(device=x.device, dtype=torch.float32)
+
+        X = torch.stft(
+            x,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=win,
+            window=w,
+            return_complex=True,
+            center=True,
+            pad_mode="reflect",
+        )
+        Y = torch.stft(
+            y,
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=win,
+            window=w,
+            return_complex=True,
+            center=True,
+            pad_mode="reflect",
+        )
+
+        magX = X.abs()
+        magY = Y.abs()
+
+        # spectral convergence per-example
+        # ||Y - X||_F / ||Y||_F
+        diff = (magY - magX).reshape(magY.shape[0], -1)
+        denom = magY.reshape(magY.shape[0], -1)
+
+        sc = torch.linalg.vector_norm(diff, dim=1) / torch.linalg.vector_norm(denom, dim=1).clamp_min(self.eps)
+
+        # log-mag L1 per-example
+        logmag = (torch.log(magY + self.eps) - torch.log(magX + self.eps)).abs().mean(dim=(1, 2))
+
+        return (self.sc_weight * sc) + (self.logmag_weight * logmag)
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """
+        x,y: (N,T) any float dtype -> internally float32
+        returns: (N,) per-example loss
+        """
+        if x.ndim != 2 or y.ndim != 2:
+            raise ValueError(f"MRSTFTLoss expects (N,T), got x={tuple(x.shape)} y={tuple(y.shape)}")
+        if x.shape != y.shape:
+            raise ValueError(f"MRSTFTLoss shape mismatch: x={tuple(x.shape)} y={tuple(y.shape)}")
+
+        x = x.float()
+        y = y.float()
+
+        N = x.shape[0]
+        chunk = self.chunk if self.chunk and self.chunk > 0 else N
+
+        outs: List[torch.Tensor] = []
+        for s in range(0, N, chunk):
+            e = min(N, s + chunk)
+            xc = x[s:e]
+            yc = y[s:e]
+
+            loss_c = xc.new_zeros((e - s,), dtype=torch.float32)
+            for i in range(len(self.cfgs)):
+                loss_c = loss_c + self._one_res_loss(xc, yc, i)
+            loss_c = loss_c / float(len(self.cfgs))
+            outs.append(loss_c)
+
+        return torch.cat(outs, dim=0)
+
+
+
+# -----------------------
 # Dataset
 # -----------------------
 @dataclass
@@ -597,6 +718,17 @@ def main():
     ap.add_argument("--w-stem", type=float, default=1.0)
     ap.add_argument("--w-mix", type=float, default=0.5)
 
+    # ---- MR-STFT (time-domain) over ALL heads ----
+    ap.add_argument("--w-mrstft", type=float, default=0.0)
+    ap.add_argument("--mr-nffts", type=str, default="512,1024,2048")
+    ap.add_argument("--mr-hops", type=str, default="120,240,480")
+    ap.add_argument("--mr-wins", type=str, default="512,1024,2048")
+    ap.add_argument("--mr-sc-weight", type=float, default=1.0)
+    ap.add_argument("--mr-logmag-weight", type=float, default=1.0)
+    ap.add_argument("--mr-eps", type=float, default=1e-7)
+    ap.add_argument("--mr-chunk", type=int, default=20)  # <= важно для памяти
+    ap.add_argument("--mr-every", type=int, default=1)  # считать раз в N шагов (1 = каждый шаг)
+
     # optional per-head weights
     ap.add_argument("--w-bass", type=float, default=1.0)
     ap.add_argument("--w-drums", type=float, default=1.0)
@@ -706,6 +838,24 @@ def main():
         )
 
     stft = STFT(StftCfg(n_fft=args.n_fft, hop=args.hop, win=args.win)).to(device)
+
+    # MR-STFT loss module
+    mrstft = None
+    if float(args.w_mrstft) > 0.0:
+        n_ffts = _parse_int_csv(args.mr_nffts)
+        hops = _parse_int_csv(args.mr_hops)
+        wins = _parse_int_csv(args.mr_wins)
+        mrstft = MRSTFTLoss(
+            n_ffts=n_ffts,
+            hops=hops,
+            wins=wins,
+            sc_weight=float(args.mr_sc_weight),
+            logmag_weight=float(args.mr_logmag_weight),
+            eps=float(args.mr_eps),
+            chunk=int(args.mr_chunk),
+        ).to(device)
+
+
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
 
     save_dir = Path(args.save_dir)
@@ -763,7 +913,7 @@ def main():
         )
         p_full = float(np.clip(p_full, 0.0, 1.0))
 
-        run = {"stem": 0.0, "mix": 0.0, "total": 0.0}
+        run = {"stem": 0.0, "mix": 0.0, "mr": 0.0, "total": 0.0}
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
         for full, bass, drums, inst, melody, vocals in pbar:
@@ -827,6 +977,33 @@ def main():
 
             loss = float(args.w_stem) * loss_stem + float(args.w_mix) * loss_mix
 
+            # --- MR-STFT (time-domain) on ALL heads ---
+            mr_loss = None
+            if (mrstft is not None) and (int(args.mr_every) > 0) and ((global_step % int(args.mr_every)) == 0):
+                # pred: (N,4,F,Tf,2) where N=B*C
+                N = pred.shape[0]
+                S = pred.shape[1]  # =4
+
+                # iSTFT predicted stems -> (N*S, T)
+                pred_ri_flat = pred.reshape(N * S, pred.shape[2], pred.shape[3], 2)
+                pred_wav = stft.istft_ri(pred_ri_flat, length=T)  # (N*S, T)
+
+                # target stems waveform from original time-domain targets (already scaled)
+                tgt_wav = torch.stack([bass_f, drums_f, music_f, vocals_f], dim=1).reshape(N * S, T)  # (N*S, T)
+
+                # per-example MR loss: (N*S,)
+                mr_vec = mrstft(pred_wav, tgt_wav)
+
+                # apply same per-head weights as stem loss (broadcast over N)
+                w_vec = head_w[None, :].expand(N, S).reshape(N * S).float()
+                mr_loss = (mr_vec * w_vec).sum() / w_vec.sum().clamp_min(1e-8)
+
+                loss = loss + float(args.w_mrstft) * mr_loss
+
+            if mr_loss is not None:
+                run["mr"] += float(mr_loss.detach().cpu())
+
+
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if args.grad_clip and args.grad_clip > 0:
@@ -844,8 +1021,10 @@ def main():
                     total=f"{run['total']/denom:.6f}",
                     stem=f"{run['stem']/denom:.6f}",
                     mix=f"{run['mix']/denom:.6f}",
+                    mr=f"{run['mr']/denom:.6f}",
                     pFull=f"{p_full:.2f}",
                 )
+
 
         raw_model = model.module if isinstance(model, DDP) else model
         ckpt = {
