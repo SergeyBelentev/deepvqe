@@ -164,8 +164,8 @@ def infer_ola(
     Heads: bass, drums, music, vocals
     """
     assert 0.0 <= overlap < 1.0
-    if stitch not in ("ola", "crop"):
-        raise ValueError("stitch must be 'ola' or 'crop'")
+    if stitch not in ("ola", "crop", "full"):
+        raise ValueError("stitch must be 'ola' or 'crop' or 'full'")
 
     x = x_stereo.to(device, dtype=torch.float32)
     C, T = x.shape
@@ -199,6 +199,30 @@ def infer_ola(
         else:
             pred = model(mix_ri)
         return pred_to_time(pred)
+
+    # -----------------------
+    # Mode 0: full inference (single pass, no windows)
+    # -----------------------
+    if stitch == "full":
+        # x: (2,T) on device
+        mix_ri = stft.stft_ri(x)  # (2,F,Tf,2)
+
+        if use_amp and device.type == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                pred = model(mix_ri)  # (2,4,F,Tf,2)
+        else:
+            pred = model(mix_ri)
+
+        # pred: (2,4,F,Tf,2) -> time
+        # (4,2,F,Tf,2) -> (8,F,Tf,2)
+        p = pred.permute(1, 0, 2, 3, 4).contiguous()
+        p = p.view(p.shape[0] * p.shape[1], p.shape[2], p.shape[3], p.shape[4])  # (8,F,Tf,2)
+        y = stft.istft_ri(p, length=T)  # (8,T)
+        y = y.view(4, 2, T).detach().cpu()
+
+        names = ["bass", "drums", "music", "vocals"]
+        return {names[i]: y[i] for i in range(4)}
+
 
     # -----------------------
     # Mode 1: classic OLA (fixed normalization: wsum += win)
@@ -355,9 +379,9 @@ def main():
 
     ap.add_argument(
         "--stitch",
-        choices=["ola", "crop"],
+        choices=["ola", "crop", "full"],
         default="ola",
-        help="Stitching mode: 'ola' = overlap-add with Hann (fixed norm), 'crop' = keep central part and stitch",
+        help="Stitching mode: 'full' = single-pass on entire audio, 'ola' = overlap-add, 'crop' = central crop stitch",
     )
     ap.add_argument(
         "--keep-frac",

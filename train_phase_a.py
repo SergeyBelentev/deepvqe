@@ -9,7 +9,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, get_worker_info
 from tqdm import tqdm
 from deepvqe import DeepVQEStemSeparator
 import os, random
@@ -19,6 +19,7 @@ from boto3.s3.transfer import TransferConfig
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import json
 
 
 def ddp_setup():
@@ -355,23 +356,186 @@ def load_manifest_csv(path: str) -> List[TrackItem]:
     return items
 
 
-class StemDataset(Dataset):
+STEM_ORDER = ["bass", "drums", "music", "vocals"]
+STEM_SET = set(STEM_ORDER)
+
+_STEM_ALIASES = {
+    "bass": "bass",
+    "drums": "drums",
+    "music": "music",
+    "instrumental": "music",
+    "instruments": "music",
+    "inst": "music",
+    "melody": "music",
+    "vocals": "vocals",
+    "vocal": "vocals",
+    "voice": "vocals",
+}
+
+
+def _norm_stem_name(x: str) -> str:
+    k = x.strip().lower()
+    if k not in _STEM_ALIASES:
+        raise ValueError(f"Unknown stem name: {x!r}. Allowed: {sorted(set(_STEM_ALIASES.keys()))}")
+    return _STEM_ALIASES[k]
+
+
+@dataclass(frozen=True)
+class Recipe:
+    prob: float
+    type: str                      # "unconditional" (пока)
+    mix_in: str                    # "stem_sum" | "full"
+    stem_sum_mode: str             # "fixed" | "random" | "random_within_track"
+    stem_count: int                # 1..4
+    required_stems: Tuple[str, ...]
+    available_stems: Tuple[str, ...]
+
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "Recipe":
+        prob = float(d.get("prob", 0.0))
+        typ = str(d.get("type", "unconditional"))
+        mix_in = str(d.get("mix_in", "stem_sum"))
+        mode = str(d.get("stem_sum_mode", "fixed"))
+        stem_count = int(d.get("stem_count", 4))
+
+        req = tuple(_norm_stem_name(x) for x in (d.get("required_stems", []) or []))
+        avl = tuple(_norm_stem_name(x) for x in (d.get("available_stems", []) or []))
+
+        if stem_count < 1 or stem_count > 4:
+            raise ValueError(f"stem_count must be 1..4, got {stem_count}")
+
+        if any(s not in STEM_SET for s in req + avl):
+            raise ValueError(f"Bad stems in recipe: req={req} avl={avl}")
+
+        if len(set(req)) != len(req):
+            raise ValueError(f"required_stems has duplicates: {req}")
+
+        # stem_count must cover required
+        if len(req) > stem_count:
+            raise ValueError(f"stem_count={stem_count} < len(required_stems)={len(req)}")
+
+        # mode validation
+        if mode not in ("fixed", "random", "random_within_track"):
+            raise ValueError(f"stem_sum_mode must be one of fixed|random|random_within_track, got {mode!r}")
+
+        if mix_in not in ("stem_sum", "full"):
+            raise ValueError(f"mix_in must be one of stem_sum|full, got {mix_in!r}")
+
+        # full only makes sense for fixed (иначе targets не соответствуют входу)
+        if mix_in == "full" and mode != "fixed":
+            raise ValueError("mix_in='full' requires stem_sum_mode='fixed' (otherwise input/targets mismatch).")
+
+        return Recipe(
+            prob=prob,
+            type=typ,
+            mix_in=mix_in,
+            stem_sum_mode=mode,
+            stem_count=stem_count,
+            required_stems=req,
+            available_stems=avl,
+        )
+
+    def pick_active_stems(self, rng: np.random.Generator) -> Tuple[str, ...]:
+        """
+        Возвращает какие стемы "включены" в этом сэмпле (и должны быть в mix_in, и быть ненулевыми в таргете).
+        Остальные таргеты = 0 (тишина).
+        """
+        active = list(self.required_stems)
+        need = self.stem_count - len(active)
+        if need > 0:
+            pool = [s for s in self.available_stems if s not in active]
+            if len(pool) < need:
+                raise ValueError(
+                    f"Not enough available_stems to reach stem_count. need={need} pool={pool} req={active}"
+                )
+            pick = rng.choice(pool, size=need, replace=False).tolist()
+            active.extend(pick)
+        # фиксируем порядок стабильным (не обязательно, но удобнее)
+        active = sorted(active, key=lambda s: STEM_ORDER.index(s))
+        return tuple(active)
+
+
+class RecipeBook:
     """
-    Returns RAW (unscaled) segments:
-      full, bass, drums, inst, melody, vocals
-    Scaling + mode selection happens in train loop.
+    JSON:
+    {
+      "1": [ {recipe}, {recipe}, ... ],
+      "2": [ ... ],
+      ...
+    }
+    """
+
+    def __init__(self, plans: Dict[int, List[Recipe]]) -> None:
+        if not plans:
+            raise ValueError("RecipeBook: empty plans")
+        self.plans = {int(k): v for k, v in plans.items()}
+        self.epochs_sorted = sorted(self.plans.keys())
+
+        # validate probs per epoch
+        for e in self.epochs_sorted:
+            rs = self.plans[e]
+            s = sum(r.prob for r in rs)
+            if s <= 0:
+                raise ValueError(f"Epoch {e}: sum(prob) must be >0, got {s}")
+
+    @staticmethod
+    def from_json_path(path: str) -> "RecipeBook":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("RecipeBook JSON must be an object {epoch: [recipes]}")
+        plans: Dict[int, List[Recipe]] = {}
+        for k, v in data.items():
+            e = int(k)
+            if not isinstance(v, list):
+                raise ValueError(f"Epoch {k}: value must be list of recipes")
+            plans[e] = [Recipe.from_dict(x) for x in v]
+        return RecipeBook(plans)
+
+    def plan_for_epoch(self, epoch: int) -> List[Recipe]:
+        # берём последний определённый epoch <= текущего
+        e = int(epoch)
+        cand = [x for x in self.epochs_sorted if x <= e]
+        use = cand[-1] if cand else self.epochs_sorted[0]
+        return self.plans[use]
+
+    @staticmethod
+    def _choose_weighted(rng: np.random.Generator, recipes: List[Recipe]) -> Recipe:
+        w = np.array([max(0.0, r.prob) for r in recipes], dtype=np.float64)
+        w = w / w.sum()
+        i = int(rng.choice(len(recipes), p=w))
+        return recipes[i]
+
+    def sample_recipe(self, rng: np.random.Generator, epoch: int) -> Recipe:
+        rs = self.plan_for_epoch(epoch)
+        return self._choose_weighted(rng, rs)
+
+
+class FlexibleMixDataset(Dataset):
+    """
+    Генерирует один тренировочный пример:
+      mix_in: (2,T)
+      tgt:    (4,2,T) в порядке STEM_ORDER
+      present_mask: (4,) 1 если стем включен в mix_in, иначе 0
+
+    Реализует:
+      - stem_sum_mode=fixed: все стемы из одной и той же позиции трека (как раньше)
+      - stem_sum_mode=random: каждый стем из независимого трека/сегмента (гипотеза 1)
+      - stem_count/required/available: частичные миксы (гипотеза 2/3)
     """
 
     def __init__(
         self,
-        items: List[TrackItem],
+        items: List["TrackItem"],
         *,
         sr: int,
         segment_sec: float,
+        recipe_book: RecipeBook,
         long_threshold_sec: float = 6.0,
         long_hop_sec: Optional[float] = None,
         long_jitter_sec: float = 0.0,
+        epoch_size: int = 200_000,   # сколько __getitem__ даём "виртуально"
     ):
+        super().__init__()
         self.items = items
         self.sr = int(sr)
         self.seg_len = int(round(self.sr * float(segment_sec)))
@@ -382,103 +546,207 @@ class StemDataset(Dataset):
         self.long_jitter_len = int(round(self.sr * float(long_jitter_sec)))
         self.long_jitter_len = max(0, self.long_jitter_len)
 
-        self.index: List[Tuple[int, int]] = []
-        self._min_len_cache = {i: self._min_len(it) for i, it in enumerate(self.items)}
-        self._build_index()
+        self.epoch_size = int(epoch_size)
+        self.book = recipe_book
+        self._epoch = 1
 
-    def _min_len(self, it: TrackItem) -> int:
+        # кеш минимальной длины по доступным стемам (как у тебя)
+        self._min_len_cache = {i: self._min_len(it) for i, it in enumerate(self.items)}
+
+        # пулы треков, где можно брать сегменты
+        self.valid_any: List[int] = []
+        self.valid_vocals: List[int] = []
+        for i, it in enumerate(self.items):
+            n = self._min_len_cache[i]
+            if n >= self.seg_len and n > 0:
+                self.valid_any.append(i)
+                if it.vocals:  # только треки с vocals.wav
+                    self.valid_vocals.append(i)
+
+        if not self.valid_any:
+            raise RuntimeError("FlexibleMixDataset: no valid tracks with length >= segment")
+        if not self.valid_vocals:
+            # можно, но тогда recipes с required vocals не сработают
+            print("[warn] FlexibleMixDataset: no vocal tracks (vocals.wav). 'vocals' recipes will fail.")
+
+        # для fixed-режима мы хотим как раньше иметь list возможных starts
+        self.track_starts: Dict[int, List[int]] = {}
+        for i in self.valid_any:
+            n = self._min_len_cache[i]
+            self.track_starts[i] = self._build_starts_for_track(n)
+
+    def set_epoch(self, epoch: int) -> None:
+        self._epoch = int(epoch)
+
+    def __len__(self) -> int:
+        return self.epoch_size
+
+    def _min_len(self, it: "TrackItem") -> int:
+        # минимальная длина среди full/bass/drums/instruments и vocals/melody (как у тебя)
         paths = [it.full, it.bass, it.drums, it.instruments]
-        paths = list(filter(lambda x: x is not None, paths))
-        if it.kind == "vocal":
-            if not it.vocals:
-                raise RuntimeError("vocal item missing vocals")
+        paths = [p for p in paths if p is not None]
+        if it.vocals:
             paths.append(it.vocals)
-        else:
-            if not it.melody:
-                raise RuntimeError("novocal item missing melody")
+        if it.melody:
             paths.append(it.melody)
 
         mins = None
         for p in paths:
             n, sr, _ = _num_frames_and_sr(p)
             if sr != self.sr:
-                print(f"SR mismatch: {p} sr={sr}, expected {self.sr}")
+                # этот трек фактически невалиден
                 return 0
             mins = n if mins is None else min(mins, n)
         return int(mins or 0)
 
-    def _build_index(self) -> None:
-        self.index.clear()
-        for i, it in enumerate(self.items):
-            n = self._min_len_cache[i]
-            if n <= 0:
-                continue
-            if n < self.long_threshold_len:
-                self.index.append((i, -1))
-                continue
+    def _build_starts_for_track(self, n: int) -> List[int]:
+        # повторяем логику твоего индексатора: для длинных треков — fixed starts, иначе -1 (рандом)
+        if n <= 0:
+            return []
+        if n < self.long_threshold_len:
+            return [-1]
+        if n <= self.seg_len:
+            return [0]
+        max_start = n - self.seg_len
+        starts = list(range(0, max_start + 1, self.long_hop_len))
+        if starts[-1] != max_start:
+            starts.append(max_start)
+        return starts
+
+    def _random_start_from_starts(self, rng: np.random.Generator, track_i: int) -> int:
+        starts = self.track_starts.get(track_i)
+        n = self._min_len_cache[track_i]
+        if not starts:
+            # fallback: uniform
             if n <= self.seg_len:
-                self.index.append((i, 0))
-                continue
-
-            max_start = n - self.seg_len
-            starts = list(range(0, max_start + 1, self.long_hop_len))
-            if starts[-1] != max_start:
-                starts.append(max_start)
-            for s in starts:
-                self.index.append((i, int(s)))
-
-        if not self.index:
-            raise RuntimeError("Dataset index is empty. Check audio files / sr / lengths.")
-
-        print(
-            f"[StemDataset] tracks={len(self.items)} virtual_items={len(self.index)} "
-            f"| seg_len={self.seg_len} long_thr={self.long_threshold_len} hop={self.long_hop_len} jitter={self.long_jitter_len}"
-        )
-
-    def __len__(self) -> int:
-        return len(self.index)
-
-    def load_segment(self, full, path: str|None, start_j):
-        if path:
-            return _read_stereo_segment(path, self.sr, start_j, self.seg_len)
+                return 0
+            return int(rng.integers(0, n - self.seg_len + 1))
+        base = int(rng.choice(starts))
+        if base < 0:
+            if n <= self.seg_len:
+                return 0
+            return int(rng.integers(0, n - self.seg_len + 1))
+        if self.long_jitter_len > 0:
+            j = int(rng.integers(-self.long_jitter_len, self.long_jitter_len + 1))
         else:
-            return torch.zeros_like(full)
+            j = 0
+        max_start = max(0, n - self.seg_len)
+        return int(max(0, min(max_start, base + j)))
+
+    def _rng_for_item(self, idx: int) -> np.random.Generator:
+        # детерминизм на уровне воркера: worker seed + epoch + idx
+        wi = get_worker_info()
+        if wi is None:
+            seed = (torch.initial_seed() % (2**32))
+        else:
+            seed = (wi.seed % (2**32))
+        # смешиваем с epoch и idx
+        seed = (seed + 1000003 * int(self._epoch) + 9176 * int(idx)) % (2**32)
+        return np.random.default_rng(seed)
+
+    def _pick_track_for_stem(self, rng: np.random.Generator, stem: str) -> int:
+        if stem == "vocals":
+            if not self.valid_vocals:
+                raise RuntimeError("No vocal tracks in dataset, but recipe requires vocals.")
+            return int(rng.choice(self.valid_vocals))
+        return int(rng.choice(self.valid_any))
+
+    def _load_stem(self, track_i: int, start: int, stem: str) -> torch.Tensor:
+        it = self.items[track_i]
+        # full / bass / drums / instruments / melody / vocals — у тебя уже есть _read_stereo_segment
+        if stem == "bass":
+            return _read_stereo_segment(it.bass, self.sr, start, self.seg_len) if it.bass else torch.zeros((2, self.seg_len), dtype=torch.float32)
+        if stem == "drums":
+            return _read_stereo_segment(it.drums, self.sr, start, self.seg_len) if it.drums else torch.zeros((2, self.seg_len), dtype=torch.float32)
+        if stem == "vocals":
+            return _read_stereo_segment(it.vocals, self.sr, start, self.seg_len) if it.vocals else torch.zeros((2, self.seg_len), dtype=torch.float32)
+        if stem == "music":
+            inst = _read_stereo_segment(it.instruments, self.sr, start, self.seg_len) if it.instruments else torch.zeros((2, self.seg_len), dtype=torch.float32)
+            mel = _read_stereo_segment(it.melody, self.sr, start, self.seg_len) if it.melody else torch.zeros((2, self.seg_len), dtype=torch.float32)
+            return inst + mel
+        raise ValueError(f"Unknown stem: {stem}")
+
+    def _load_full_and_all_stems_fixed(self, track_i: int, start: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        it = self.items[track_i]
+        full = _read_stereo_segment(it.full, self.sr, start, self.seg_len)
+        stems = {
+            "bass": self._load_stem(track_i, start, "bass"),
+            "drums": self._load_stem(track_i, start, "drums"),
+            "music": self._load_stem(track_i, start, "music"),
+            "vocals": self._load_stem(track_i, start, "vocals"),
+        }
+        return full, stems
 
     def __getitem__(self, idx: int):
-        item_i, start = self.index[idx]
-        it = self.items[item_i]
+        rng = self._rng_for_item(idx)
+        recipe = self.book.sample_recipe(rng, epoch=self._epoch)
+        if recipe.type != "unconditional":
+            raise ValueError(f"Unsupported recipe type: {recipe.type}")
 
-        if start < 0:
-            n = self._min_len_cache[item_i]
-            if n <= self.seg_len:
-                start_j = 0
+        active = recipe.pick_active_stems(rng)  # tuple[str]
+
+        # targets (4,2,T) и mask (4,)
+        tgt = {s: torch.zeros((2, self.seg_len), dtype=torch.float32) for s in STEM_ORDER}
+        present = {s: 0.0 for s in STEM_ORDER}
+        full = None
+
+        if recipe.stem_sum_mode == "fixed":
+            # один трек/позиция на все стемы
+            track_i = int(rng.choice(self.valid_any))
+            start = self._random_start_from_starts(rng, track_i)
+            full, stems = self._load_full_and_all_stems_fixed(track_i, start)
+            for s in active:
+                tgt[s] = stems[s]
+                present[s] = 1.0
+
+            if recipe.mix_in == "full":
+                mix_in = full
             else:
-                start_j = int(torch.randint(0, n - self.seg_len + 1, (1,)).item())
+                mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+        elif recipe.stem_sum_mode == "random":
+            # каждый активный стем из отдельного (случайного) трека/позиции
+            for s in active:
+                tr = self._pick_track_for_stem(rng, s)
+                st = self._random_start_from_starts(rng, tr)
+                tgt[s] = self._load_stem(tr, st, s)
+                present[s] = 1.0
+            mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+        elif recipe.stem_sum_mode == "random_within_track":
+            # один трек общий, но время для каждого стема рандомное (мягче, чем random)
+            track_i = int(rng.choice(self.valid_any))
+            for s in active:
+                st = self._random_start_from_starts(rng, track_i)
+                tgt[s] = self._load_stem(track_i, st, s)
+                present[s] = 1.0
+            mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
         else:
-            j = int(torch.randint(-self.long_jitter_len, self.long_jitter_len + 1, (1,)).item()) if self.long_jitter_len > 0 else 0
-            n = self._min_len_cache[item_i]
-            max_start = max(0, n - self.seg_len)
-            start_j = int(max(0, min(max_start, start + j)))
+            raise ValueError(f"Bad stem_sum_mode: {recipe.stem_sum_mode}")
 
-        full = _read_stereo_segment(it.full, self.sr, start_j, self.seg_len)
+        # clip-safe scale по mix_in, применяем ко всем таргетам и mix_in
+        mix_in_b = mix_in.unsqueeze(0)  # (1,2,T)
+        signals = [mix_in_b] + [tgt[s].unsqueeze(0) for s in STEM_ORDER]
+        scaled = apply_clip_safe_scale(peak_ref=mix_in_b, signals=signals, peak_target=0.98)
+        mix_in_b = scaled[0]
+        for i, s in enumerate(STEM_ORDER):
+            tgt[s] = scaled[i + 1].squeeze(0)
 
-        bass = self.load_segment(full, it.bass, start_j)
-        drums = self.load_segment(full, it.drums, start_j)
-        inst = self.load_segment(full, it.instruments, start_j)
-        vocals = self.load_segment(full, it.vocals, start_j)
-        melody = self.load_segment(full, it.melody, start_j)
+        mix_in = mix_in_b.squeeze(0)
 
-        return full, bass, drums, inst, melody, vocals
+        tgt_tensor = torch.stack([tgt[s] for s in STEM_ORDER], dim=0)  # (4,2,T)
+        present_mask = torch.tensor([present[s] for s in STEM_ORDER], dtype=torch.float32)  # (4,)
+
+        return mix_in, tgt_tensor, present_mask
+
 
 
 def collate(batch):
-    full = torch.stack([b[0] for b in batch], dim=0)     # (B,2,T)
-    bass = torch.stack([b[1] for b in batch], dim=0)
-    drums = torch.stack([b[2] for b in batch], dim=0)
-    inst = torch.stack([b[3] for b in batch], dim=0)
-    melody = torch.stack([b[4] for b in batch], dim=0)
-    vocals = torch.stack([b[5] for b in batch], dim=0)
-    return full, bass, drums, inst, melody, vocals
+    mix = torch.stack([b[0] for b in batch], dim=0)          # (B,2,T)
+    tgt = torch.stack([b[1] for b in batch], dim=0)          # (B,4,2,T)
+    pm  = torch.stack([b[2] for b in batch], dim=0)          # (B,4)
+    return mix, tgt, pm
 
 
 # -----------------------
@@ -670,6 +938,8 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--root", type=str)
     g.add_argument("--manifest", type=str)
+    ap.add_argument("--recipe-json", type=str, required=True)
+    ap.add_argument("--epoch-size", type=int, default=200000)
 
     ap.add_argument("--save-dir", default="ckpt_phase_ab_4stem")
     ap.add_argument("--epochs", type=int, default=10)
@@ -706,14 +976,6 @@ def main():
     # HEADS: bass, drums, music(inst+melody), vocals
     ap.add_argument("--num-heads", type=int, default=4)
 
-    # A->B schedule for INPUT mix
-    # Mode A input: mix_in = stem_sum
-    # Mode B input: mix_in = full
-    ap.add_argument("--ab-start-epoch", type=int, default=1)
-    ap.add_argument("--ab-end-epoch", type=int, default=10)
-    ap.add_argument("--ab-prob-start", type=float, default=0.0)
-    ap.add_argument("--ab-prob-end", type=float, default=0.7)  # ВАЖНО: я бы не делал 1.0 сразу
-
     # losses
     ap.add_argument("--w-stem", type=float, default=1.0)
     ap.add_argument("--w-mix", type=float, default=0.5)
@@ -734,6 +996,7 @@ def main():
     ap.add_argument("--w-drums", type=float, default=1.0)
     ap.add_argument("--w-music", type=float, default=1.0)
     ap.add_argument("--w-vocals", type=float, default=1.0)
+    ap.add_argument("--silence-weight", type=float, default=0.35)
 
     ap.add_argument("--limit-items", type=int, default=0)
     ap.add_argument("--dump-audio-every-epochs", type=int, default=0)
@@ -785,13 +1048,17 @@ def main():
         items = items[: int(args.limit_items)]
         print(f"[info] limit-items={len(items)}")
 
-    ds = StemDataset(
+    book = RecipeBook.from_json_path(args.recipe_json)
+
+    ds = FlexibleMixDataset(
         items,
         sr=args.sr,
         segment_sec=args.segment_sec,
+        recipe_book=book,
         long_threshold_sec=args.long_threshold_sec,
         long_hop_sec=args.long_hop_sec,
         long_jitter_sec=args.long_jitter_sec,
+        epoch_size=args.epoch_size,
     )
 
     g = torch.Generator()
@@ -902,59 +1169,42 @@ def main():
     )
 
     for epoch in range(start_epoch, args.epochs + 1):
+        ds.set_epoch(epoch)
         if sampler is not None:
             sampler.set_epoch(epoch)
-        p_full = linear_ramp(
-            epoch=epoch,
-            start=int(args.ab_start_epoch),
-            end=int(args.ab_end_epoch),
-            v0=float(args.ab_prob_start),
-            v1=float(args.ab_prob_end),
-        )
-        p_full = float(np.clip(p_full, 0.0, 1.0))
 
         run = {"stem": 0.0, "mix": 0.0, "mr": 0.0, "total": 0.0}
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
-        for full, bass, drums, inst, melody, vocals in pbar:
-            full = full.to(device, non_blocking=True)      # (B,2,T)
-            bass = bass.to(device, non_blocking=True)
-            drums = drums.to(device, non_blocking=True)
-            inst = inst.to(device, non_blocking=True)
-            melody = melody.to(device, non_blocking=True)
-            vocals = vocals.to(device, non_blocking=True)
+        for mix_in, tgt, present_mask in pbar:
+            # mix_in: (B,2,T)
+            # tgt:    (B,4,2,T)
+            # present_mask: (B,4)
 
-            B, C, T = full.shape
+            mix_in = mix_in.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
+            present_mask = present_mask.to(device, non_blocking=True)
 
-            # merge
-            music = inst + melody                       # (B,2,T)
-            stem_sum = bass + drums + music + vocals    # (B,2,T)  <-- THIS is the canonical target mix
+            B, C, T = mix_in.shape
+            N = B * C  # как у тебя: канал считаем как batch
 
-            # choose input mode per example
-            use_full = (torch.rand((), device=device) < p_full)
-            mix_in = full if bool(use_full.item()) else stem_sum
+            def flat_bc(x: torch.Tensor) -> torch.Tensor:
+                return x.reshape(N, T).float()
 
-            # clip-safe scale based on chosen input, apply to all signals + stem_sum
-            full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
-                peak_ref=stem_sum,
-                signals=[full, bass, drums, music, vocals, stem_sum, mix_in],
-                peak_target=0.98,
-            )
+            mix_f = flat_bc(mix_in)  # (N,T)
 
-            # flatten (B,2,T) -> (B*C,T)
-            def flat(x: torch.Tensor) -> torch.Tensor:
-                return x.reshape(B * C, T).float()
+            # targets per head -> (N,T) each
+            bass_f = flat_bc(tgt[:, 0])  # (N,T)
+            drums_f = flat_bc(tgt[:, 1])
+            music_f = flat_bc(tgt[:, 2])
+            vocals_f = flat_bc(tgt[:, 3])
 
-            mix_f = flat(mix_in)
-            bass_f = flat(bass)
-            drums_f = flat(drums)
-            music_f = flat(music)
-            vocals_f = flat(vocals)
-            stem_sum_f = flat(stem_sum)
+            # mask expand to channels (N,4)
+            pm_n = present_mask.repeat_interleave(C, dim=0)  # (N,4)
 
             with torch.no_grad():
-                mix_ri = stft.stft_ri(mix_f)                # input (B*C,F,Tf,2)
-                tgt = torch.stack(
+                mix_ri = stft.stft_ri(mix_f)  # (N,F,Tf,2)
+                tgt_ri = torch.stack(
                     [
                         stft.stft_ri(bass_f),
                         stft.stft_ri(drums_f),
@@ -962,47 +1212,45 @@ def main():
                         stft.stft_ri(vocals_f),
                     ],
                     dim=1,
-                )  # (B*C,4,F,Tf,2)
-                stem_sum_ri = stft.stft_ri(stem_sum_f)      # TARGET MIX ALWAYS = stem_sum
+                )  # (N,4,F,Tf,2)
 
-            pred = model(mix_ri)  # (B*C,4,F,Tf,2)
+            pred = model(mix_ri)  # (N,4,F,Tf,2)
 
-            # stem loss (weighted per head)
-            diff = (pred.float() - tgt.float()).abs().mean(dim=(2, 3, 4))  # (B*C,4)
-            loss_stem = (diff * head_w[None, :]).sum(dim=1).mean() / head_w.mean().clamp_min(1e-8)
+            # --- stem loss (L1 in RI) ---
+            diff = (pred.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
 
-            # mixture consistency: sum(pred_stems) must match stem_sum (not full!)
-            mix_hat = pred.sum(dim=1)  # (B*C,F,Tf,2)
-            loss_mix = l1_ri(mix_hat, stem_sum_ri)
+            # weights: head_w * (present + silence_weight * absent)
+            sil_w = float(args.silence_weight)
+            w = head_w[None, :] * (pm_n * 1.0 + (1.0 - pm_n) * sil_w)  # (N,4)
+
+            # normalize per-sample to not depend on how many stems included
+            loss_stem = ((diff * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-8)).mean()
+
+            # --- mixture consistency: sum(pred) must reconstruct mix_in (which IS sum of active stems) ---
+            mix_hat = pred.sum(dim=1)  # (N,F,Tf,2)
+            loss_mix = l1_ri(mix_hat, mix_ri)
 
             loss = float(args.w_stem) * loss_stem + float(args.w_mix) * loss_mix
 
-            # --- MR-STFT (time-domain) on ALL heads ---
+            # --- MR-STFT (time-domain) ---
             mr_loss = None
             if (mrstft is not None) and (int(args.mr_every) > 0) and ((global_step % int(args.mr_every)) == 0):
-                # pred: (N,4,F,Tf,2) where N=B*C
-                N = pred.shape[0]
-                S = pred.shape[1]  # =4
-
-                # iSTFT predicted stems -> (N*S, T)
+                S = pred.shape[1]  # 4
                 pred_ri_flat = pred.reshape(N * S, pred.shape[2], pred.shape[3], 2)
-                pred_wav = stft.istft_ri(pred_ri_flat, length=T)  # (N*S, T)
+                pred_wav = stft.istft_ri(pred_ri_flat, length=T)  # (N*S,T)
 
-                # target stems waveform from original time-domain targets (already scaled)
-                tgt_wav = torch.stack([bass_f, drums_f, music_f, vocals_f], dim=1).reshape(N * S, T)  # (N*S, T)
+                tgt_wav = torch.stack([bass_f, drums_f, music_f, vocals_f], dim=1).reshape(N * S, T)  # (N*S,T)
 
-                # per-example MR loss: (N*S,)
-                mr_vec = mrstft(pred_wav, tgt_wav)
+                mr_vec = mrstft(pred_wav, tgt_wav)  # (N*S,)
 
-                # apply same per-head weights as stem loss (broadcast over N)
-                w_vec = head_w[None, :].expand(N, S).reshape(N * S).float()
-                mr_loss = (mr_vec * w_vec).sum() / w_vec.sum().clamp_min(1e-8)
+                # weights for MR: same idea as above, but flattened (N*S,)
+                w_mr = w.reshape(N * S).float()
+                mr_loss = (mr_vec * w_mr).sum() / w_mr.sum().clamp_min(1e-8)
 
                 loss = loss + float(args.w_mrstft) * mr_loss
 
             if mr_loss is not None:
                 run["mr"] += float(mr_loss.detach().cpu())
-
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1018,13 +1266,11 @@ def main():
             if is_main:
                 denom = max(1, pbar.n + 1)
                 pbar.set_postfix(
-                    total=f"{run['total']/denom:.6f}",
-                    stem=f"{run['stem']/denom:.6f}",
-                    mix=f"{run['mix']/denom:.6f}",
-                    mr=f"{run['mr']/denom:.6f}",
-                    pFull=f"{p_full:.2f}",
+                    total=f"{run['total'] / denom:.6f}",
+                    stem=f"{run['stem'] / denom:.6f}",
+                    mix=f"{run['mix'] / denom:.6f}",
+                    mr=f"{run['mr'] / denom:.6f}",
                 )
-
 
         raw_model = model.module if isinstance(model, DDP) else model
         ckpt = {
@@ -1064,60 +1310,6 @@ def main():
 
         if is_ddp:
             dist.barrier()
-
-        if is_main and args.dump_audio_every_epochs and (epoch % int(args.dump_audio_every_epochs) == 0):
-            model.eval()
-            with torch.no_grad():
-                full, bass, drums, inst, melody, vocals = next(iter(dl))
-                full = full.to(device)
-                bass = bass.to(device)
-                drums = drums.to(device)
-                inst = inst.to(device)
-                melody = melody.to(device)
-                vocals = vocals.to(device)
-
-                B, C, T = full.shape
-                music = inst + melody
-                stem_sum = bass + drums + music + vocals
-
-                use_full = (torch.rand((), device=device) < p_full)
-                mix_in = full if bool(use_full.item()) else stem_sum
-
-                full, bass, drums, music, vocals, stem_sum, mix_in = apply_clip_safe_scale(
-                    peak_ref=mix_in,
-                    signals=[full, bass, drums, music, vocals, stem_sum, mix_in],
-                    peak_target=0.98,
-                )
-
-                mix_f = mix_in.reshape(B * C, T).float()
-                mix_ri = stft.stft_ri(mix_f)
-                pred = model(mix_ri)  # (B*C,4,F,Tf,2)
-
-                def unflat(y: torch.Tensor) -> torch.Tensor:
-                    return y.reshape(B, C, T)
-
-                names = ["bass", "drums", "music", "vocals"]
-                for head, name in enumerate(names):
-                    y = stft.istft_ri(pred[:, head], length=T)  # (B*C,T)
-                    y_st = unflat(y)[0].detach().cpu().transpose(0, 1).numpy()  # (T,2)
-                    sf.write(str(dump_dir / f"e{epoch:03d}_ex0_{name}.wav"), y_st, args.sr, subtype="FLOAT")
-
-                # refs
-                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_mix_in.wav"), mix_in[0].cpu().transpose(0, 1).numpy(), args.sr, subtype="FLOAT")
-                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_stem_sum.wav"), stem_sum[0].cpu().transpose(0, 1).numpy(), args.sr, subtype="FLOAT")
-                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_full.wav"), full[0].cpu().transpose(0, 1).numpy(), args.sr, subtype="FLOAT")
-
-                sum_ri = pred.sum(dim=1)
-                sum_w = unflat(stft.istft_ri(sum_ri, length=T))[0].cpu().transpose(0, 1).numpy()
-                sf.write(str(dump_dir / f"e{epoch:03d}_ex0_sum.wav"), sum_w, args.sr, subtype="FLOAT")
-
-                (dump_dir / f"e{epoch:03d}_ex0_mode.txt").write_text(
-                    f"epoch={epoch}\npFull={p_full:.4f}\nuse_full_ex0={bool(use_full[0].item())}\n",
-                    encoding="utf-8",
-                )
-
-                print(f"[dump] wrote wavs to {dump_dir}")
-            model.train()
 
     if is_ddp:
         dist.destroy_process_group()
