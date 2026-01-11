@@ -380,15 +380,19 @@ def _norm_stem_name(x: str) -> str:
     return _STEM_ALIASES[k]
 
 
+def db_to_lin(db: float) -> float:
+    return float(10.0 ** (db / 20.0))
+
 @dataclass(frozen=True)
 class Recipe:
     prob: float
-    type: str                      # "unconditional" (пока)
-    mix_in: str                    # "stem_sum" | "full"
-    stem_sum_mode: str             # "fixed" | "random" | "random_within_track"
-    stem_count: int                # 1..4
+    type: str
+    mix_in: str
+    stem_sum_mode: str
+    stem_count: int
     required_stems: Tuple[str, ...]
     available_stems: Tuple[str, ...]
+    gain_db: Tuple[Tuple[str, float, float], ...]  # (stem, min_db, max_db)
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "Recipe":
@@ -401,29 +405,42 @@ class Recipe:
         req = tuple(_norm_stem_name(x) for x in (d.get("required_stems", []) or []))
         avl = tuple(_norm_stem_name(x) for x in (d.get("available_stems", []) or []))
 
+        # --- gain parsing ---
+        gain_raw = d.get("gain", {}) or {}
+        if not isinstance(gain_raw, dict):
+            raise ValueError(f"gain must be an object, got {type(gain_raw).__name__}")
+
+        gain_list: List[Tuple[str, float, float]] = []
+        for k, v in gain_raw.items():
+            stem = _norm_stem_name(str(k))
+            if isinstance(v, (int, float)):
+                mn = mx = float(v)
+            elif isinstance(v, dict):
+                if "min" not in v or "max" not in v:
+                    raise ValueError(f"gain[{k!r}] must contain min/max")
+                mn = float(v["min"])
+                mx = float(v["max"])
+            else:
+                raise ValueError(f"gain[{k!r}] must be number or {{min,max}}, got {type(v).__name__}")
+            if mn > mx:
+                raise ValueError(f"gain[{k!r}] min > max: {mn} > {mx}")
+            gain_list.append((stem, mn, mx))
+
+        gain_db = tuple(gain_list)
+
+        # --- validations (как раньше) ---
         if stem_count < 1 or stem_count > 4:
             raise ValueError(f"stem_count must be 1..4, got {stem_count}")
-
-        if any(s not in STEM_SET for s in req + avl):
-            raise ValueError(f"Bad stems in recipe: req={req} avl={avl}")
-
         if len(set(req)) != len(req):
             raise ValueError(f"required_stems has duplicates: {req}")
-
-        # stem_count must cover required
         if len(req) > stem_count:
             raise ValueError(f"stem_count={stem_count} < len(required_stems)={len(req)}")
-
-        # mode validation
         if mode not in ("fixed", "random", "random_within_track"):
             raise ValueError(f"stem_sum_mode must be one of fixed|random|random_within_track, got {mode!r}")
-
         if mix_in not in ("stem_sum", "full"):
             raise ValueError(f"mix_in must be one of stem_sum|full, got {mix_in!r}")
-
-        # full only makes sense for fixed (иначе targets не соответствуют входу)
         if mix_in == "full" and mode != "fixed":
-            raise ValueError("mix_in='full' requires stem_sum_mode='fixed' (otherwise input/targets mismatch).")
+            raise ValueError("mix_in='full' requires stem_sum_mode='fixed'.")
 
         return Recipe(
             prob=prob,
@@ -433,6 +450,7 @@ class Recipe:
             stem_count=stem_count,
             required_stems=req,
             available_stems=avl,
+            gain_db=gain_db,
         )
 
     def pick_active_stems(self, rng: np.random.Generator) -> Tuple[str, ...]:
@@ -533,7 +551,7 @@ class FlexibleMixDataset(Dataset):
         long_threshold_sec: float = 6.0,
         long_hop_sec: Optional[float] = None,
         long_jitter_sec: float = 0.0,
-        epoch_size: int = 200_000,   # сколько __getitem__ даём "виртуально"
+        epoch_size: int = 200_000,
     ):
         super().__init__()
         self.items = items
@@ -677,6 +695,19 @@ class FlexibleMixDataset(Dataset):
         }
         return full, stems
 
+    def _apply_recipe_gain(self, rng: np.random.Generator, recipe: Recipe, tgt: Dict[str, torch.Tensor],
+                           active: Tuple[str, ...]) -> None:
+        if not recipe.gain_db:
+            return
+        active_set = set(active)
+        for stem, mn_db, mx_db in recipe.gain_db:
+            if stem not in active_set:
+                continue  # не трогаем отсутствующие стемы (они и так 0)
+            db = float(rng.uniform(mn_db, mx_db)) if (mx_db != mn_db) else float(mn_db)
+            g = db_to_lin(db)
+            # умножаем волну (2,T)
+            tgt[stem] = tgt[stem] * float(g)
+
     def __getitem__(self, idx: int):
         rng = self._rng_for_item(idx)
         recipe = self.book.sample_recipe(rng, epoch=self._epoch)
@@ -699,6 +730,8 @@ class FlexibleMixDataset(Dataset):
                 tgt[s] = stems[s]
                 present[s] = 1.0
 
+            self._apply_recipe_gain(rng, recipe, tgt, active)
+
             if recipe.mix_in == "full":
                 mix_in = full
             else:
@@ -711,6 +744,7 @@ class FlexibleMixDataset(Dataset):
                 st = self._random_start_from_starts(rng, tr)
                 tgt[s] = self._load_stem(tr, st, s)
                 present[s] = 1.0
+            self._apply_recipe_gain(rng, recipe, tgt, active)
             mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
 
         elif recipe.stem_sum_mode == "random_within_track":
@@ -720,6 +754,7 @@ class FlexibleMixDataset(Dataset):
                 st = self._random_start_from_starts(rng, track_i)
                 tgt[s] = self._load_stem(track_i, st, s)
                 present[s] = 1.0
+            self._apply_recipe_gain(rng, recipe, tgt, active)
             mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
 
         else:
