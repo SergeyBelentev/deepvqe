@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, get_worker_info
 from tqdm import tqdm
-from deepvqe import DeepVQEStemSeparator
+from deepvqe import DeepVQEConditionalStemSeparator
 import os, random
 import boto3
 from botocore.config import Config as BotoConfig
@@ -176,45 +176,32 @@ class MRSTFTLoss(nn.Module):
             )
 
     def _one_res_loss(self, x: torch.Tensor, y: torch.Tensor, i: int) -> torch.Tensor:
-        """
-        x,y: (N,T) float32
-        returns: (N,) for one resolution
-        """
         n_fft, hop, win = self.cfgs[i]
         w = getattr(self, f"window_{i}").to(device=x.device, dtype=torch.float32)
 
         X = torch.stft(
-            x,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=win,
-            window=w,
-            return_complex=True,
-            center=True,
-            pad_mode="reflect",
+            x, n_fft=n_fft, hop_length=hop, win_length=win,
+            window=w, return_complex=True, center=True, pad_mode="reflect",
         )
         Y = torch.stft(
-            y,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=win,
-            window=w,
-            return_complex=True,
-            center=True,
-            pad_mode="reflect",
+            y, n_fft=n_fft, hop_length=hop, win_length=win,
+            window=w, return_complex=True, center=True, pad_mode="reflect",
         )
 
         magX = X.abs()
         magY = Y.abs()
 
-        # spectral convergence per-example
-        # ||Y - X||_F / ||Y||_F
-        diff = (magY - magX).reshape(magY.shape[0], -1)
-        denom = magY.reshape(magY.shape[0], -1)
+        # ---- spectral convergence (bounded, stable on silence) ----
+        err = (magY - magX).reshape(magY.shape[0], -1)
+        tgt = magY.reshape(magY.shape[0], -1)
 
-        sc = torch.linalg.vector_norm(diff, dim=1) / torch.linalg.vector_norm(denom, dim=1).clamp_min(self.eps)
+        err_n = torch.linalg.vector_norm(err, dim=1)
+        tgt_n = torch.linalg.vector_norm(tgt, dim=1)
 
-        # log-mag L1 per-example
+        # bounded in [0,1): err / (tgt + err + eps)
+        sc = err_n / (tgt_n + err_n + self.eps)
+
+        # ---- log-mag L1 (как было) ----
         logmag = (torch.log(magY + self.eps) - torch.log(magX + self.eps)).abs().mean(dim=(1, 2))
 
         return (self.sc_weight * sc) + (self.logmag_weight * logmag)
@@ -382,95 +369,135 @@ def _norm_stem_name(x: str) -> str:
 
 def db_to_lin(db: float) -> float:
     return float(10.0 ** (db / 20.0))
-
 @dataclass(frozen=True)
 class Recipe:
     prob: float
-    type: str
-    mix_in: str
-    stem_sum_mode: str
+    type: str                     # "unconditional" | "conditional"
+    mix_in: str                   # "stem_sum" | "full"
+    stem_sum_mode: str            # fixed|random|random_within_track
+
+    # unconditional: выбираем активные стемы в mix_in/target
     stem_count: int
     required_stems: Tuple[str, ...]
     available_stems: Tuple[str, ...]
-    gain_db: Tuple[Tuple[str, float, float], ...]  # (stem, min_db, max_db)
+    gain_db: Tuple[Tuple[str, float, float], ...]  # target gain (dB)
+
+    # conditional: какие стемы подаем в ref (target = complement)
+    ref_stem_count: int
+    ref_required_stems: Tuple[str, ...]
+    ref_available_stems: Tuple[str, ...]
+    ref_gain_db: Tuple[Tuple[str, float, float], ...]  # ref gain (dB)
+
+    # optional: подмешать "чужой" стем в ref (из другой песни, которого нет в full)
+    foreign_ref_prob: float
+    foreign_ref_stem_choices: Tuple[str, ...]          # e.g. ("music",) or ("bass","drums","music","vocals")
+    foreign_gain_db: Tuple[Tuple[str, float, float], ...]  # foreign gain (dB)
 
     @staticmethod
-    def from_dict(d: Dict[str, Any]) -> "Recipe":
-        prob = float(d.get("prob", 0.0))
-        typ = str(d.get("type", "unconditional"))
-        mix_in = str(d.get("mix_in", "stem_sum"))
-        mode = str(d.get("stem_sum_mode", "fixed"))
-        stem_count = int(d.get("stem_count", 4))
-
-        req = tuple(_norm_stem_name(x) for x in (d.get("required_stems", []) or []))
-        avl = tuple(_norm_stem_name(x) for x in (d.get("available_stems", []) or []))
-
-        # --- gain parsing ---
-        gain_raw = d.get("gain", {}) or {}
+    def _parse_gain_block(d: Dict[str, Any], field: str) -> Tuple[Tuple[str, float, float], ...]:
+        gain_raw = d.get(field, {}) or {}
         if not isinstance(gain_raw, dict):
-            raise ValueError(f"gain must be an object, got {type(gain_raw).__name__}")
+            raise ValueError(f"{field} must be an object, got {type(gain_raw).__name__}")
 
-        gain_list: List[Tuple[str, float, float]] = []
+        out: List[Tuple[str, float, float]] = []
         for k, v in gain_raw.items():
             stem = _norm_stem_name(str(k))
             if isinstance(v, (int, float)):
                 mn = mx = float(v)
             elif isinstance(v, dict):
                 if "min" not in v or "max" not in v:
-                    raise ValueError(f"gain[{k!r}] must contain min/max")
-                mn = float(v["min"])
-                mx = float(v["max"])
+                    raise ValueError(f"{field}[{k!r}] must contain min/max")
+                mn = float(v["min"]); mx = float(v["max"])
             else:
-                raise ValueError(f"gain[{k!r}] must be number or {{min,max}}, got {type(v).__name__}")
+                raise ValueError(f"{field}[{k!r}] must be number or {{min,max}}, got {type(v).__name__}")
             if mn > mx:
-                raise ValueError(f"gain[{k!r}] min > max: {mn} > {mx}")
-            gain_list.append((stem, mn, mx))
+                raise ValueError(f"{field}[{k!r}] min > max: {mn} > {mx}")
+            out.append((stem, mn, mx))
+        return tuple(out)
 
-        gain_db = tuple(gain_list)
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> "Recipe":
+        prob = float(d.get("prob", 0.0))
+        typ = str(d.get("type", "unconditional")).strip().lower()
+        mix_in = str(d.get("mix_in", "stem_sum")).strip().lower()
+        mode = str(d.get("stem_sum_mode", "fixed")).strip().lower()
 
-        # --- validations (как раньше) ---
-        if stem_count < 1 or stem_count > 4:
-            raise ValueError(f"stem_count must be 1..4, got {stem_count}")
-        if len(set(req)) != len(req):
-            raise ValueError(f"required_stems has duplicates: {req}")
-        if len(req) > stem_count:
-            raise ValueError(f"stem_count={stem_count} < len(required_stems)={len(req)}")
+        stem_count = int(d.get("stem_count", 4))
+        req = tuple(_norm_stem_name(x) for x in (d.get("required_stems", []) or []))
+        avl = tuple(_norm_stem_name(x) for x in (d.get("available_stems", []) or []))
+        gain_db = Recipe._parse_gain_block(d, "gain")
+
+        # conditional ref selection (если нет — поставим дефолты, но лучше задавать явно)
+        ref_stem_count = int(d.get("ref_stem_count", 2))
+        ref_req = tuple(_norm_stem_name(x) for x in (d.get("ref_required_stems", []) or []))
+        ref_avl = tuple(_norm_stem_name(x) for x in (d.get("ref_available_stems", []) or []))
+        ref_gain_db = Recipe._parse_gain_block(d, "ref_gain")
+
+        foreign_ref_prob = float(d.get("foreign_ref_prob", 0.0))
+        foreign_choice_raw = d.get("foreign_ref_stem", "random")
+        if isinstance(foreign_choice_raw, str):
+            if foreign_choice_raw.strip().lower() == "random":
+                foreign_ref_stem_choices = tuple(STEM_ORDER)
+            else:
+                foreign_ref_stem_choices = ( _norm_stem_name(foreign_choice_raw), )
+        elif isinstance(foreign_choice_raw, list):
+            foreign_ref_stem_choices = tuple(_norm_stem_name(x) for x in foreign_choice_raw)
+        else:
+            raise ValueError("foreign_ref_stem must be 'random' | string | list[str]")
+
+        foreign_gain_db = Recipe._parse_gain_block(d, "foreign_gain")
+
+        # --- validations ---
         if mode not in ("fixed", "random", "random_within_track"):
-            raise ValueError(f"stem_sum_mode must be one of fixed|random|random_within_track, got {mode!r}")
+            raise ValueError(f"stem_sum_mode must be fixed|random|random_within_track, got {mode!r}")
         if mix_in not in ("stem_sum", "full"):
-            raise ValueError(f"mix_in must be one of stem_sum|full, got {mix_in!r}")
-        if mix_in == "full" and mode != "fixed":
-            raise ValueError("mix_in='full' requires stem_sum_mode='fixed'.")
+            raise ValueError(f"mix_in must be stem_sum|full, got {mix_in!r}")
+        if typ not in ("unconditional", "conditional"):
+            raise ValueError(f"type must be unconditional|conditional, got {typ!r}")
+
+        if typ == "conditional":
+            # по твоему описанию: conditional всегда mix_in=full и fixed (чтобы ref соответствовал этому full)
+            if mix_in != "full":
+                raise ValueError("conditional требует mix_in='full'")
+            if mode != "fixed":
+                raise ValueError("conditional требует stem_sum_mode='fixed' (ref берется из того же сегмента)")
+            if ref_stem_count < 1 or ref_stem_count > 4:
+                raise ValueError(f"ref_stem_count must be 1..4, got {ref_stem_count}")
+            if len(ref_req) > ref_stem_count:
+                raise ValueError("ref_stem_count < len(ref_required_stems)")
+        else:
+            if stem_count < 1 or stem_count > 4:
+                raise ValueError(f"stem_count must be 1..4, got {stem_count}")
+            if len(req) > stem_count:
+                raise ValueError("stem_count < len(required_stems)")
 
         return Recipe(
-            prob=prob,
-            type=typ,
-            mix_in=mix_in,
-            stem_sum_mode=mode,
-            stem_count=stem_count,
-            required_stems=req,
-            available_stems=avl,
-            gain_db=gain_db,
+            prob=prob, type=typ, mix_in=mix_in, stem_sum_mode=mode,
+            stem_count=stem_count, required_stems=req, available_stems=avl, gain_db=gain_db,
+            ref_stem_count=ref_stem_count, ref_required_stems=ref_req, ref_available_stems=ref_avl, ref_gain_db=ref_gain_db,
+            foreign_ref_prob=foreign_ref_prob,
+            foreign_ref_stem_choices=foreign_ref_stem_choices,
+            foreign_gain_db=foreign_gain_db,
         )
 
-    def pick_active_stems(self, rng: np.random.Generator) -> Tuple[str, ...]:
-        """
-        Возвращает какие стемы "включены" в этом сэмпле (и должны быть в mix_in, и быть ненулевыми в таргете).
-        Остальные таргеты = 0 (тишина).
-        """
-        active = list(self.required_stems)
-        need = self.stem_count - len(active)
+    def _pick_from(self, rng: np.random.Generator, count: int, req: Tuple[str, ...], avl: Tuple[str, ...]) -> Tuple[str, ...]:
+        active = list(req)
+        need = count - len(active)
         if need > 0:
-            pool = [s for s in self.available_stems if s not in active]
+            pool = [s for s in avl if s not in active]
             if len(pool) < need:
-                raise ValueError(
-                    f"Not enough available_stems to reach stem_count. need={need} pool={pool} req={active}"
-                )
+                raise ValueError(f"Not enough stems in available set: need={need} pool={pool} req={active}")
             pick = rng.choice(pool, size=need, replace=False).tolist()
             active.extend(pick)
-        # фиксируем порядок стабильным (не обязательно, но удобнее)
         active = sorted(active, key=lambda s: STEM_ORDER.index(s))
         return tuple(active)
+
+    def pick_active_stems_uncond(self, rng: np.random.Generator) -> Tuple[str, ...]:
+        return self._pick_from(rng, self.stem_count, self.required_stems, self.available_stems)
+
+    def pick_ref_stems_cond(self, rng: np.random.Generator) -> Tuple[str, ...]:
+        return self._pick_from(rng, self.ref_stem_count, self.ref_required_stems, self.ref_available_stems)
+
 
 
 class RecipeBook:
@@ -526,6 +553,17 @@ class RecipeBook:
     def sample_recipe(self, rng: np.random.Generator, epoch: int) -> Recipe:
         rs = self.plan_for_epoch(epoch)
         return self._choose_weighted(rng, rs)
+
+
+def _apply_gain_block(rng: np.random.Generator, gain_db: Tuple[Tuple[str, float, float], ...],
+                      waves: Dict[str, torch.Tensor], active: set[str]) -> None:
+    if not gain_db:
+        return
+    for stem, mn_db, mx_db in gain_db:
+        if stem not in active:
+            continue
+        db = float(rng.uniform(mn_db, mx_db)) if mx_db != mn_db else float(mn_db)
+        waves[stem] = waves[stem] * db_to_lin(db)
 
 
 class FlexibleMixDataset(Dataset):
@@ -711,77 +749,198 @@ class FlexibleMixDataset(Dataset):
     def __getitem__(self, idx: int):
         rng = self._rng_for_item(idx)
         recipe = self.book.sample_recipe(rng, epoch=self._epoch)
-        if recipe.type != "unconditional":
-            raise ValueError(f"Unsupported recipe type: {recipe.type}")
 
-        active = recipe.pick_active_stems(rng)  # tuple[str]
+        # -----------------------------
+        # helpers (локально, чтобы __getitem__ был самодостаточным)
+        # -----------------------------
+        def apply_gain_block(
+                gain_db: tuple[tuple[str, float, float], ...],
+                waves: dict[str, torch.Tensor],
+                active: set[str],
+        ) -> None:
+            if not gain_db:
+                return
+            for stem, mn_db, mx_db in gain_db:
+                if stem not in active:
+                    continue
+                db = float(rng.uniform(mn_db, mx_db)) if (mx_db != mn_db) else float(mn_db)
+                waves[stem] = waves[stem] * float(db_to_lin(db))
 
-        # targets (4,2,T) и mask (4,)
-        tgt = {s: torch.zeros((2, self.seg_len), dtype=torch.float32) for s in STEM_ORDER}
-        present = {s: 0.0 for s in STEM_ORDER}
-        full = None
+        # -----------------------------
+        # outputs we will fill
+        # -----------------------------
+        mode_id = 0  # 0=unconditional, 1=conditional
+        foreign_used = 0  # 0/1
+        ref = torch.zeros((2, self.seg_len), dtype=torch.float32)
+        mix_target = None  # (2,T) — то, что должна реконструировать сумма голов
+        mix_in = None  # (2,T)
 
-        if recipe.stem_sum_mode == "fixed":
-            # один трек/позиция на все стемы
-            track_i = int(rng.choice(self.valid_any))
-            start = self._random_start_from_starts(rng, track_i)
-            full, stems = self._load_full_and_all_stems_fixed(track_i, start)
-            for s in active:
+        # targets and mask: всегда 4 головы (bass, drums, music, vocals)
+        tgt: dict[str, torch.Tensor] = {s: torch.zeros((2, self.seg_len), dtype=torch.float32) for s in STEM_ORDER}
+        present: dict[str, float] = {s: 0.0 for s in STEM_ORDER}
+
+        # -----------------------------
+        # UNCONDITIONAL
+        # -----------------------------
+        if recipe.type == "unconditional":
+            active = recipe.pick_active_stems_uncond(rng)  # tuple[str]
+
+            if recipe.stem_sum_mode == "fixed":
+                track_i = int(rng.choice(self.valid_any))
+                start = self._random_start_from_starts(rng, track_i)
+
+                full, stems = self._load_full_and_all_stems_fixed(track_i, start)
+
+                for s in active:
+                    tgt[s] = stems[s]
+                    present[s] = 1.0
+
+                # gain на таргеты (и, следовательно, на mix_target)
+                apply_gain_block(recipe.gain_db, tgt, set(active))
+
+                if recipe.mix_in == "full":
+                    mix_in = full
+                else:
+                    mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+            elif recipe.stem_sum_mode == "random":
+                for s in active:
+                    tr = self._pick_track_for_stem(rng, s)
+                    st = self._random_start_from_starts(rng, tr)
+                    tgt[s] = self._load_stem(tr, st, s)
+                    present[s] = 1.0
+
+                apply_gain_block(recipe.gain_db, tgt, set(active))
+                mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+            elif recipe.stem_sum_mode == "random_within_track":
+                track_i = int(rng.choice(self.valid_any))
+                for s in active:
+                    st = self._random_start_from_starts(rng, track_i)
+                    tgt[s] = self._load_stem(track_i, st, s)
+                    present[s] = 1.0
+
+                apply_gain_block(recipe.gain_db, tgt, set(active))
+                mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+            else:
+                raise ValueError(f"Bad stem_sum_mode: {recipe.stem_sum_mode!r}")
+
+            # сумма таргетов (для mix-consistency в train — всегда лучше именно её)
+            mix_target = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+            # ref в unconditional = тишина
+            ref = torch.zeros_like(mix_in)
+
+        # -----------------------------
+        # CONDITIONAL
+        # -----------------------------
+        elif recipe.type == "conditional":
+            mode_id = 1
+
+            # какие стемы кладём в ref; target = complement(ref_stems)
+            ref_stems = recipe.pick_ref_stems_cond(rng)
+            ref_set = set(ref_stems)
+            complement = tuple(s for s in STEM_ORDER if s not in ref_set)
+            complement_set = set(complement)
+
+            # если хоть где-то нужен vocals — нужен вокальный трек
+            need_vocal_track = ("vocals" in ref_set) or ("vocals" in complement_set)
+            base_track = int(rng.choice(self.valid_vocals if need_vocal_track else self.valid_any))
+            start = self._random_start_from_starts(rng, base_track)
+
+            full, stems = self._load_full_and_all_stems_fixed(base_track, start)
+
+            # ref waves из stems по ref_stems
+            ref_waves: dict[str, torch.Tensor] = {s: torch.zeros((2, self.seg_len), dtype=torch.float32) for s in
+                                                  STEM_ORDER}
+            for s in ref_stems:
+                ref_waves[s] = stems[s]
+
+            # gain на ref
+            apply_gain_block(recipe.ref_gain_db, ref_waves, ref_set)
+
+            # foreign stem: подмешиваем "чужой" стем в ref (из другой песни)
+            if float(recipe.foreign_ref_prob) > 0.0 and (float(rng.random()) < float(recipe.foreign_ref_prob)):
+                foreign_used = 1
+
+                # выбираем, какой стем подмешать
+                choices = list(recipe.foreign_ref_stem_choices) if recipe.foreign_ref_stem_choices else STEM_ORDER
+                fs = str(rng.choice(np.array(choices, dtype=object)))
+                fs = _norm_stem_name(fs)
+
+                # стараемся выбрать другой трек
+                tr = None
+                for _ in range(8):
+                    cand = self._pick_track_for_stem(rng, fs)
+                    if cand != base_track:
+                        tr = cand
+                        break
+                if tr is None:
+                    tr = self._pick_track_for_stem(rng, fs)
+
+                st = self._random_start_from_starts(rng, int(tr))
+                foreign_wave = self._load_stem(int(tr), st, fs)
+
+                foreign_dict = {fs: foreign_wave}
+                apply_gain_block(recipe.foreign_gain_db, foreign_dict, {fs})
+
+                ref_waves[fs] = ref_waves[fs] + foreign_dict[fs]
+
+            ref = ref_waves["bass"] + ref_waves["drums"] + ref_waves["music"] + ref_waves["vocals"]
+
+            # targets = complement(ref_stems)
+            for s in complement:
                 tgt[s] = stems[s]
                 present[s] = 1.0
 
-            self._apply_recipe_gain(rng, recipe, tgt, active)
+            # gain на targets (complement)
+            apply_gain_block(recipe.gain_db, tgt, complement_set)
 
-            if recipe.mix_in == "full":
-                mix_in = full
-            else:
-                mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
-
-        elif recipe.stem_sum_mode == "random":
-            # каждый активный стем из отдельного (случайного) трека/позиции
-            for s in active:
-                tr = self._pick_track_for_stem(rng, s)
-                st = self._random_start_from_starts(rng, tr)
-                tgt[s] = self._load_stem(tr, st, s)
-                present[s] = 1.0
-            self._apply_recipe_gain(rng, recipe, tgt, active)
-            mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
-
-        elif recipe.stem_sum_mode == "random_within_track":
-            # один трек общий, но время для каждого стема рандомное (мягче, чем random)
-            track_i = int(rng.choice(self.valid_any))
-            for s in active:
-                st = self._random_start_from_starts(rng, track_i)
-                tgt[s] = self._load_stem(track_i, st, s)
-                present[s] = 1.0
-            self._apply_recipe_gain(rng, recipe, tgt, active)
-            mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+            mix_in = full
+            mix_target = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
 
         else:
-            raise ValueError(f"Bad stem_sum_mode: {recipe.stem_sum_mode}")
+            raise ValueError(f"Unsupported recipe type: {recipe.type!r}")
 
-        # clip-safe scale по mix_in, применяем ко всем таргетам и mix_in
-        mix_in_b = mix_in.unsqueeze(0)  # (1,2,T)
-        signals = [mix_in_b] + [tgt[s].unsqueeze(0) for s in STEM_ORDER]
-        scaled = apply_clip_safe_scale(peak_ref=mix_in_b, signals=signals, peak_target=0.98)
-        mix_in_b = scaled[0]
+        assert mix_in is not None
+        assert mix_target is not None
+
+        # -----------------------------
+        # clip-safe scale (масштабируем ВСЁ вместе)
+        # -----------------------------
+        peak_ref = torch.stack([mix_in, ref, mix_target], dim=0).abs().amax(dim=0)  # (2,T)
+        peak_ref_b = peak_ref.unsqueeze(0)  # (1,2,T)
+
+        mix_b = mix_in.unsqueeze(0)
+        ref_b = ref.unsqueeze(0)
+        mt_b = mix_target.unsqueeze(0)
+
+        signals = [mix_b, ref_b, mt_b] + [tgt[s].unsqueeze(0) for s in STEM_ORDER]
+        scaled = apply_clip_safe_scale(peak_ref=peak_ref_b, signals=signals, peak_target=0.98)
+
+        mix_in = scaled[0].squeeze(0)
+        ref = scaled[1].squeeze(0)
+        mix_target = scaled[2].squeeze(0)
         for i, s in enumerate(STEM_ORDER):
-            tgt[s] = scaled[i + 1].squeeze(0)
-
-        mix_in = mix_in_b.squeeze(0)
+            tgt[s] = scaled[3 + i].squeeze(0)
 
         tgt_tensor = torch.stack([tgt[s] for s in STEM_ORDER], dim=0)  # (4,2,T)
         present_mask = torch.tensor([present[s] for s in STEM_ORDER], dtype=torch.float32)  # (4,)
+        flags = torch.tensor([mode_id, foreign_used], dtype=torch.int64)  # (2,)
 
-        return mix_in, tgt_tensor, present_mask
-
+        return mix_in, ref, tgt_tensor, present_mask, mix_target, flags
 
 
 def collate(batch):
     mix = torch.stack([b[0] for b in batch], dim=0)          # (B,2,T)
-    tgt = torch.stack([b[1] for b in batch], dim=0)          # (B,4,2,T)
-    pm  = torch.stack([b[2] for b in batch], dim=0)          # (B,4)
-    return mix, tgt, pm
+    ref = torch.stack([b[1] for b in batch], dim=0)          # (B,2,T)
+    tgt = torch.stack([b[2] for b in batch], dim=0)          # (B,4,2,T)
+    pm  = torch.stack([b[3] for b in batch], dim=0)          # (B,4)
+    mt  = torch.stack([b[4] for b in batch], dim=0)          # (B,2,T)
+    fl  = torch.stack([b[5] for b in batch], dim=0)          # (B,2) [mode_id, foreign_used]
+    return mix, ref, tgt, pm, mt, fl
+
 
 
 # -----------------------
@@ -1127,7 +1286,10 @@ def main():
     )
     print(f"dataset: {len(ds)} segments | batch={args.batch} | batches/epoch={len(dl)}")
 
-    model = DeepVQEStemSeparator(n_fft=args.n_fft, num_heads=args.num_heads).to(device)
+    model = DeepVQEConditionalStemSeparator(
+        n_fft=args.n_fft,
+        num_heads=args.num_heads,
+    ).to(device)
 
     if is_ddp:
         model = DDP(
@@ -1174,7 +1336,13 @@ def main():
         ckpt = load_ckpt(args.resume, device=device)
 
         sd = _normalize_checkpoint_state_dict(ckpt["model"])
-        raw_model.load_state_dict(sd, strict=True)
+        try:
+            raw_model.load_state_dict(sd, strict=True)
+        except RuntimeError as e:
+            print(f"[warn] strict load failed: {e}")
+            missing = raw_model.load_state_dict(sd, strict=False)
+            print(
+                f"[warn] loaded with strict=False. missing={missing.missing_keys} unexpected={missing.unexpected_keys}")
 
         if (not args.reset_opt) and ("opt" in ckpt):
             try:
@@ -1211,45 +1379,42 @@ def main():
         run = {"stem": 0.0, "mix": 0.0, "mr": 0.0, "total": 0.0}
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
-        for mix_in, tgt, present_mask in pbar:
-            # mix_in: (B,2,T)
-            # tgt:    (B,4,2,T)
-            # present_mask: (B,4)
-
-            mix_in = mix_in.to(device, non_blocking=True)
-            tgt = tgt.to(device, non_blocking=True)
-            present_mask = present_mask.to(device, non_blocking=True)
+        for mix_in, ref, tgt, present_mask, mix_target, flags in pbar:
+            mix_in = mix_in.to(device, non_blocking=True)  # (B,2,T)
+            ref = ref.to(device, non_blocking=True)  # (B,2,T)
+            tgt = tgt.to(device, non_blocking=True)  # (B,4,2,T)
+            present_mask = present_mask.to(device, non_blocking=True)  # (B,4)
+            mix_target = mix_target.to(device, non_blocking=True)  # (B,2,T)
+            # flags можно пока не использовать
 
             B, C, T = mix_in.shape
-            N = B * C  # как у тебя: канал считаем как batch
+            N = B * C
 
             def flat_bc(x: torch.Tensor) -> torch.Tensor:
                 return x.reshape(N, T).float()
 
-            mix_f = flat_bc(mix_in)  # (N,T)
+            mix_f = flat_bc(mix_in)
+            ref_f = flat_bc(ref)
+            mt_f = flat_bc(mix_target)
 
-            # targets per head -> (N,T) each
-            bass_f = flat_bc(tgt[:, 0])  # (N,T)
+            bass_f = flat_bc(tgt[:, 0])
             drums_f = flat_bc(tgt[:, 1])
             music_f = flat_bc(tgt[:, 2])
             vocals_f = flat_bc(tgt[:, 3])
 
-            # mask expand to channels (N,4)
             pm_n = present_mask.repeat_interleave(C, dim=0)  # (N,4)
 
             with torch.no_grad():
                 mix_ri = stft.stft_ri(mix_f)  # (N,F,Tf,2)
+                ref_ri = stft.stft_ri(ref_f)  # (N,F,Tf,2)
+                mt_ri = stft.stft_ri(mt_f)  # (N,F,Tf,2)
+
                 tgt_ri = torch.stack(
-                    [
-                        stft.stft_ri(bass_f),
-                        stft.stft_ri(drums_f),
-                        stft.stft_ri(music_f),
-                        stft.stft_ri(vocals_f),
-                    ],
+                    [stft.stft_ri(bass_f), stft.stft_ri(drums_f), stft.stft_ri(music_f), stft.stft_ri(vocals_f)],
                     dim=1,
                 )  # (N,4,F,Tf,2)
 
-            pred = model(mix_ri)  # (N,4,F,Tf,2)
+            pred = model(mix_ri, ref_ri)  # (N,4,F,Tf,2)
 
             # --- stem loss (L1 in RI) ---
             diff = (pred.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
@@ -1263,7 +1428,7 @@ def main():
 
             # --- mixture consistency: sum(pred) must reconstruct mix_in (which IS sum of active stems) ---
             mix_hat = pred.sum(dim=1)  # (N,F,Tf,2)
-            loss_mix = l1_ri(mix_hat, mix_ri)
+            loss_mix = l1_ri(mix_hat, mt_ri)  # <-- mt_ri, не mix_ri
 
             loss = float(args.w_stem) * loss_stem + float(args.w_mix) * loss_mix
 

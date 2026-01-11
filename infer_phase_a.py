@@ -4,16 +4,14 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List, Any
-from collections import OrderedDict
+from typing import Dict, Optional, Any
 import numpy as np
 import soundfile as sf
 import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-
-from deepvqe import DeepVQEStemSeparator
+from deepvqe import DeepVQEConditionalStemSeparator
 
 
 # -----------------------
@@ -62,6 +60,23 @@ class STFT(nn.Module):
 # -----------------------
 # Audio I/O
 # -----------------------
+def match_length(x: torch.Tensor, T: int) -> torch.Tensor:
+    """
+    x: (2,Tx) -> (2,T) by crop/pad with zeros
+    """
+    Tx = x.shape[1]
+    if Tx == T:
+        return x
+    if Tx > T:
+        return x[:, :T].contiguous()
+    # pad right
+    return F.pad(x, (0, T - Tx))
+
+
+def db_to_lin(db: float) -> float:
+    return float(10.0 ** (db / 20.0))
+
+
 def read_audio(path: str, sr_expected: int) -> torch.Tensor:
     """
     Returns stereo float32: (2, T)
@@ -117,7 +132,7 @@ def load_model(ckpt_path: str, device: torch.device, n_fft: int, num_heads: int 
     if not isinstance(ckpt, dict) or "model" not in ckpt:
         raise RuntimeError(f"Bad checkpoint: {ckpt_path}")
 
-    model = DeepVQEStemSeparator(n_fft=n_fft, num_heads=num_heads).to(device)
+    model = DeepVQEConditionalStemSeparator(n_fft=n_fft, num_heads=num_heads).to(device)
 
     sd = ckpt["model"]
     if not isinstance(sd, dict):
@@ -146,18 +161,19 @@ def make_hann_ola(win_len: int, device: torch.device) -> torch.Tensor:
 
 @torch.no_grad()
 def infer_ola(
-    model: DeepVQEStemSeparator,
+    model: DeepVQEConditionalStemSeparator,
     stft: STFT,
-    x_stereo: torch.Tensor,  # (2,T)
+    x_stereo: torch.Tensor,              # (2,T)
     *,
+    ref_stereo: Optional[torch.Tensor] = None,  # (2,T) or None
     sr: int,
     chunk_sec: float,
     overlap: float,
     device: torch.device,
     use_amp: bool = False,
-    stitch: str = "ola",          # "ola" | "crop"
-    keep_frac: float = 0.6,       # for crop: 0.50..0.75
-    xfade_ms: float = 0.0,        # for crop: optional small crossfade
+    stitch: str = "ola",
+    keep_frac: float = 0.6,
+    xfade_ms: float = 0.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Returns dict head->(2,T) in float32 on CPU.
@@ -170,6 +186,20 @@ def infer_ola(
     x = x_stereo.to(device, dtype=torch.float32)
     C, T = x.shape
     assert C == 2
+
+    if ref_stereo is None:
+        ref = None
+    else:
+        ref = ref_stereo.to(device, dtype=torch.float32)
+        if ref.shape[0] != 2:
+            raise ValueError("ref_stereo must be (2,T)")
+        if ref.shape[1] != T:
+            # на всякий случай: но лучше это делать ещё в main()
+            if ref.shape[1] > T:
+                ref = ref[:, :T]
+            else:
+                ref = F.pad(ref, (0, T - ref.shape[1]))
+
 
     chunk_len = int(round(sr * chunk_sec))
     if chunk_len <= 0:
@@ -187,18 +217,27 @@ def infer_ola(
         y = y.view(4, 2, chunk_len)
         return y
 
-    def run_model_on_chunk(chunk: torch.Tensor) -> torch.Tensor:
+    def call_model(mix_ri: torch.Tensor, ref_ri: Optional[torch.Tensor]) -> torch.Tensor:
+        return model(mix_ri, ref_ri)
+
+
+    def run_model_on_chunk(chunk: torch.Tensor, ref_chunk: Optional[torch.Tensor]) -> torch.Tensor:
         """
         chunk: (2,chunk_len) float32 on device
+        ref_chunk: (2,chunk_len) float32 on device or None
         returns y: (4,2,chunk_len) float32 on device
         """
         mix_ri = stft.stft_ri(chunk)  # (2,F,Tf,2)
+        ref_ri = stft.stft_ri(ref_chunk) if (ref_chunk is not None) else None
+
         if use_amp and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                pred = model(mix_ri)  # (2,4,F,Tf,2)
+                pred = call_model(mix_ri, ref_ri)  # (2,4,F,Tf,2) expected
         else:
-            pred = model(mix_ri)
+            pred = call_model(mix_ri, ref_ri)
+
         return pred_to_time(pred)
+
 
     # -----------------------
     # Mode 0: full inference (single pass, no windows)
@@ -206,12 +245,13 @@ def infer_ola(
     if stitch == "full":
         # x: (2,T) on device
         mix_ri = stft.stft_ri(x)  # (2,F,Tf,2)
+        ref_ri = stft.stft_ri(ref) if (ref is not None) else None
 
         if use_amp and device.type == "cuda":
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                pred = model(mix_ri)  # (2,4,F,Tf,2)
+                pred = call_model(mix_ri, ref_ri) # (2,4,F,Tf,2)
         else:
-            pred = model(mix_ri)
+            pred = call_model(mix_ri, ref_ri)
 
         # pred: (2,4,F,Tf,2) -> time
         # (4,2,F,Tf,2) -> (8,F,Tf,2)
@@ -236,9 +276,12 @@ def infer_ola(
         total_len = (n_chunks - 1) * hop_len + chunk_len
         pad = max(0, total_len - T)
         if pad > 0:
-            x_pad = F.pad(x, (0, pad))  # (2, T+pad)
+            x_pad = F.pad(x, (0, pad))
+            ref_pad = F.pad(ref, (0, pad)) if (ref is not None) else None
         else:
             x_pad = x
+            ref_pad = ref
+
 
         T_pad = x_pad.shape[1]
 
@@ -251,8 +294,9 @@ def infer_ola(
         for i in range(n_chunks):
             s = i * hop_len
             e = s + chunk_len
-            chunk = x_pad[:, s:e]                               # (2,L)
-            y = run_model_on_chunk(chunk)                       # (4,2,L)
+            chunk = x_pad[:, s:e]  # (2,L)
+            ref_chunk = ref_pad[:, s:e] if (ref_pad is not None) else None
+            y = run_model_on_chunk(chunk, ref_chunk)
 
             out[:, :, s:e] += y * win_v
             wsum[:, :, s:e] += win_v                            # <<< FIX: sum(win), not sum(win^2)
@@ -300,8 +344,9 @@ def infer_ola(
         wsum = None
         fade = None
 
-    def get_chunk_by_start(start: int) -> torch.Tensor:
+    def get_chunk_by_start(src: torch.Tensor, start: int) -> torch.Tensor:
         """
+        src: (2,T)
         start can be negative. Returns (2,chunk_len) padded with zeros if needed.
         """
         end = start + chunk_len
@@ -309,10 +354,9 @@ def infer_ola(
         right_pad = max(0, end - T)
         s0 = max(0, start)
         e0 = min(T, end)
-        ch = x[:, s0:e0]  # (2, <=chunk_len)
+        ch = src[:, s0:e0]
         if left_pad or right_pad:
             ch = F.pad(ch, (left_pad, right_pad))
-        # safety
         if ch.shape[1] != chunk_len:
             ch = F.pad(ch, (0, max(0, chunk_len - ch.shape[1])))
             ch = ch[:, :chunk_len]
@@ -324,9 +368,10 @@ def infer_ola(
 
         # align: kept center lands exactly at [out_s:out_e]
         in_s = out_s - trim_left  # may be negative
-        chunk = get_chunk_by_start(in_s)  # (2,chunk_len)
+        chunk = get_chunk_by_start(x, in_s)
+        ref_chunk = get_chunk_by_start(ref, in_s) if (ref is not None) else None
 
-        y = run_model_on_chunk(chunk)  # (4,2,chunk_len)
+        y = run_model_on_chunk(chunk, ref_chunk)
         y_keep = y[:, :, trim_left:trim_left + keep_len]  # (4,2,keep_len)
 
         if xfade_len <= 0:
@@ -360,6 +405,8 @@ def main():
 
     ap.add_argument("--ckpt", required=True, type=str, help="Path to phase_a_latest.pt (or phase_a_eXXX.pt)")
     ap.add_argument("--inp", required=True, type=str, help="Input audio file (wav/flac/...)")
+    ap.add_argument("--ref", default="", type=str, help="(conditional) Reference audio file (same SR). If empty -> zeros.")
+    ap.add_argument("--ref-gain-db", type=float, default=0.0, help="Optional gain (dB) applied to ref before STFT.")
     ap.add_argument("--outdir", default="out_phase_a", type=str)
 
     ap.add_argument("--sr", type=int, default=48000)
@@ -410,6 +457,16 @@ def main():
     T = x.shape[1]
     print(f"[audio] {args.inp} | sr={args.sr} | samples={T} | sec={T/args.sr:.2f}")
 
+    ref = None
+    if args.ref:
+        ref = read_audio(args.ref, sr_expected=int(args.sr))  # (2,Tr)
+        ref = match_length(ref, T)
+        g = db_to_lin(float(args.ref_gain_db))
+        if g != 1.0:
+            ref = ref * float(g)
+        print(f"[ref] {args.ref} | gain_db={args.ref_gain_db}")
+
+
     # load model + stft
     model = load_model(args.ckpt, device=device, n_fft=int(args.n_fft), num_heads=4)
     stft = STFT(StftCfg(n_fft=int(args.n_fft), hop=int(args.hop), win=int(args.win))).to(device)
@@ -419,6 +476,7 @@ def main():
         model=model,
         stft=stft,
         x_stereo=x,
+        ref_stereo=ref,
         sr=int(args.sr),
         chunk_sec=float(args.chunk_sec),
         overlap=float(args.overlap),
