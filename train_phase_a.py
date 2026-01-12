@@ -749,6 +749,7 @@ class FlexibleMixDataset(Dataset):
     def __getitem__(self, idx: int):
         rng = self._rng_for_item(idx)
         recipe = self.book.sample_recipe(rng, epoch=self._epoch)
+        ref_target = torch.zeros((2, self.seg_len), dtype=torch.float32)
 
         # -----------------------------
         # helpers (локально, чтобы __getitem__ был самодостаточным)
@@ -831,6 +832,7 @@ class FlexibleMixDataset(Dataset):
 
             # ref в unconditional = тишина
             ref = torch.zeros_like(mix_in)
+            ref_target = torch.zeros_like(mix_in)
 
         # -----------------------------
         # CONDITIONAL
@@ -838,67 +840,42 @@ class FlexibleMixDataset(Dataset):
         elif recipe.type == "conditional":
             mode_id = 1
 
-            # какие стемы кладём в ref; target = complement(ref_stems)
             ref_stems = recipe.pick_ref_stems_cond(rng)
             ref_set = set(ref_stems)
             complement = tuple(s for s in STEM_ORDER if s not in ref_set)
             complement_set = set(complement)
 
-            # если хоть где-то нужен vocals — нужен вокальный трек
             need_vocal_track = ("vocals" in ref_set) or ("vocals" in complement_set)
             base_track = int(rng.choice(self.valid_vocals if need_vocal_track else self.valid_any))
             start = self._random_start_from_starts(rng, base_track)
 
             full, stems = self._load_full_and_all_stems_fixed(base_track, start)
 
-            # ref waves из stems по ref_stems
-            ref_waves: dict[str, torch.Tensor] = {s: torch.zeros((2, self.seg_len), dtype=torch.float32) for s in
-                                                  STEM_ORDER}
-            for s in ref_stems:
-                ref_waves[s] = stems[s]
-
-            # gain на ref
-            apply_gain_block(recipe.ref_gain_db, ref_waves, ref_set)
-
-            # foreign stem: подмешиваем "чужой" стем в ref (из другой песни)
-            if float(recipe.foreign_ref_prob) > 0.0 and (float(rng.random()) < float(recipe.foreign_ref_prob)):
-                foreign_used = 1
-
-                # выбираем, какой стем подмешать
-                choices = list(recipe.foreign_ref_stem_choices) if recipe.foreign_ref_stem_choices else STEM_ORDER
-                fs = str(rng.choice(np.array(choices, dtype=object)))
-                fs = _norm_stem_name(fs)
-
-                # стараемся выбрать другой трек
-                tr = None
-                for _ in range(8):
-                    cand = self._pick_track_for_stem(rng, fs)
-                    if cand != base_track:
-                        tr = cand
-                        break
-                if tr is None:
-                    tr = self._pick_track_for_stem(rng, fs)
-
-                st = self._random_start_from_starts(rng, int(tr))
-                foreign_wave = self._load_stem(int(tr), st, fs)
-
-                foreign_dict = {fs: foreign_wave}
-                apply_gain_block(recipe.foreign_gain_db, foreign_dict, {fs})
-
-                ref_waves[fs] = ref_waves[fs] + foreign_dict[fs]
-
-            ref = ref_waves["bass"] + ref_waves["drums"] + ref_waves["music"] + ref_waves["vocals"]
-
-            # targets = complement(ref_stems)
-            for s in complement:
+            # --- main targets: ВСЕ 4 стема всегда присутствуют ---
+            for s in STEM_ORDER:
                 tgt[s] = stems[s]
                 present[s] = 1.0
 
-            # gain на targets (complement)
-            apply_gain_block(recipe.gain_db, tgt, complement_set)
+            # общий gain на стемы (чтобы mix/ref/targets были согласованы)
+            apply_gain_block(recipe.gain_db, tgt, set(STEM_ORDER))
 
-            mix_in = full
-            mix_target = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+            # mix_in = sum_stems, mix_target = sum_stems
+            mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+            mix_target = mix_in
+
+            # ref_in = sum(ref_stems)
+            ref = torch.zeros((2, self.seg_len), dtype=torch.float32)
+            for s in ref_stems:
+                ref = ref + tgt[s]
+
+            # ref_target = sum(complement_stems)
+            ref_target = torch.zeros((2, self.seg_len), dtype=torch.float32)
+            for s in complement:
+                ref_target = ref_target + tgt[s]
+
+            # IMPORTANT: в этом режиме foreign_ref запрещён (иначе будет "антисигнал" в комплементе)
+            foreign_used = 0
+
 
         else:
             raise ValueError(f"Unsupported recipe type: {recipe.type!r}")
@@ -909,37 +886,41 @@ class FlexibleMixDataset(Dataset):
         # -----------------------------
         # clip-safe scale (масштабируем ВСЁ вместе)
         # -----------------------------
-        peak_ref = torch.stack([mix_in, ref, mix_target], dim=0).abs().amax(dim=0)  # (2,T)
+        peak_ref = torch.stack([mix_in, ref, ref_target, mix_target], dim=0).abs().amax(dim=0)  # (2,T)
         peak_ref_b = peak_ref.unsqueeze(0)  # (1,2,T)
 
         mix_b = mix_in.unsqueeze(0)
         ref_b = ref.unsqueeze(0)
+        rt_b = ref_target.unsqueeze(0)
         mt_b = mix_target.unsqueeze(0)
 
-        signals = [mix_b, ref_b, mt_b] + [tgt[s].unsqueeze(0) for s in STEM_ORDER]
+        signals = [mix_b, ref_b, rt_b, mt_b] + [tgt[s].unsqueeze(0) for s in STEM_ORDER]
         scaled = apply_clip_safe_scale(peak_ref=peak_ref_b, signals=signals, peak_target=0.98)
 
         mix_in = scaled[0].squeeze(0)
         ref = scaled[1].squeeze(0)
-        mix_target = scaled[2].squeeze(0)
+        ref_target = scaled[2].squeeze(0)
+        mix_target = scaled[3].squeeze(0)
+
         for i, s in enumerate(STEM_ORDER):
-            tgt[s] = scaled[3 + i].squeeze(0)
+            tgt[s] = scaled[4 + i].squeeze(0)
 
         tgt_tensor = torch.stack([tgt[s] for s in STEM_ORDER], dim=0)  # (4,2,T)
         present_mask = torch.tensor([present[s] for s in STEM_ORDER], dtype=torch.float32)  # (4,)
         flags = torch.tensor([mode_id, foreign_used], dtype=torch.int64)  # (2,)
 
-        return mix_in, ref, tgt_tensor, present_mask, mix_target, flags
+        return mix_in, ref, ref_target, tgt_tensor, present_mask, mix_target, flags
 
 
 def collate(batch):
     mix = torch.stack([b[0] for b in batch], dim=0)          # (B,2,T)
     ref = torch.stack([b[1] for b in batch], dim=0)          # (B,2,T)
-    tgt = torch.stack([b[2] for b in batch], dim=0)          # (B,4,2,T)
-    pm  = torch.stack([b[3] for b in batch], dim=0)          # (B,4)
-    mt  = torch.stack([b[4] for b in batch], dim=0)          # (B,2,T)
-    fl  = torch.stack([b[5] for b in batch], dim=0)          # (B,2) [mode_id, foreign_used]
-    return mix, ref, tgt, pm, mt, fl
+    ref_tgt = torch.stack([b[2] for b in batch], dim=0)      # (B,2,T)
+    tgt = torch.stack([b[3] for b in batch], dim=0)          # (B,4,2,T)
+    pm  = torch.stack([b[4] for b in batch], dim=0)          # (B,4)
+    mt  = torch.stack([b[5] for b in batch], dim=0)          # (B,2,T)
+    fl  = torch.stack([b[6] for b in batch], dim=0)          # (B,2)
+    return mix, ref, ref_tgt, tgt, pm, mt, fl
 
 
 
@@ -996,6 +977,41 @@ def _normalize_checkpoint_state_dict(state_dict: Dict[str, Any]) -> Dict[str, An
     sd = _strip_prefix_if_all_keys(sd, "_orig_mod.")
     # 3) бывает комбо "module._orig_mod."
     sd = _strip_prefix_if_all_keys(sd, "module._orig_mod.")
+    return sd
+
+def _upgrade_head_4_to_5(sd: Dict[str, Any], *, prefix: str = "") -> Dict[str, Any]:
+    """
+    Старый head: out=27*4, новый: out=27*5.
+    Копируем первые 4 головы 1:1, 5-ю инициализируем нулями.
+    """
+    kw = prefix + "head.weight"
+    kb = prefix + "head.bias"
+
+    if kw not in sd:
+        return sd
+
+    w = sd[kw]
+    if not isinstance(w, torch.Tensor) or w.ndim != 4:
+        return sd
+
+    out_old = int(w.shape[0])
+    out4 = 27 * 4
+    out5 = 27 * 5
+
+    if out_old != out4:
+        return sd  # не тот случай
+
+    # build new
+    new_w = w.new_zeros((out5, w.shape[1], w.shape[2], w.shape[3]))
+    new_w[:out4] = w
+    sd[kw] = new_w
+
+    if kb in sd and isinstance(sd[kb], torch.Tensor) and sd[kb].ndim == 1 and int(sd[kb].shape[0]) == out4:
+        b = sd[kb]
+        new_b = b.new_zeros((out5,))
+        new_b[:out4] = b
+        sd[kb] = new_b
+
     return sd
 
 
@@ -1192,6 +1208,11 @@ def main():
     ap.add_argument("--w-vocals", type=float, default=1.0)
     ap.add_argument("--silence-weight", type=float, default=0.35)
 
+    # ref head
+    ap.add_argument("--with-ref-head", action="store_true", default=True)
+    ap.add_argument("--w-ref", type=float, default=1)
+    ap.add_argument("--ref-silence-weight", type=float, default=1)
+
     ap.add_argument("--limit-items", type=int, default=0)
     ap.add_argument("--dump-audio-every-epochs", type=int, default=0)
     ap.add_argument("--dump-dir", type=str, default="dumps_phase_ab_4stem")
@@ -1289,6 +1310,7 @@ def main():
     model = DeepVQEConditionalStemSeparator(
         n_fft=args.n_fft,
         num_heads=args.num_heads,
+        with_ref_head=args.with_ref_head,
     ).to(device)
 
     if is_ddp:
@@ -1336,6 +1358,7 @@ def main():
         ckpt = load_ckpt(args.resume, device=device)
 
         sd = _normalize_checkpoint_state_dict(ckpt["model"])
+        sd = _upgrade_head_4_to_5(sd)
         try:
             raw_model.load_state_dict(sd, strict=True)
         except RuntimeError as e:
@@ -1343,6 +1366,13 @@ def main():
             missing = raw_model.load_state_dict(sd, strict=False)
             print(
                 f"[warn] loaded with strict=False. missing={missing.missing_keys} unexpected={missing.unexpected_keys}")
+
+            if "fuse1.weight" in missing.missing_keys:
+                with torch.no_grad():
+                    raw_model.fuse1.weight.zero_()
+                    raw_model.fuse1.bias.zero_()
+                    for i in range(64):
+                        raw_model.fuse1.weight[i, i, 0, 0] = 1.0
 
         if (not args.reset_opt) and ("opt" in ckpt):
             try:
@@ -1376,16 +1406,17 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)
 
-        run = {"stem": 0.0, "mix": 0.0, "mr": 0.0, "total": 0.0}
+        run = {"stem": 0.0, "mix": 0.0, "ref": 0.0, "mr": 0.0, "total": 0.0}
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
-        for mix_in, ref, tgt, present_mask, mix_target, flags in pbar:
+        for mix_in, ref, ref_target, tgt, present_mask, mix_target, flags in pbar:
             mix_in = mix_in.to(device, non_blocking=True)  # (B,2,T)
             ref = ref.to(device, non_blocking=True)  # (B,2,T)
             tgt = tgt.to(device, non_blocking=True)  # (B,4,2,T)
             present_mask = present_mask.to(device, non_blocking=True)  # (B,4)
             mix_target = mix_target.to(device, non_blocking=True)  # (B,2,T)
-            # flags можно пока не использовать
+            ref_target = ref_target.to(device, non_blocking=True)  # (B,2,T)
+            flags = flags.to(device, non_blocking=True)  # (B,2)
 
             B, C, T = mix_in.shape
             N = B * C
@@ -1396,6 +1427,7 @@ def main():
             mix_f = flat_bc(mix_in)
             ref_f = flat_bc(ref)
             mt_f = flat_bc(mix_target)
+            rt_f = flat_bc(ref_target)
 
             bass_f = flat_bc(tgt[:, 0])
             drums_f = flat_bc(tgt[:, 1])
@@ -1408,6 +1440,7 @@ def main():
                 mix_ri = stft.stft_ri(mix_f)  # (N,F,Tf,2)
                 ref_ri = stft.stft_ri(ref_f)  # (N,F,Tf,2)
                 mt_ri = stft.stft_ri(mt_f)  # (N,F,Tf,2)
+                rt_ri = stft.stft_ri(rt_f)
 
                 tgt_ri = torch.stack(
                     [stft.stft_ri(bass_f), stft.stft_ri(drums_f), stft.stft_ri(music_f), stft.stft_ri(vocals_f)],
@@ -1415,36 +1448,60 @@ def main():
                 )  # (N,4,F,Tf,2)
 
             pred = model(mix_ri, ref_ri)  # (N,4,F,Tf,2)
+            pred_main = pred[:, :4]  # (N,4,F,Tf,2)
+            pred_refh = pred[:, 4]  # (N,F,Tf,2)
 
             # --- stem loss (L1 in RI) ---
-            diff = (pred.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
+            diff = (pred_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
 
-            # weights: head_w * (present + silence_weight * absent)
             sil_w = float(args.silence_weight)
-            w = head_w[None, :] * (pm_n * 1.0 + (1.0 - pm_n) * sil_w)  # (N,4)
-
-            # normalize per-sample to not depend on how many stems included
+            w = head_w[None, :] * (pm_n * 1.0 + (1.0 - pm_n) * sil_w)
             loss_stem = ((diff * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-8)).mean()
 
-            # --- mixture consistency: sum(pred) must reconstruct mix_in (which IS sum of active stems) ---
-            mix_hat = pred.sum(dim=1)  # (N,F,Tf,2)
-            loss_mix = l1_ri(mix_hat, mt_ri)  # <-- mt_ri, не mix_ri
+            mix_hat = pred_main.sum(dim=1)  # (N,F,Tf,2)
+            loss_mix = l1_ri(mix_hat, mt_ri)
 
-            loss = float(args.w_stem) * loss_stem + float(args.w_mix) * loss_mix
+            def l1_ri_per(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+                # (N,F,T,2) -> (N,)
+                return (x.float() - y.float()).abs().mean(dim=(1, 2, 3))
+
+            mode_b = flags[:, 0].long()  # (B,) 0/1
+            mode_n = mode_b.repeat_interleave(C, dim=0).float()  # (N,)
+
+            ref_l_vec = l1_ri_per(pred_refh, rt_ri)  # (N,)
+
+            w_ref_vec = torch.where(
+                mode_n > 0.5,
+                torch.ones_like(mode_n),
+                torch.full_like(mode_n, float(args.ref_silence_weight)),
+            )
+
+            loss_ref = (ref_l_vec * w_ref_vec).sum() / w_ref_vec.sum().clamp_min(1e-8)
+
+            run["ref"] += float(loss_ref.detach().cpu())
+
+            loss = (
+                    float(args.w_stem) * loss_stem
+                    + float(args.w_mix) * loss_mix
+                    + float(args.w_ref) * loss_ref
+            )
 
             # --- MR-STFT (time-domain) ---
             mr_loss = None
             if (mrstft is not None) and (int(args.mr_every) > 0) and ((global_step % int(args.mr_every)) == 0):
-                S = pred.shape[1]  # 4
-                pred_ri_flat = pred.reshape(N * S, pred.shape[2], pred.shape[3], 2)
-                pred_wav = stft.istft_ri(pred_ri_flat, length=T)  # (N*S,T)
+                S_main = 4  # bass, drums, music, vocals
 
-                tgt_wav = torch.stack([bass_f, drums_f, music_f, vocals_f], dim=1).reshape(N * S, T)  # (N*S,T)
+                # pred_main: (N,4,F,Tf,2)
+                pred_ri_flat = pred_main.reshape(N * S_main, pred_main.shape[2], pred_main.shape[3], 2)
+                pred_wav = stft.istft_ri(pred_ri_flat, length=T)  # (N*4,T)
 
-                mr_vec = mrstft(pred_wav, tgt_wav)  # (N*S,)
+                # targets: (N,4,T) -> (N*4,T)
+                tgt_wav = torch.stack([bass_f, drums_f, music_f, vocals_f], dim=1).reshape(N * S_main, T)
 
-                # weights for MR: same idea as above, but flattened (N*S,)
-                w_mr = w.reshape(N * S).float()
+                mr_vec = mrstft(pred_wav, tgt_wav)  # (N*4,)
+
+                # w: (N,4) -> (N*4,)
+                w_mr = w.reshape(N * S_main).float()
                 mr_loss = (mr_vec * w_mr).sum() / w_mr.sum().clamp_min(1e-8)
 
                 loss = loss + float(args.w_mrstft) * mr_loss
@@ -1469,6 +1526,7 @@ def main():
                     total=f"{run['total'] / denom:.6f}",
                     stem=f"{run['stem'] / denom:.6f}",
                     mix=f"{run['mix'] / denom:.6f}",
+                    ref=f"{run['ref'] / denom:.6f}",
                     mr=f"{run['mr'] / denom:.6f}",
                 )
 

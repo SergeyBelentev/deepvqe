@@ -205,16 +205,19 @@ def infer_ola(
     if chunk_len <= 0:
         raise ValueError("chunk_sec too small")
 
-    def pred_to_time(pred: torch.Tensor) -> torch.Tensor:
+    def pred_to_time(pred: torch.Tensor, length: int) -> torch.Tensor:
         """
-        pred: (2,4,F,Tf,2)
-        returns y: (4,2,chunk_len)
+        pred: (2,S,F,Tf,2)
+        returns y: (S,2,length)
         """
-        # (4,2,F,Tf,2) -> (8,F,Tf,2)
+        S = pred.shape[1]
+
+        # (2,S,F,Tf,2) -> (S,2,F,Tf,2) -> (S*2,F,Tf,2)
         p = pred.permute(1, 0, 2, 3, 4).contiguous()
-        p = p.view(p.shape[0] * p.shape[1], p.shape[2], p.shape[3], p.shape[4])
-        y = stft.istft_ri(p, length=chunk_len)  # (8, chunk_len)
-        y = y.view(4, 2, chunk_len)
+        p = p.view(S * 2, p.shape[2], p.shape[3], p.shape[4])
+
+        y = stft.istft_ri(p, length=length)  # (S*2, length)
+        y = y.view(S, 2, length)
         return y
 
     def call_model(mix_ri: torch.Tensor, ref_ri: Optional[torch.Tensor]) -> torch.Tensor:
@@ -236,7 +239,7 @@ def infer_ola(
         else:
             pred = call_model(mix_ri, ref_ri)
 
-        return pred_to_time(pred)
+        return pred_to_time(pred, length=chunk_len)
 
 
     # -----------------------
@@ -255,14 +258,19 @@ def infer_ola(
 
         # pred: (2,4,F,Tf,2) -> time
         # (4,2,F,Tf,2) -> (8,F,Tf,2)
-        p = pred.permute(1, 0, 2, 3, 4).contiguous()
-        p = p.view(p.shape[0] * p.shape[1], p.shape[2], p.shape[3], p.shape[4])  # (8,F,Tf,2)
-        y = stft.istft_ri(p, length=T)  # (8,T)
-        y = y.view(4, 2, T).detach().cpu()
+        S = pred.shape[1]
+
+        p = pred.permute(1, 0, 2, 3, 4).contiguous()  # (S,2,F,Tf,2)
+        p = p.view(S * 2, p.shape[2], p.shape[3], p.shape[4])
+
+        y = stft.istft_ri(p, length=T)  # (S*2,T)
+        y = y.view(S, 2, T).detach().cpu()
 
         names = ["bass", "drums", "music", "vocals"]
-        return {names[i]: y[i] for i in range(4)}
+        if S == 5:
+            names += ["ref"]
 
+        return {names[i] if i < len(names) else f"head{i}": y[i] for i in range(S)}
 
     # -----------------------
     # Mode 1: classic OLA (fixed normalization: wsum += win)
@@ -285,27 +293,35 @@ def infer_ola(
 
         T_pad = x_pad.shape[1]
 
-        out = torch.zeros((4, 2, T_pad), device=device, dtype=torch.float32)
+        out = None
         wsum = torch.zeros((1, 1, T_pad), device=device, dtype=torch.float32)
 
-        win = make_hann_ola(chunk_len, device=device)          # (L,)
-        win_v = win.view(1, 1, -1)                              # (1,1,L)
+        win = make_hann_ola(chunk_len, device=device)  # (L,)
+        win_v = win.view(1, 1, -1)  # (1,1,L)
 
         for i in range(n_chunks):
             s = i * hop_len
             e = s + chunk_len
-            chunk = x_pad[:, s:e]  # (2,L)
+            chunk = x_pad[:, s:e]
             ref_chunk = ref_pad[:, s:e] if (ref_pad is not None) else None
-            y = run_model_on_chunk(chunk, ref_chunk)
+
+            y = run_model_on_chunk(chunk, ref_chunk)  # (S,2,L)
+
+            if out is None:
+                S = y.shape[0]
+                out = torch.zeros((S, 2, T_pad), device=device, dtype=torch.float32)
 
             out[:, :, s:e] += y * win_v
-            wsum[:, :, s:e] += win_v                            # <<< FIX: sum(win), not sum(win^2)
+            wsum[:, :, s:e] += win_v
 
         out = out / wsum.clamp_min(1e-8)
         out = out[:, :, :T].detach().cpu()
 
         names = ["bass", "drums", "music", "vocals"]
-        return {names[i]: out[i] for i in range(4)}
+        if out.shape[0] == 5:
+            names = names + ["ref"]  # 5-я голова
+
+        return {names[i] if i < len(names) else f"head{i}": out[i] for i in range(out.shape[0])}
 
     # -----------------------
     # Mode 2: crop-stitching (take central 50-75% and stitch)

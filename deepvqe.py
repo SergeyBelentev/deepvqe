@@ -400,21 +400,28 @@ class DeepVQEConditionalStemSeparator(nn.Module):
     """
     Conditional separator:
       input:  mix_ri (B,F,T,2), ref_ri (B,F,T,2)
-      output: stems_ri (B,S,F,T,2)
+      output:
+        - main stems: (B,4,F,T,2)  in STEM_ORDER
+        - optional ref head: +1 head (B,1,F,T,2) as the last head
+      forward returns: (B, S_total, F, T, 2)
     """
 
     def __init__(
         self,
         n_fft: int = 1536,
-        num_heads: int = 4,
+        num_heads: int = 4,              # main heads count (must be 4 in твоём скрипте)
         *,
+        with_ref_head: bool = True,      # <-- NEW
         delay_past_frames: int = 25,
         delay_future_frames: int = 25,
         align_hidden: int = 64,
     ):
         super().__init__()
         self.n_fft = int(n_fft)
-        self.num_heads = int(num_heads)
+
+        self.num_heads_main = int(num_heads)
+        self.with_ref_head = bool(with_ref_head)
+        self.num_heads_total = self.num_heads_main + (1 if self.with_ref_head else 0)
 
         self.fe = FE()
 
@@ -432,7 +439,7 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         )
         self.fuse1 = nn.Conv2d(64 + align_hidden, 64, kernel_size=1)
 
-        # dynamic F5 (так же, как у тебя)
+        # dynamic F5
         F_in = self.n_fft // 2 + 1
         with torch.no_grad():
             dummy = torch.zeros(1, 2, 8, F_in)
@@ -450,7 +457,9 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         self.ccm = CCM()
 
         # per-head CCM masks: 27 channels per head
-        self.head = nn.Conv2d(27, 27 * self.num_heads, kernel_size=1)
+        # OLD: 27 * num_heads
+        # NEW: 27 * num_heads_total
+        self.head = nn.Conv2d(27, 27 * self.num_heads_total, kernel_size=1)
 
     def forward(self, mix_ri: Tensor, ref_ri: Tensor) -> Tensor:
         # mix_ri/ref_ri: (B,F,T,2)
@@ -463,9 +472,8 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         x1 = self.enblock1(x0)  # (B,64,T,F')
         r1 = self.enblock1(r0)  # (B,64,T,F')
 
-        # ctx: (B,align_hidden,T,F')
-        ctx = self.align1(x1, r1, return_att=False)
-        x1f = self.fuse1(torch.cat([x1, ctx], dim=1))  # (B,64,T,F')
+        ctx = self.align1(x1, r1, return_att=False)               # (B,align_hidden,T,F')
+        x1f = self.fuse1(torch.cat([x1, ctx], dim=1))             # (B,64,T,F')
 
         en2 = self.enblock2(x1f)
         en3 = self.enblock3(en2)
@@ -478,14 +486,15 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         d4 = self.deblock4(d5, en4)[..., :en3.shape[-1]]
         d3 = self.deblock3(d4, en3)[..., :en2.shape[-1]]
         d2 = self.deblock2(d3, en2)[..., :x1f.shape[-1]]
-        d1 = self.deblock1(d2, x1f)[..., :x0.shape[-1]]   # (B,27,T,F)
+        d1 = self.deblock1(d2, x1f)[..., :x0.shape[-1]]           # (B,27,T,F)
 
-        m = self.head(d1)  # (B,27*S,T,F)
+        m = self.head(d1)                                         # (B,27*S_total,T,F)
         B, _, Tt, Freq = m.shape
-        S = self.num_heads
+        S = self.num_heads_total
 
-        m2 = rearrange(m, "b (s c) t f -> (b s) c t f", s=S)     # (B*S,27,T,F)
-        x2 = mix_ri.repeat_interleave(S, dim=0)                  # (B*S,F,T,2)
-        y2 = self.ccm(m2, x2)                                    # (B*S,F,T,2)
-        y  = rearrange(y2, "(b s) f t r -> b s f t r", b=B, s=S) # (B,S,F,T,2)
+        m2 = rearrange(m, "b (s c) t f -> (b s) c t f", s=S)       # (B*S,27,T,F)
+        x2 = mix_ri.repeat_interleave(S, dim=0)                    # (B*S,F,T,2)
+        y2 = self.ccm(m2, x2)                                      # (B*S,F,T,2)
+        y  = rearrange(y2, "(b s) f t r -> b s f t r", b=B, s=S)   # (B,S,F,T,2)
         return y
+
