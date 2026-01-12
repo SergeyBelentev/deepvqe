@@ -1015,6 +1015,56 @@ def _upgrade_head_4_to_5(sd: Dict[str, Any], *, prefix: str = "") -> Dict[str, A
     return sd
 
 
+def load_shape_compatible(
+    model: torch.nn.Module,
+    ckpt_path: str,
+    device: torch.device,
+    *,
+    allow_prefixes: tuple[str, ...] = (
+        "fe.",
+        "enblock1.", "enblock2.", "enblock3.", "enblock4.", "enblock5.",
+        "deblock5.", "deblock4.", "deblock3.", "deblock2.",
+    ),
+    skip_substrings: tuple[str, ...] = (
+        ".bn.", "running_mean", "running_var", "num_batches_tracked",
+        "align1.", "fuse1.",
+    ),
+) -> None:
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    # normalize prefixes like "module." / "_orig_mod."
+    def strip_prefix_all(d: dict[str, torch.Tensor], pref: str) -> dict[str, torch.Tensor]:
+        if d and all(k.startswith(pref) for k in d.keys()):
+            return {k[len(pref):]: v for k, v in d.items()}
+        return d
+
+    sd = strip_prefix_all(sd, "module.")
+    sd = strip_prefix_all(sd, "_orig_mod.")
+    sd = strip_prefix_all(sd, "module._orig_mod.")
+
+    msd = model.state_dict()
+    take = {}
+
+    for k, v in sd.items():
+        if not k.startswith(allow_prefixes):
+            continue
+        if any(s in k for s in skip_substrings):
+            continue
+        if k not in msd:
+            continue
+        if not isinstance(v, torch.Tensor):
+            continue
+        if msd[k].shape != v.shape:
+            continue
+        take[k] = v
+
+    missing, unexpected = model.load_state_dict(take, strict=False)
+    print("[init] loaded keys:", len(take))
+    print("[init] missing:", len(missing), "unexpected:", len(unexpected))
+
+
+
 def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if not isinstance(ckpt, dict) or "model" not in ckpt:
@@ -1155,6 +1205,7 @@ def main():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--save-every-epochs", type=int, default=1)
 
+    ap.add_argument("--load-shape-compatible", action="store_true", default=False)
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--reset-opt", action="store_true")
     ap.add_argument("--reset-rng", action="store_true")
@@ -1355,38 +1406,45 @@ def main():
     raw_model = model.module if isinstance(model, DDP) else model
 
     if args.resume:
-        ckpt = load_ckpt(args.resume, device=device)
+        if args.load_shape_compatible:
+            load_shape_compatible(
+                raw_model,
+                args.resume,
+                device=device,
+            )
+        else:
+            ckpt = load_ckpt(args.resume, device=device)
 
-        sd = _normalize_checkpoint_state_dict(ckpt["model"])
-        sd = _upgrade_head_4_to_5(sd)
-        try:
-            raw_model.load_state_dict(sd, strict=True)
-        except RuntimeError as e:
-            print(f"[warn] strict load failed: {e}")
-            missing = raw_model.load_state_dict(sd, strict=False)
-            print(
-                f"[warn] loaded with strict=False. missing={missing.missing_keys} unexpected={missing.unexpected_keys}")
-
-            if "fuse1.weight" in missing.missing_keys:
-                with torch.no_grad():
-                    raw_model.fuse1.weight.zero_()
-                    raw_model.fuse1.bias.zero_()
-                    for i in range(64):
-                        raw_model.fuse1.weight[i, i, 0, 0] = 1.0
-
-        if (not args.reset_opt) and ("opt" in ckpt):
+            sd = _normalize_checkpoint_state_dict(ckpt["model"])
+            sd = _upgrade_head_4_to_5(sd)
             try:
-                opt.load_state_dict(ckpt["opt"])
-            except Exception as e:
-                print(f"[warn] failed to load optimizer state: {e}")
+                raw_model.load_state_dict(sd, strict=True)
+            except RuntimeError as e:
+                print(f"[warn] strict load failed: {e}")
+                missing = raw_model.load_state_dict(sd, strict=False)
+                print(
+                    f"[warn] loaded with strict=False. missing={missing.missing_keys} unexpected={missing.unexpected_keys}")
 
-        if not args.reset_rng:
-            restore_rng(ckpt)
+                if "fuse1.weight" in missing.missing_keys:
+                    with torch.no_grad():
+                        raw_model.fuse1.weight.zero_()
+                        raw_model.fuse1.bias.zero_()
+                        for i in range(64):
+                            raw_model.fuse1.weight[i, i, 0, 0] = 1.0
 
-        start_epoch = int(ckpt.get("epoch", 0)) + 1
-        global_step = int(ckpt.get("global_step", 0))
-        print(f"[resume] loaded {args.resume}")
-        print(f"[resume] will start from epoch={start_epoch}")
+            if (not args.reset_opt) and ("opt" in ckpt):
+                try:
+                    opt.load_state_dict(ckpt["opt"])
+                except Exception as e:
+                    print(f"[warn] failed to load optimizer state: {e}")
+
+            if not args.reset_rng:
+                restore_rng(ckpt)
+
+            start_epoch = int(ckpt.get("epoch", 0)) + 1
+            global_step = int(ckpt.get("global_step", 0))
+            print(f"[resume] loaded {args.resume}")
+            print(f"[resume] will start from epoch={start_epoch}")
 
     if start_epoch > args.epochs:
         print(f"[info] nothing to do: start_epoch={start_epoch} > --epochs={args.epochs}")
@@ -1421,6 +1479,9 @@ def main():
             B, C, T = mix_in.shape
             N = B * C
 
+            mode_b = flags[:, 0].long()  # (B,) 0/1
+            ref_valid_n = mode_b.repeat_interleave(C, 0).bool()  # (N,) bool, где N=B*C
+
             def flat_bc(x: torch.Tensor) -> torch.Tensor:
                 return x.reshape(N, T).float()
 
@@ -1447,9 +1508,8 @@ def main():
                     dim=1,
                 )  # (N,4,F,Tf,2)
 
-            pred = model(mix_ri, ref_ri)  # (N,4,F,Tf,2)
+            pred = model(mix_ri, ref_ri, ref_valid=ref_valid_n)
             pred_main = pred[:, :4]  # (N,4,F,Tf,2)
-            pred_refh = pred[:, 4]  # (N,F,Tf,2)
 
             # --- stem loss (L1 in RI) ---
             diff = (pred_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
@@ -1461,22 +1521,17 @@ def main():
             mix_hat = pred_main.sum(dim=1)  # (N,F,Tf,2)
             loss_mix = l1_ri(mix_hat, mt_ri)
 
-            def l1_ri_per(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-                # (N,F,T,2) -> (N,)
-                return (x.float() - y.float()).abs().mean(dim=(1, 2, 3))
 
-            mode_b = flags[:, 0].long()  # (B,) 0/1
-            mode_n = mode_b.repeat_interleave(C, dim=0).float()  # (N,)
+            loss_ref = mix_ri.sum() * 0.0  # нулевой тензор на device
+            if args.with_ref_head:
+                pred_refh = pred[:, 4]  # (N,F,Tf,2)
 
-            ref_l_vec = l1_ri_per(pred_refh, rt_ri)  # (N,)
-
-            w_ref_vec = torch.where(
-                mode_n > 0.5,
-                torch.ones_like(mode_n),
-                torch.full_like(mode_n, float(args.ref_silence_weight)),
-            )
-
-            loss_ref = (ref_l_vec * w_ref_vec).sum() / w_ref_vec.sum().clamp_min(1e-8)
+                cond = ref_valid_n  # (N,) bool
+                if cond.any():
+                    loss_ref = l1_ri(pred_refh[cond], rt_ri[cond])
+                else:
+                    # в этом шаге нет conditional примеров -> ref-head не обучаем
+                    loss_ref = pred_refh.sum() * 0.0
 
             run["ref"] += float(loss_ref.detach().cpu())
 

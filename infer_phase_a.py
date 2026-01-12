@@ -221,7 +221,11 @@ def infer_ola(
         return y
 
     def call_model(mix_ri: torch.Tensor, ref_ri: Optional[torch.Tensor]) -> torch.Tensor:
-        return model(mix_ri, ref_ri)
+        if ref_ri is None:
+            ref_valid = torch.zeros((mix_ri.shape[0],), device=mix_ri.device, dtype=torch.bool)
+        else:
+            ref_valid = torch.ones((mix_ri.shape[0],), device=mix_ri.device, dtype=torch.bool)
+        return model(mix_ri, ref_ri, ref_valid)
 
 
     def run_model_on_chunk(chunk: torch.Tensor, ref_chunk: Optional[torch.Tensor]) -> torch.Tensor:

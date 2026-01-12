@@ -10,6 +10,13 @@ from torch import Tensor
 FLOAT_EPS: Final[float] = torch.finfo(torch.float32).eps
 
 
+def norm2d(ch: int, groups: int = 8) -> nn.Module:
+    g = min(groups, ch)
+    while ch % g != 0:
+        g -= 1
+    return nn.GroupNorm(g, ch)
+
+
 class FE(nn.Module):
     """Feature extraction block.
 
@@ -44,7 +51,7 @@ class ResidualBlock(nn.Module):
         super().__init__()
         self.pad = nn.ZeroPad2d([1, 1, 3, 0])
         self.conv = nn.Conv2d(channels, channels, kernel_size=(4, 3))
-        self.bn = nn.BatchNorm2d(channels)
+        self.bn = norm2d(channels)
         self.elu = nn.ELU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -179,7 +186,7 @@ class EncoderBlock(nn.Module):
         super().__init__()
         self.pad = nn.ZeroPad2d([1, 1, 3, 0])
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride)
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.bn = norm2d(out_channels)
         self.elu = nn.ELU()
         self.resblock = ResidualBlock(out_channels)
 
@@ -221,7 +228,7 @@ class DecoderBlock(nn.Module):
         self.skip_conv = nn.Conv2d(in_channels, in_channels, 1)
         self.resblock = ResidualBlock(in_channels)
         self.deconv = SubpixelConv2d(in_channels, out_channels, kernel_size)
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.bn = norm2d(out_channels)
         self.elu = nn.ELU()
         self.is_last = is_last
 
@@ -396,25 +403,139 @@ class DeepVQE(nn.Module):
         return out
 
 
+class AxialMHSA2DBlock(nn.Module):
+    """
+    Axial MHSA on (B,C,T,F):
+      1) attention over T for each F-bin independently  (batch=B*F, seq=T)
+      2) attention over F for each T-frame independently (batch=B*T, seq=F)
+      + pointwise FFN on 2D map
+    Intended to run at bottleneck where F is small (F5 ~ 20-30).
+    """
+    def __init__(self, channels: int, heads: int = 4, ff_mult: int = 2, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.channels = int(channels)
+
+        self.ln_t = nn.LayerNorm(channels)
+        self.attn_t = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, dropout=dropout, batch_first=True)
+
+        self.ln_f = nn.LayerNorm(channels)
+        self.attn_f = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, dropout=dropout, batch_first=True)
+
+        # FFN (2D pointwise)
+        hid = int(channels * ff_mult)
+        self.gn = nn.GroupNorm(1, channels)  # стабильнее BN при маленьком batch
+        self.ff = nn.Sequential(
+            nn.Conv2d(channels, hid, kernel_size=1),
+            nn.GELU(),
+            nn.Conv2d(hid, channels, kernel_size=1),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B,C,T,F)
+        B, C, T, Freq = x.shape
+
+        # ---- time-attn: (B*F, T, C) ----
+        xt = x.permute(0, 3, 2, 1).contiguous().view(B * Freq, T, C)
+        xtn = self.ln_t(xt)
+        ot, _ = self.attn_t(xtn, xtn, xtn, need_weights=False)
+        xt = xt + ot
+        x = xt.view(B, Freq, T, C).permute(0, 3, 2, 1).contiguous()  # back to (B,C,T,F)
+
+        # ---- freq-attn: (B*T, F, C) ----
+        xf = x.permute(0, 2, 3, 1).contiguous().view(B * T, Freq, C)
+        xfn = self.ln_f(xf)
+        of, _ = self.attn_f(xfn, xfn, xfn, need_weights=False)
+        xf = xf + of
+        x = xf.view(B, T, Freq, C).permute(0, 3, 1, 2).contiguous()  # (B,C,T,F)
+
+        # ---- FFN ----
+        y = self.ff(self.gn(x))
+        return x + y
+
+
+class AxialTrunk(nn.Module):
+    def __init__(self, channels: int, num_layers: int = 5, heads: int = 4, ff_mult: int = 2, dropout: float = 0.0):
+        super().__init__()
+        self.blocks = nn.Sequential(
+            *[AxialMHSA2DBlock(channels, heads=heads, ff_mult=ff_mult, dropout=dropout) for _ in range(int(num_layers))]
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.blocks(x)
+
+
+class HeadAdapter(nn.Module):
+    """
+    Input:  shared features (B,64,T,F)
+    Output: CCM mask         (B,27,T,F)
+
+    "attention" here is cheap CBAM-like:
+      - channel gate (SE)
+      - spatial gate (avg/max -> conv -> sigmoid)
+    """
+    def __init__(self, in_ch: int = 64, bottleneck: int = 32, se_ratio: int = 4, spatial_ks: int = 7) -> None:
+        super().__init__()
+        in_ch = int(in_ch)
+        bottleneck = int(bottleneck)
+
+        self.pre = nn.Conv2d(in_ch, bottleneck, kernel_size=1)
+
+        # channel attention (SE)
+        hid = max(1, bottleneck // int(se_ratio))
+        self.se1 = nn.Conv2d(bottleneck, hid, kernel_size=1)
+        self.se2 = nn.Conv2d(hid, bottleneck, kernel_size=1)
+        self.se_act = nn.ELU()
+
+        # spatial attention
+        ks = int(spatial_ks)
+        pad = ks // 2
+        self.sa = nn.Sequential(
+            nn.ZeroPad2d([pad, pad, pad, pad]),
+            nn.Conv2d(2, 1, kernel_size=ks),
+        )
+
+        # 1x1 to CCM mask
+        self.out = nn.Conv2d(bottleneck, 27, kernel_size=1)
+
+    def forward(self, feat: Tensor) -> Tensor:
+        # feat: (B,64,T,F)
+        x = self.pre(feat)  # (B,bn,T,F)
+
+        # --- channel gate ---
+        w = x.mean(dim=(2, 3), keepdim=True)         # (B,bn,1,1)
+        w = self.se_act(self.se1(w))
+        w = torch.sigmoid(self.se2(w))
+        x = x * w
+
+        # --- spatial gate ---
+        a = x.mean(dim=1, keepdim=True)              # (B,1,T,F)
+        m = x.amax(dim=1, keepdim=True)              # (B,1,T,F)
+        s = torch.sigmoid(self.sa(torch.cat([a, m], dim=1)))  # (B,1,T,F)
+        x = x * s
+
+        return self.out(x)  # (B,27,T,F)
+
+
 class DeepVQEConditionalStemSeparator(nn.Module):
     """
-    Conditional separator:
-      input:  mix_ri (B,F,T,2), ref_ri (B,F,T,2)
-      output:
-        - main stems: (B,4,F,T,2)  in STEM_ORDER
-        - optional ref head: +1 head (B,1,F,T,2) as the last head
-      forward returns: (B, S_total, F, T, 2)
+    Variant B:
+      encoders -> align/fuse (optional) -> en5 -> axial trunk shared -> decoder shared -> shared feat (64ch)
+      then per-head:
+        HeadAdapter(attn+bottleneck)->27 -> CCM -> (B,F,T,2)
+    Output: (B, S_total, F, T, 2)
     """
 
     def __init__(
         self,
         n_fft: int = 1536,
-        num_heads: int = 4,              # main heads count (must be 4 in твоём скрипте)
+        num_heads: int = 4,
         *,
-        with_ref_head: bool = True,      # <-- NEW
+        with_ref_head: bool = True,
         delay_past_frames: int = 25,
         delay_future_frames: int = 25,
         align_hidden: int = 64,
+        trunk_layers: int = 5,
+        trunk_heads: int = 4,
     ):
         super().__init__()
         self.n_fft = int(n_fft)
@@ -422,6 +543,7 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         self.num_heads_main = int(num_heads)
         self.with_ref_head = bool(with_ref_head)
         self.num_heads_total = self.num_heads_main + (1 if self.with_ref_head else 0)
+        self.align_hidden = int(align_hidden)
 
         self.fe = FE()
 
@@ -433,68 +555,80 @@ class DeepVQEConditionalStemSeparator(nn.Module):
 
         self.align1 = AlignBlockBi(
             in_channels=64,
-            hidden_channels=align_hidden,
+            hidden_channels=self.align_hidden,
             delay_past=delay_past_frames,
             delay_future=delay_future_frames,
         )
-        self.fuse1 = nn.Conv2d(64 + align_hidden, 64, kernel_size=1)
+        self.fuse1 = nn.Conv2d(64 + self.align_hidden, 64, kernel_size=1)
 
         # dynamic F5
         F_in = self.n_fft // 2 + 1
         with torch.no_grad():
             dummy = torch.zeros(1, 2, 8, F_in)
             y = self.enblock5(self.enblock4(self.enblock3(self.enblock2(self.enblock1(dummy)))))
-            self.F5 = y.shape[-1]
+            self.F5 = int(y.shape[-1])
 
-        self.bottle = Bottleneck(128 * self.F5, 64 * self.F5)
+        # ---- NEW: axial trunk (shared) instead of GRU bottleneck ----
+        self.trunk = AxialTrunk(
+            channels=128,
+            num_layers=int(trunk_layers),
+            heads=int(trunk_heads),
+            ff_mult=2,
+            dropout=0.0,
+        )
 
+        # shared decoder (unchanged topology), but LAST outputs 64-ch features
         self.deblock5 = DecoderBlock(128, 128)
         self.deblock4 = DecoderBlock(128, 128)
         self.deblock3 = DecoderBlock(128, 128)
         self.deblock2 = DecoderBlock(128, 64)
-        self.deblock1 = DecoderBlock(64, 27, is_last=True)
+        self.deblock1 = DecoderBlock(64, 64, is_last=False)  # <-- was 27, now 64
 
-        self.ccm = CCM()
+        # per-head adapters + CCM per head
+        S = self.num_heads_total
+        self.adapters = nn.ModuleList([HeadAdapter(in_ch=64, bottleneck=32) for _ in range(S)])
+        self.ccms = nn.ModuleList([CCM() for _ in range(S)])  # "per-head CCM"
 
-        # per-head CCM masks: 27 channels per head
-        # OLD: 27 * num_heads
-        # NEW: 27 * num_heads_total
-        self.head = nn.Conv2d(27, 27 * self.num_heads_total, kernel_size=1)
-
-    def forward(self, mix_ri: Tensor, ref_ri: Tensor) -> Tensor:
+    def forward(self, mix_ri: Tensor, ref_ri: Tensor, ref_valid: Tensor | None = None) -> Tensor:
         # mix_ri/ref_ri: (B,F,T,2)
-        if ref_ri is None:
-            ref_ri = torch.zeros_like(mix_ri)
+        B = mix_ri.shape[0]
 
-        x0 = self.fe(mix_ri)  # (B,2,T,F)
-        r0 = self.fe(ref_ri)  # (B,2,T,F)
+        if ref_valid is None:
+            ref_valid = mix_ri.new_ones((B,), dtype=torch.bool)
+        else:
+            ref_valid = ref_valid.to(device=mix_ri.device).bool()
 
-        x1 = self.enblock1(x0)  # (B,64,T,F')
-        r1 = self.enblock1(r0)  # (B,64,T,F')
+        x0 = self.fe(mix_ri)
+        r0 = self.fe(ref_ri)
 
-        ctx = self.align1(x1, r1, return_att=False)               # (B,align_hidden,T,F')
-        x1f = self.fuse1(torch.cat([x1, ctx], dim=1))             # (B,64,T,F')
+        x1 = self.enblock1(x0)
+        r1 = self.enblock1(r0)
+
+        ctx = self.align1(x1, r1, return_att=False)  # (B,align_hidden,T,F')
+        mask = ref_valid.float().view(B, 1, 1, 1)  # broadcast
+        ctx = ctx * mask  # <- ключевой момент: uncond не даёт градиент в align
+
+        x1f = self.fuse1(torch.cat([x1, ctx], dim=1))
 
         en2 = self.enblock2(x1f)
         en3 = self.enblock3(en2)
         en4 = self.enblock4(en3)
         en5 = self.enblock5(en4)
 
-        z = self.bottle(en5)
+        z = self.trunk(en5)  # (B,128,T,F5)
 
         d5 = self.deblock5(z, en5)[..., :en4.shape[-1]]
         d4 = self.deblock4(d5, en4)[..., :en3.shape[-1]]
         d3 = self.deblock3(d4, en3)[..., :en2.shape[-1]]
         d2 = self.deblock2(d3, en2)[..., :x1f.shape[-1]]
-        d1 = self.deblock1(d2, x1f)[..., :x0.shape[-1]]           # (B,27,T,F)
+        d1 = self.deblock1(d2, x1f)[..., :x0.shape[-1]]  # (B,64,T,F_in)
 
-        m = self.head(d1)                                         # (B,27*S_total,T,F)
-        B, _, Tt, Freq = m.shape
-        S = self.num_heads_total
+        # per-head: adapter -> mask -> CCM
+        outs: list[Tensor] = []
+        for i in range(self.num_heads_total):
+            m = self.adapters[i](d1)          # (B,27,T,F)
+            y = self.ccms[i](m, mix_ri)       # (B,F,T,2)
+            outs.append(y)
 
-        m2 = rearrange(m, "b (s c) t f -> (b s) c t f", s=S)       # (B*S,27,T,F)
-        x2 = mix_ri.repeat_interleave(S, dim=0)                    # (B*S,F,T,2)
-        y2 = self.ccm(m2, x2)                                      # (B*S,F,T,2)
-        y  = rearrange(y2, "(b s) f t r -> b s f t r", b=B, s=S)   # (B,S,F,T,2)
-        return y
+        return torch.stack(outs, dim=1)  # (B,S,F,T,2)
 
