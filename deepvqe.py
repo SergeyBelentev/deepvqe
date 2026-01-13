@@ -403,90 +403,414 @@ class DeepVQE(nn.Module):
         return out
 
 
-class AxialMHSA2DBlock(nn.Module):
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import Tensor
+
+
+# ---------------------------
+# Utils
+# ---------------------------
+class LayerNorm2D(nn.Module):
+    """LayerNorm over channels for (B,C,T,F)."""
+    def __init__(self, channels: int, eps: float = 1e-5):
+        super().__init__()
+        self.ln = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # (B,C,T,F) -> (B,T,F,C) -> LN -> (B,C,T,F)
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+
+
+class DropPath(nn.Module):
+    """Stochastic depth."""
+    def __init__(self, p: float = 0.0):
+        super().__init__()
+        self.p = float(p)
+
+    def forward(self, x: Tensor) -> Tensor:
+        if self.p == 0.0 or not self.training:
+            return x
+        keep = 1.0 - self.p
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = x.new_empty(shape).bernoulli_(keep)
+        return x * mask / keep
+
+
+def swiglu(x: Tensor) -> Tensor:
+    a, b = x.chunk(2, dim=1)
+    return a * F.silu(b)
+
+
+# ---------------------------
+# 2D Rotary Positional Embedding (RoPE)
+# ---------------------------
+class Rotary2D(nn.Module):
     """
-    Axial MHSA on (B,C,T,F):
-      1) attention over T for each F-bin independently  (batch=B*F, seq=T)
-      2) attention over F for each T-frame independently (batch=B*T, seq=F)
-      + pointwise FFN on 2D map
-    Intended to run at bottleneck where F is small (F5 ~ 20-30).
+    Apply RoPE separately on time axis and freq axis.
+
+    We split head_dim into two even parts:
+      - first part uses time positions
+      - second part uses freq positions
+
+    q,k expected shape: (B, H, T, F, D)
     """
-    def __init__(self, channels: int, heads: int = 4, ff_mult: int = 2, dropout: float = 0.0) -> None:
+    def __init__(self, head_dim: int):
+        super().__init__()
+        if head_dim % 4 != 0:
+            raise ValueError("For 2D RoPE we want head_dim divisible by 4 (so each half is even).")
+        self.head_dim = int(head_dim)
+        self.dt = head_dim // 2
+        self.df = head_dim // 2
+
+        if self.dt % 2 != 0 or self.df % 2 != 0:
+            raise ValueError("RoPE parts must be even.")
+
+        self.register_buffer("_t_cache_cos", torch.empty(0), persistent=False)
+        self.register_buffer("_t_cache_sin", torch.empty(0), persistent=False)
+        self.register_buffer("_f_cache_cos", torch.empty(0), persistent=False)
+        self.register_buffer("_f_cache_sin", torch.empty(0), persistent=False)
+
+        self._t_cache_len = 0
+        self._f_cache_len = 0
+
+    @staticmethod
+    def _build_sin_cos(length: int, dim: int, device, dtype):
+        # dim is even; returns cos,sin with shape (length, dim/2)
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim))
+        pos = torch.arange(length, device=device, dtype=torch.float32)
+        ang = torch.outer(pos, inv_freq)  # (L, dim/2)
+        cos = torch.cos(ang).to(dtype=dtype)
+        sin = torch.sin(ang).to(dtype=dtype)
+        return cos, sin
+
+    @staticmethod
+    def _apply_rotary(x: Tensor, cos: Tensor, sin: Tensor, axis: str) -> Tensor:
+        # x: (B,H,T,F,dim) where dim even
+        # cos/sin:
+        #  - time: (T, dim/2) -> broadcast to (1,1,T,1,dim/2)
+        #  - freq: (F, dim/2) -> broadcast to (1,1,1,F,dim/2)
+        dim = x.shape[-1]
+        x2 = x.view(*x.shape[:-1], dim // 2, 2)
+        x1 = x2[..., 0]
+        x2v = x2[..., 1]
+
+        if axis == "t":
+            cos = cos[None, None, :, None, :]  # (1,1,T,1,dim/2)
+            sin = sin[None, None, :, None, :]
+        elif axis == "f":
+            cos = cos[None, None, None, :, :]  # (1,1,1,F,dim/2)
+            sin = sin[None, None, None, :, :]
+        else:
+            raise ValueError("axis must be 't' or 'f'")
+
+        y1 = x1 * cos - x2v * sin
+        y2 = x1 * sin + x2v * cos
+        y = torch.stack([y1, y2], dim=-1).flatten(-2)
+        return y
+
+    def forward(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+        # q,k: (B,H,T,F,D)
+        B, H, T, Freq, D = q.shape
+        assert D == self.head_dim
+
+        device = q.device
+        dtype = q.dtype
+
+        # cache sin/cos for time
+        if T > self._t_cache_len or self._t_cache_cos.device != device or self._t_cache_cos.dtype != dtype:
+            cos, sin = self._build_sin_cos(T, self.dt, device, dtype)
+            self._t_cache_cos = cos
+            self._t_cache_sin = sin
+            self._t_cache_len = T
+        cos_t = self._t_cache_cos[:T]
+        sin_t = self._t_cache_sin[:T]
+
+        # cache sin/cos for freq
+        if Freq > self._f_cache_len or self._f_cache_cos.device != device or self._f_cache_cos.dtype != dtype:
+            cos, sin = self._build_sin_cos(Freq, self.df, device, dtype)
+            self._f_cache_cos = cos
+            self._f_cache_sin = sin
+            self._f_cache_len = Freq
+        cos_f = self._f_cache_cos[:Freq]
+        sin_f = self._f_cache_sin[:Freq]
+
+        # split dims
+        q_t, q_f = q[..., :self.dt], q[..., self.dt:self.dt + self.df]
+        k_t, k_f = k[..., :self.dt], k[..., self.dt:self.dt + self.df]
+
+        # apply time rope on first half
+        q_t = self._apply_rotary(q_t, cos_t, sin_t, axis="t")
+        k_t = self._apply_rotary(k_t, cos_t, sin_t, axis="t")
+
+        # apply freq rope on second half
+        q_f = self._apply_rotary(q_f, cos_f, sin_f, axis="f")
+        k_f = self._apply_rotary(k_f, cos_f, sin_f, axis="f")
+
+        q = torch.cat([q_t, q_f], dim=-1)
+        k = torch.cat([k_t, k_f], dim=-1)
+        return q, k
+
+
+# ---------------------------
+# Full 2D MHSA over TF tokens
+# ---------------------------
+class MHSA2D(nn.Module):
+    """
+    Full self-attention over TF grid.
+    Input/Output: (B,C,T,F)
+
+    Tokenization is implicit: N = T*F.
+    Uses 2D RoPE for position.
+    """
+    def __init__(self, channels: int, heads: int = 8, attn_drop: float = 0.0, proj_drop: float = 0.0):
         super().__init__()
         self.channels = int(channels)
+        self.heads = int(heads)
+        if self.channels % self.heads != 0:
+            raise ValueError("channels must be divisible by heads.")
+        self.head_dim = self.channels // self.heads
 
-        self.ln_t = nn.LayerNorm(channels)
-        self.attn_t = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, dropout=dropout, batch_first=True)
+        self.qkv = nn.Linear(self.channels, 3 * self.channels, bias=True)
+        self.proj = nn.Linear(self.channels, self.channels, bias=True)
 
-        self.ln_f = nn.LayerNorm(channels)
-        self.attn_f = nn.MultiheadAttention(embed_dim=channels, num_heads=heads, dropout=dropout, batch_first=True)
+        self.attn_drop = float(attn_drop)
+        self.proj_drop = nn.Dropout(float(proj_drop))
 
-        # FFN (2D pointwise)
-        hid = int(channels * ff_mult)
-        self.gn = nn.GroupNorm(1, channels)  # стабильнее BN при маленьком batch
-        self.ff = nn.Sequential(
-            nn.Conv2d(channels, hid, kernel_size=1),
-            nn.GELU(),
-            nn.Conv2d(hid, channels, kernel_size=1),
-        )
+        self.rope2d = Rotary2D(self.head_dim)
 
     def forward(self, x: Tensor) -> Tensor:
         # x: (B,C,T,F)
         B, C, T, Freq = x.shape
+        N = T * Freq
 
-        # ---- time-attn: (B*F, T, C) ----
-        xt = x.permute(0, 3, 2, 1).contiguous().view(B * Freq, T, C)
-        xtn = self.ln_t(xt)
-        ot, _ = self.attn_t(xtn, xtn, xtn, need_weights=False)
-        xt = xt + ot
-        x = xt.view(B, Freq, T, C).permute(0, 3, 2, 1).contiguous()  # back to (B,C,T,F)
+        # (B,C,T,F) -> (B,N,C)
+        xt = x.permute(0, 2, 3, 1).contiguous().view(B, N, C)
 
-        # ---- freq-attn: (B*T, F, C) ----
-        xf = x.permute(0, 2, 3, 1).contiguous().view(B * T, Freq, C)
-        xfn = self.ln_f(xf)
-        of, _ = self.attn_f(xfn, xfn, xfn, need_weights=False)
-        xf = xf + of
-        x = xf.view(B, T, Freq, C).permute(0, 3, 1, 2).contiguous()  # (B,C,T,F)
+        qkv = self.qkv(xt)  # (B,N,3C)
+        qkv = qkv.view(B, N, 3, self.heads, self.head_dim).permute(2, 0, 3, 1, 4)  # (3,B,H,N,D)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # (B,H,N,D)
 
-        # ---- FFN ----
-        y = self.ff(self.gn(x))
-        return x + y
+        # reshape to 2D grid for RoPE: (B,H,T,F,D)
+        q2 = q.view(B, self.heads, T, Freq, self.head_dim)
+        k2 = k.view(B, self.heads, T, Freq, self.head_dim)
+        q2, k2 = self.rope2d(q2, k2)
+        q = q2.view(B, self.heads, N, self.head_dim)
+        k = k2.view(B, self.heads, N, self.head_dim)
 
-
-class AxialTrunk(nn.Module):
-    def __init__(self, channels: int, num_layers: int = 5, heads: int = 4, ff_mult: int = 2, dropout: float = 0.0):
-        super().__init__()
-        self.blocks = nn.Sequential(
-            *[AxialMHSA2DBlock(channels, heads=heads, ff_mult=ff_mult, dropout=dropout) for _ in range(int(num_layers))]
+        # SDPA (quality-first; heavy at large N)
+        # out: (B,H,N,D)
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.attn_drop if self.training else 0.0,
+            is_causal=False,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.blocks(x)
+        out = out.transpose(1, 2).contiguous().view(B, N, C)  # (B,N,C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        # back to (B,C,T,F)
+        out = out.view(B, T, Freq, C).permute(0, 3, 1, 2).contiguous()
+        return out
 
 
-class HeadAdapter(nn.Module):
+# ---------------------------
+# Conformer-style conv module on 2D map
+# ---------------------------
+class ConvModule2D(nn.Module):
     """
-    Input:  shared features (B,64,T,F)
-    Output: CCM mask         (B,27,T,F)
-
-    "attention" here is cheap CBAM-like:
-      - channel gate (SE)
-      - spatial gate (avg/max -> conv -> sigmoid)
+    Conformer conv module adapted to (B,C,T,F):
+      pw -> GLU -> dwconv(k_t,k_f) -> norm -> SiLU -> pw
     """
-    def __init__(self, in_ch: int = 64, bottleneck: int = 32, se_ratio: int = 4, spatial_ks: int = 7) -> None:
+    def __init__(self, channels: int, k_t: int = 7, k_f: int = 3, drop: float = 0.0):
         super().__init__()
-        in_ch = int(in_ch)
-        bottleneck = int(bottleneck)
+        C = int(channels)
+        self.pw1 = nn.Conv2d(C, 2 * C, kernel_size=1)
+        self.dw = nn.Conv2d(C, C, kernel_size=(k_t, k_f), padding=(k_t // 2, k_f // 2), groups=C)
+        self.n = nn.GroupNorm(1, C)
+        self.pw2 = nn.Conv2d(C, C, kernel_size=1)
+        self.drop = nn.Dropout(float(drop))
 
-        self.pre = nn.Conv2d(in_ch, bottleneck, kernel_size=1)
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.pw1(x)
+        y = swiglu(y)            # GLU-ish with SiLU gate
+        y = self.dw(y)
+        y = self.n(y)
+        y = F.silu(y)
+        y = self.pw2(y)
+        y = self.drop(y)
+        return y
 
-        # channel attention (SE)
-        hid = max(1, bottleneck // int(se_ratio))
-        self.se1 = nn.Conv2d(bottleneck, hid, kernel_size=1)
-        self.se2 = nn.Conv2d(hid, bottleneck, kernel_size=1)
+
+# ---------------------------
+# FFN (SwiGLU) on 2D map
+# ---------------------------
+class FFN2D(nn.Module):
+    def __init__(self, channels: int, mult: int = 4, drop: float = 0.0):
+        super().__init__()
+        C = int(channels)
+        H = int(C * mult)
+        self.fc1 = nn.Conv2d(C, 2 * H, kernel_size=1)
+        self.fc2 = nn.Conv2d(H, C, kernel_size=1)
+        self.drop = nn.Dropout(float(drop))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.fc1(x)
+        y = swiglu(y)    # -> (B,H,T,F)
+        y = self.drop(y)
+        y = self.fc2(y)
+        y = self.drop(y)
+        return y
+
+
+# ---------------------------
+# TF-Conformer block: (FFN/2) + MHSA2D + Conv + (FFN/2)
+# ---------------------------
+class TFConformerBlock(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        heads: int = 8,
+        ff_mult: int = 4,
+        attn_drop: float = 0.0,
+        drop: float = 0.0,
+        drop_path: float = 0.0,
+        conv_k_t: int = 7,
+        conv_k_f: int = 3,
+        layer_scale: float = 1e-2,
+    ):
+        super().__init__()
+        C = int(channels)
+
+        self.n1 = LayerNorm2D(C)
+        self.ff1 = FFN2D(C, mult=ff_mult, drop=drop)
+
+        self.n2 = LayerNorm2D(C)
+        self.mhsa = MHSA2D(C, heads=heads, attn_drop=attn_drop, proj_drop=drop)
+
+        self.n3 = LayerNorm2D(C)
+        self.conv = ConvModule2D(C, k_t=conv_k_t, k_f=conv_k_f, drop=drop)
+
+        self.n4 = LayerNorm2D(C)
+        self.ff2 = FFN2D(C, mult=ff_mult, drop=drop)
+
+        self.dp = DropPath(drop_path)
+
+        # LayerScale (очень стабилизирует глубокие трансформеры для аудио)
+        self.g1 = nn.Parameter(torch.ones(1, C, 1, 1) * layer_scale)
+        self.g2 = nn.Parameter(torch.ones(1, C, 1, 1) * layer_scale)
+        self.g3 = nn.Parameter(torch.ones(1, C, 1, 1) * layer_scale)
+        self.g4 = nn.Parameter(torch.ones(1, C, 1, 1) * layer_scale)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # FFN half
+        x = x + 0.5 * self.dp(self.g1 * self.ff1(self.n1(x)))
+        # MHSA
+        x = x + self.dp(self.g2 * self.mhsa(self.n2(x)))
+        # Conv module
+        x = x + self.dp(self.g3 * self.conv(self.n3(x)))
+        # FFN half
+        x = x + 0.5 * self.dp(self.g4 * self.ff2(self.n4(x)))
+        return x
+
+
+# ---------------------------
+# Trunk
+# ---------------------------
+class TFConformerTrunk(nn.Module):
+    """
+    Quality-first trunk for (B,128,T,F5):
+      - explicit freq embedding
+      - conv positional encoding
+      - deep TF-Conformer blocks with full 2D attention
+    """
+    def __init__(
+        self,
+        channels: int = 128,
+        depth: int = 8,
+        heads: int = 8,
+        ff_mult: int = 4,
+        conv_k_t: int = 9,
+        conv_k_f: int = 5,
+        drop: float = 0.1,
+        attn_drop: float = 0.0,
+        drop_path: float = 0.1,
+        max_freq_bins: int = 64,
+    ):
+        super().__init__()
+        C = int(channels)
+        self.max_freq_bins = int(max_freq_bins)
+
+        # learnable freq embedding (лечит "F превратился в batch" проблему и даёт специализацию)
+        self.f_emb = nn.Parameter(torch.zeros(1, C, 1, self.max_freq_bins))
+        nn.init.normal_(self.f_emb, std=0.02)
+
+        # conv positional encoding (локальная позиционка по T/F)
+        self.pos = nn.Conv2d(C, C, kernel_size=3, padding=1, groups=C)
+
+        blocks = []
+        for i in range(int(depth)):
+            # линейный рост drop_path по глубине
+            dpr = drop_path * (i / max(1, depth - 1))
+            blocks.append(
+                TFConformerBlock(
+                    channels=C,
+                    heads=int(heads),
+                    ff_mult=int(ff_mult),
+                    attn_drop=float(attn_drop),
+                    drop=float(drop),
+                    drop_path=float(dpr),
+                    conv_k_t=int(conv_k_t),
+                    conv_k_f=int(conv_k_f),
+                    layer_scale=1e-2,
+                )
+            )
+        self.blocks = nn.Sequential(*blocks)
+        self.out_norm = LayerNorm2D(C)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: (B,C,T,F)
+        B, C, T, Freq = x.shape
+        if Freq > self.max_freq_bins:
+            raise ValueError(f"Freq bins in trunk ({Freq}) > max_freq_bins ({self.max_freq_bins}). Increase max_freq_bins.")
+
+        x = x + self.f_emb[..., :Freq]
+        x = x + self.pos(x)
+
+        x = self.blocks(x)
+        x = self.out_norm(x)
+        return x
+
+
+
+def gn1(ch: int) -> nn.Module:
+    return nn.GroupNorm(1, ch)
+
+
+class HeadAdapterDWGLU(nn.Module):
+    """
+    Head adapter v2:
+      pre -> (residual CBAM gate) -> (DWConv + GLU residual) -> out(27)
+
+    Input:  (B,64,T,F)
+    Output: (B,27,T,F)
+    """
+    def __init__(self, in_ch: int = 64, bottleneck: int = 48, spatial_ks: int = 7, dw_ks: int = 3, se_ratio: int = 4):
+        super().__init__()
+        bn = int(bottleneck)
+
+        self.pre = nn.Conv2d(in_ch, bn, kernel_size=1)
+
+        # ---------- CBAM-like attention (residual gating) ----------
+        hid = max(1, bn // int(se_ratio))
+        self.se1 = nn.Conv2d(bn, hid, kernel_size=1)
+        self.se2 = nn.Conv2d(hid, bn, kernel_size=1)
         self.se_act = nn.ELU()
 
-        # spatial attention
         ks = int(spatial_ks)
         pad = ks // 2
         self.sa = nn.Sequential(
@@ -494,26 +818,71 @@ class HeadAdapter(nn.Module):
             nn.Conv2d(2, 1, kernel_size=ks),
         )
 
-        # 1x1 to CCM mask
-        self.out = nn.Conv2d(bottleneck, 27, kernel_size=1)
+        # ---------- Local residual block: DWConv + GLU ----------
+        k = int(dw_ks)
+        p = k // 2
+        self.dw = nn.Conv2d(bn, bn, kernel_size=k, padding=p, groups=bn)
+        self.n1 = gn1(bn)
+
+        # pointwise -> GLU
+        self.pw_in = nn.Conv2d(bn, 2 * bn, kernel_size=1)
+        self.glu = nn.GLU(dim=1)  # (B,2*bn,T,F) -> (B,bn,T,F)
+
+        self.pw_out = nn.Conv2d(bn, bn, kernel_size=1)
+        self.n2 = gn1(bn)
+
+        self.act = nn.GELU()
+
+        # output
+        self.out = nn.Conv2d(bn, 27, kernel_size=1)
+
+        # ---- init: zero-init out so early training is stable ----
+        nn.init.zeros_(self.out.weight)
+        if self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
+
+        # (опционально) сделать residual-блок тоже близким к identity на старте:
+        nn.init.zeros_(self.pw_out.weight)
+        if self.pw_out.bias is not None:
+            nn.init.zeros_(self.pw_out.bias)
+
+    def _cbam_gate(self, x: Tensor) -> Tensor:
+        # x: (B,bn,T,F)
+
+        # channel gate
+        w = x.mean(dim=(2, 3), keepdim=True)   # (B,bn,1,1)
+        w = self.se_act(self.se1(w))
+        w = torch.sigmoid(self.se2(w))         # (B,bn,1,1)
+
+        # spatial gate
+        a = x.mean(dim=1, keepdim=True)        # (B,1,T,F)
+        m = x.amax(dim=1, keepdim=True)        # (B,1,T,F)
+        s = torch.sigmoid(self.sa(torch.cat([a, m], dim=1)))  # (B,1,T,F)
+
+        # residual gating (важно! не убиваем x)
+        x = x * (1.0 + w)
+        x = x * (1.0 + s)
+        return x
 
     def forward(self, feat: Tensor) -> Tensor:
         # feat: (B,64,T,F)
-        x = self.pre(feat)  # (B,bn,T,F)
+        x = self.pre(feat)          # (B,bn,T,F)
 
-        # --- channel gate ---
-        w = x.mean(dim=(2, 3), keepdim=True)         # (B,bn,1,1)
-        w = self.se_act(self.se1(w))
-        w = torch.sigmoid(self.se2(w))
-        x = x * w
+        # attention first (как ты хочешь), но в residual форме
+        x = self._cbam_gate(x)
 
-        # --- spatial gate ---
-        a = x.mean(dim=1, keepdim=True)              # (B,1,T,F)
-        m = x.amax(dim=1, keepdim=True)              # (B,1,T,F)
-        s = torch.sigmoid(self.sa(torch.cat([a, m], dim=1)))  # (B,1,T,F)
-        x = x * s
+        # DWConv+GLU residual block
+        r = x
+        y = self.dw(x)
+        y = self.act(self.n1(y))
+        y = self.pw_in(y)
+        y = self.glu(y)
+        y = self.pw_out(y)
+        y = self.n2(y)
 
-        return self.out(x)  # (B,27,T,F)
+        x = r + y
+
+        return self.out(x)          # (B,27,T,F)
 
 
 class DeepVQEConditionalStemSeparator(nn.Module):
@@ -568,13 +937,17 @@ class DeepVQEConditionalStemSeparator(nn.Module):
             y = self.enblock5(self.enblock4(self.enblock3(self.enblock2(self.enblock1(dummy)))))
             self.F5 = int(y.shape[-1])
 
-        # ---- NEW: axial trunk (shared) instead of GRU bottleneck ----
-        self.trunk = AxialTrunk(
+        self.trunk = TFConformerTrunk(
             channels=128,
-            num_layers=int(trunk_layers),
-            heads=int(trunk_heads),
-            ff_mult=2,
-            dropout=0.0,
+            depth=12,
+            heads=8,
+            ff_mult=4,
+            conv_k_t=9,
+            conv_k_f=5,
+            drop=0.1,
+            attn_drop=0.0,
+            drop_path=0.1,
+            max_freq_bins=self.F5,
         )
 
         # shared decoder (unchanged topology), but LAST outputs 64-ch features
@@ -582,11 +955,11 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         self.deblock4 = DecoderBlock(128, 128)
         self.deblock3 = DecoderBlock(128, 128)
         self.deblock2 = DecoderBlock(128, 64)
-        self.deblock1 = DecoderBlock(64, 64, is_last=False)  # <-- was 27, now 64
+        self.deblock1 = DecoderBlock(64, 64, is_last=False)
 
         # per-head adapters + CCM per head
         S = self.num_heads_total
-        self.adapters = nn.ModuleList([HeadAdapter(in_ch=64, bottleneck=32) for _ in range(S)])
+        self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64) for _ in range(S)])
         self.ccms = nn.ModuleList([CCM() for _ in range(S)])  # "per-head CCM"
 
     def forward(self, mix_ri: Tensor, ref_ri: Tensor, ref_valid: Tensor | None = None) -> Tensor:
