@@ -10,6 +10,7 @@ import soundfile as sf
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, get_worker_info
+from torch.backends.cuda import sdp_kernel
 from tqdm import tqdm
 from deepvqe import DeepVQEConditionalStemSeparator
 import os, random
@@ -1212,6 +1213,7 @@ def main():
 
     # Enable TF32
     ap.add_argument("--enable-tf32", action="store_true")
+    ap.add_argument("--bf16", action="store_true", default=False)
 
     ap.add_argument("--sr", type=int, default=48000)
     ap.add_argument("--segment-sec", type=float, default=4.0)
@@ -1340,6 +1342,8 @@ def main():
             seed=args.seed,
             drop_last=(len(ds) >= args.batch),
         )
+
+    use_bf16 = bool(args.bf16) and (device.type == "cuda")
 
     dl = DataLoader(
         ds,
@@ -1508,7 +1512,10 @@ def main():
                     dim=1,
                 )  # (N,4,F,Tf,2)
 
-            pred = model(mix_ri, ref_ri, ref_valid=ref_valid_n)
+            with sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                    pred = model(mix_ri, ref_ri, ref_valid=ref_valid_n)
+
             pred_main = pred[:, :4]  # (N,4,F,Tf,2)
 
             # --- stem loss (L1 in RI) ---
