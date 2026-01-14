@@ -388,11 +388,35 @@ class Recipe:
     ref_required_stems: Tuple[str, ...]
     ref_available_stems: Tuple[str, ...]
     ref_gain_db: Tuple[Tuple[str, float, float], ...]  # ref gain (dB)
+    ref_shift_ms: Tuple[float, float] = (0.0, 0.0)
 
     # optional: подмешать "чужой" стем в ref (из другой песни, которого нет в full)
     foreign_ref_prob: float
     foreign_ref_stem_choices: Tuple[str, ...]          # e.g. ("music",) or ("bass","drums","music","vocals")
     foreign_gain_db: Tuple[Tuple[str, float, float], ...]  # foreign gain (dB)
+
+    @staticmethod
+    def _parse_range_ms(d: Dict[str, Any], field: str) -> Tuple[float, float]:
+        v = d.get(field, None)
+        if v is None:
+            return (0.0, 0.0)
+
+        # allow number -> fixed shift
+        if isinstance(v, (int, float)):
+            x = float(v)
+            return (x, x)
+
+        if not isinstance(v, dict):
+            raise ValueError(f"{field} must be number or {{min,max}}, got {type(v).__name__}")
+
+        if "min" not in v or "max" not in v:
+            raise ValueError(f"{field} must contain min/max")
+
+        mn = float(v["min"])
+        mx = float(v["max"])
+        if mn > mx:
+            raise ValueError(f"{field} min > max: {mn} > {mx}")
+        return (mn, mx)
 
     @staticmethod
     def _parse_gain_block(d: Dict[str, Any], field: str) -> Tuple[Tuple[str, float, float], ...]:
@@ -448,7 +472,12 @@ class Recipe:
 
         foreign_gain_db = Recipe._parse_gain_block(d, "foreign_gain")
 
+        ref_shift_ms = Recipe._parse_range_ms(d, "ref_shift_ms")
+
         # --- validations ---
+        if typ != "conditional" and d.get("ref_shift_ms") is not None:
+            raise ValueError("ref_shift_ms is only allowed for conditional recipes")
+
         if mode not in ("fixed", "random", "random_within_track"):
             raise ValueError(f"stem_sum_mode must be fixed|random|random_within_track, got {mode!r}")
         if mix_in not in ("stem_sum", "full"):
@@ -466,6 +495,7 @@ class Recipe:
                 raise ValueError(f"ref_stem_count must be 1..4, got {ref_stem_count}")
             if len(ref_req) > ref_stem_count:
                 raise ValueError("ref_stem_count < len(ref_required_stems)")
+
         else:
             if stem_count < 1 or stem_count > 4:
                 raise ValueError(f"stem_count must be 1..4, got {stem_count}")
@@ -479,6 +509,7 @@ class Recipe:
             foreign_ref_prob=foreign_ref_prob,
             foreign_ref_stem_choices=foreign_ref_stem_choices,
             foreign_gain_db=foreign_gain_db,
+            ref_shift_ms=ref_shift_ms,
         )
 
     def _pick_from(self, rng: np.random.Generator, count: int, req: Tuple[str, ...], avl: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -747,6 +778,27 @@ class FlexibleMixDataset(Dataset):
             # умножаем волну (2,T)
             tgt[stem] = tgt[stem] * float(g)
 
+    @staticmethod
+    def _time_shift_2ch(x: torch.Tensor, shift: int) -> torch.Tensor:
+        """
+        x: (2,T) float
+        shift > 0  -> delay (pad left with zeros)
+        shift < 0  -> advance (pad right with zeros)
+        """
+        if shift == 0:
+            return x
+        T = x.shape[1]
+        if abs(shift) >= T:
+            return torch.zeros_like(x)
+
+        if shift > 0:
+            pad = torch.zeros((2, shift), dtype=x.dtype)
+            return torch.cat([pad, x[:, :T - shift]], dim=1)
+        else:
+            s = -shift
+            pad = torch.zeros((2, s), dtype=x.dtype)
+            return torch.cat([x[:, s:], pad], dim=1)
+
     def __getitem__(self, idx: int):
         rng = self._rng_for_item(idx)
         recipe = self.book.sample_recipe(rng, epoch=self._epoch)
@@ -868,6 +920,13 @@ class FlexibleMixDataset(Dataset):
             ref = torch.zeros((2, self.seg_len), dtype=torch.float32)
             for s in ref_stems:
                 ref = ref + tgt[s]
+
+            # ---- ref shift augmentation (ref input only) ----
+            mn_ms, mx_ms = recipe.ref_shift_ms
+            if (mn_ms != 0.0) or (mx_ms != 0.0):
+                ms = float(rng.uniform(mn_ms, mx_ms)) if mx_ms != mn_ms else float(mn_ms)
+                shift = int(round(ms * self.sr / 1000.0))  # samples
+                ref = self._time_shift_2ch(ref, shift)
 
             # ref_target = sum(complement_stems)
             ref_target = torch.zeros((2, self.seg_len), dtype=torch.float32)
