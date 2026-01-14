@@ -388,12 +388,12 @@ class Recipe:
     ref_required_stems: Tuple[str, ...]
     ref_available_stems: Tuple[str, ...]
     ref_gain_db: Tuple[Tuple[str, float, float], ...]  # ref gain (dB)
-    ref_shift_ms: Tuple[float, float] = (0.0, 0.0)
 
     # optional: подмешать "чужой" стем в ref (из другой песни, которого нет в full)
     foreign_ref_prob: float
     foreign_ref_stem_choices: Tuple[str, ...]          # e.g. ("music",) or ("bass","drums","music","vocals")
     foreign_gain_db: Tuple[Tuple[str, float, float], ...]  # foreign gain (dB)
+    ref_shift_ms: Tuple[float, float]
 
     @staticmethod
     def _parse_range_ms(d: Dict[str, Any], field: str) -> Tuple[float, float]:
