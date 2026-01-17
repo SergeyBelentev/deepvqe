@@ -1075,6 +1075,41 @@ def _upgrade_head_4_to_5(sd: Dict[str, Any], *, prefix: str = "") -> Dict[str, A
     return sd
 
 
+def reinit_head_adapter(adapter: nn.Module) -> None:
+    """
+    DDP-safe: не заменяем модуль, а сбрасываем параметры его слоёв.
+    Восстанавливаем важные init-хаки из __init__ (zero-init out/pw_out).
+    """
+    # 1) reset conv/linear
+    for m in adapter.modules():
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            m.reset_parameters()
+        elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
+            if m.weight is not None:
+                nn.init.ones_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+
+    # 2) повторяем "стабилизирующий" zero-init как в HeadAdapterDWGLU.__init__()
+    # out: нули
+    if hasattr(adapter, "out") and isinstance(adapter.out, nn.Conv2d):
+        nn.init.zeros_(adapter.out.weight)
+        if adapter.out.bias is not None:
+            nn.init.zeros_(adapter.out.bias)
+
+    # pw_out: нули (residual блок близок к identity на старте)
+    if hasattr(adapter, "pw_out") and isinstance(adapter.pw_out, nn.Conv2d):
+        nn.init.zeros_(adapter.pw_out.weight)
+        if adapter.pw_out.bias is not None:
+            nn.init.zeros_(adapter.pw_out.bias)
+
+
+def reset_optimizer_state_for_module(opt: torch.optim.Optimizer, module: nn.Module) -> None:
+    for p in module.parameters():
+        if p in opt.state:
+            opt.state.pop(p, None)
+
+
 def load_shape_compatible(
     model: torch.nn.Module,
     ckpt_path: str,
@@ -1123,6 +1158,10 @@ def load_shape_compatible(
     print("[init] loaded keys:", len(take))
     print("[init] missing:", len(missing), "unexpected:", len(unexpected))
 
+
+def set_requires_grad(module: nn.Module, flag: bool) -> None:
+    for p in module.parameters():
+        p.requires_grad_(flag)
 
 
 def load_ckpt(path: str, device: torch.device) -> Dict[str, Any]:
@@ -1265,6 +1304,9 @@ def main():
     ap.add_argument("--epochs", type=int, default=10)
     ap.add_argument("--save-every-epochs", type=int, default=1)
 
+    ap.add_argument("--freeze-models-without-adapaters", action="store_true", default=False)
+
+    ap.add_argument("--reinit-adapters", action="store_true", default=False)
     ap.add_argument("--load-shape-compatible", action="store_true", default=False)
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--reset-opt", action="store_true")
@@ -1508,6 +1550,31 @@ def main():
             global_step = int(ckpt.get("global_step", 0))
             print(f"[resume] loaded {args.resume}")
             print(f"[resume] will start from epoch={start_epoch}")
+
+        # пример: реинициализировать адаптеры после resume
+        if getattr(args, "reinit_adapters", False):
+            raw_model = model.module if isinstance(model, DDP) else model
+
+            # (опционально) фиксируем seed, чтобы init был детерминирован
+            torch.manual_seed(args.seed + 777)
+
+            for i, ad in enumerate(raw_model.adapters):
+                reinit_head_adapter(ad)
+
+            print(f"[reinit] adapters reset: {len(raw_model.adapters)}")
+            for ad in raw_model.adapters:
+                reset_optimizer_state_for_module(opt, ad)
+            print("[reinit] optimizer state cleared for adapters")
+
+        if getattr(args, "freeze_models_without_adapaters", False):
+            raw_model = model.module if isinstance(model, DDP) else model
+            set_requires_grad(raw_model, False)
+            for ad in raw_model.adapters:
+                set_requires_grad(ad, True)
+            # если хочешь чуть гибче: можно оставить обучаемым deblock1
+            set_requires_grad(raw_model.deblock1, True)
+            print("[reinit] frozen everything except adapters (+deblock1)")
+
 
     if start_epoch > args.epochs:
         print(f"[info] nothing to do: start_epoch={start_epoch} > --epochs={args.epochs}")
