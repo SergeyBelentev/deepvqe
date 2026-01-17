@@ -159,6 +159,96 @@ def make_hann_ola(win_len: int, device: torch.device) -> torch.Tensor:
     return w.clamp_min(1e-8)
 
 
+# -----------------------
+# Residual U-Net debug tap (forward_hook)
+# -----------------------
+class ResidualUnetTap:
+    """
+    Hooks every module in model.residual_unets and captures:
+      - inputs (tuple): we expect (d1_i, y_ccm_i) per your design
+      - output: what the U-Net returns (often residual in RI)
+    Works per forward() call: call .reset() before model(...)
+    """
+    def __init__(self, model: nn.Module):
+        self.model = model
+        self.last_out: Dict[int, Any] = {}
+        self.last_inp: Dict[int, Any] = {}
+        self.handles = []
+
+        if not hasattr(model, "residual_unets"):
+            raise RuntimeError("Model has no attribute 'residual_unets' (nothing to tap).")
+
+        for i, m in enumerate(getattr(model, "residual_unets")):
+            self.handles.append(m.register_forward_hook(self._make_hook(i)))
+
+    def _make_hook(self, i: int):
+        def hook(mod, inp, out):
+            self.last_inp[i] = inp
+            self.last_out[i] = out
+        return hook
+
+    def reset(self) -> None:
+        self.last_inp.clear()
+        self.last_out.clear()
+
+    def close(self) -> None:
+        for h in self.handles:
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.handles.clear()
+
+
+def _pick_tensor(x: Any) -> Optional[torch.Tensor]:
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, (tuple, list)) and len(x) > 0 and isinstance(x[0], torch.Tensor):
+        return x[0]
+    return None
+
+
+def _to_ri_layout(t: torch.Tensor) -> Optional[torch.Tensor]:
+    """
+    Try to coerce tensor to RI layout (N,F,Tf,2) needed by istft_ri().
+    Supports common variants:
+      - (N,F,Tf,2)  -> ok
+      - (N,2,Tf,F)  -> permute to (N,F,Tf,2)
+    Returns None if it's not RI-like.
+    """
+    if not isinstance(t, torch.Tensor):
+        return None
+    if t.ndim != 4:
+        return None
+
+    # already (N,F,Tf,2)
+    if t.shape[-1] == 2:
+        return t
+
+    # maybe (N,2,Tf,F)
+    if t.shape[1] == 2:
+        return t.permute(0, 3, 2, 1).contiguous()
+
+    return None
+
+
+def _ri_to_stereo(stft: STFT, ri: torch.Tensor, *, length: int) -> Optional[torch.Tensor]:
+    """
+    ri: (N,F,Tf,2) where N==2 (stereo channels treated as batch).
+    returns: (2,length)
+    """
+    ri = _to_ri_layout(ri)
+    if ri is None:
+        return None
+    if ri.shape[0] != 2:
+        # your infer uses N=2 (stereo). If not, we skip.
+        return None
+
+    wav = stft.istft_ri(ri.float(), length=length)  # (2,length)
+    return wav
+
+
+
 @torch.no_grad()
 def infer_ola(
     model: DeepVQEConditionalStemSeparator,
@@ -174,7 +264,9 @@ def infer_ola(
     stitch: str = "ola",
     keep_frac: float = 0.6,
     xfade_ms: float = 0.0,
-) -> Dict[str, torch.Tensor]:
+    unet_tap: Optional[ResidualUnetTap] = None,
+    unet_dump_what: str = "both",
+) -> tuple[Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]]]:
     """
     Returns dict head->(2,T) in float32 on CPU.
     Heads: bass, drums, music, vocals
@@ -205,6 +297,11 @@ def infer_ola(
     if chunk_len <= 0:
         raise ValueError("chunk_sec too small")
 
+    # debug buffers (time-domain) for U-Net input/output
+    dbg_out = None   # (S,2,T_pad)
+    dbg_yccm = None  # (S,2,T_pad)
+
+
     def pred_to_time(pred: torch.Tensor, length: int) -> torch.Tensor:
         """
         pred: (2,S,F,Tf,2)
@@ -230,13 +327,21 @@ def infer_ola(
         else:
             ref_valid = torch.ones((N,), device=mix_ri.device, dtype=torch.bool)
 
+        if unet_tap is not None:
+            unet_tap.reset()
+
         return model(mix_ri, ref_ri, ref_valid=ref_valid)
 
-    def run_model_on_chunk(chunk: torch.Tensor, ref_chunk: Optional[torch.Tensor]) -> torch.Tensor:
+    def run_model_on_chunk(chunk: torch.Tensor, ref_chunk: Optional[torch.Tensor]) -> tuple[
+        torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """
         chunk: (2,chunk_len) float32 on device
         ref_chunk: (2,chunk_len) float32 on device or None
-        returns y: (4,2,chunk_len) float32 on device
+        returns:
+          y: (S,2,chunk_len) float32 on device
+          dbg: dict with optional keys:
+               - "unet_out": (S,2,chunk_len)
+               - "unet_yccm": (S,2,chunk_len)
         """
         mix_ri = stft.stft_ri(chunk)  # (2,F,Tf,2)
         ref_ri = stft.stft_ri(ref_chunk) if (ref_chunk is not None) else None
@@ -247,8 +352,52 @@ def infer_ola(
         else:
             pred = call_model(mix_ri, ref_ri)
 
-        return pred_to_time(pred, length=chunk_len)
+        y_time = pred_to_time(pred, length=chunk_len)
 
+        dbg = None
+        if unet_tap is not None and (unet_dump_what in ("out", "yccm", "both")):
+            # determine how many heads U-Net has
+            n_unet = 0
+            if hasattr(model, "residual_unets"):
+                n_unet = len(getattr(model, "residual_unets"))
+            n_unet = int(max(0, n_unet))
+
+            # build per-head tensors (time-domain)
+            outs = []
+            yccms = []
+
+            for hi in range(n_unet):
+                # U-Net output
+                out_t = _pick_tensor(unet_tap.last_out.get(hi, None))
+                out_wav = _ri_to_stereo(stft, out_t, length=chunk_len) if out_t is not None else None
+
+                # U-Net 2nd input (expected y_ccm_i)
+                inp = unet_tap.last_inp.get(hi, None)
+                yccm_t = None
+                if isinstance(inp, (tuple, list)) and len(inp) >= 2 and isinstance(inp[1], torch.Tensor):
+                    yccm_t = inp[1]
+                yccm_wav = _ri_to_stereo(stft, yccm_t, length=chunk_len) if yccm_t is not None else None
+
+                if out_wav is None and yccm_wav is None:
+                    continue
+
+                # both are (2,L). Make them consistent.
+                if out_wav is None:
+                    out_wav = torch.zeros((2, chunk_len), device=device, dtype=torch.float32)
+                if yccm_wav is None:
+                    yccm_wav = torch.zeros((2, chunk_len), device=device, dtype=torch.float32)
+
+                outs.append(out_wav)
+                yccms.append(yccm_wav)
+
+            if outs or yccms:
+                dbg = {}
+                if unet_dump_what in ("out", "both") and outs:
+                    dbg["unet_out"] = torch.stack(outs, dim=0)  # (S_unet,2,L)
+                if unet_dump_what in ("yccm", "both") and yccms:
+                    dbg["unet_yccm"] = torch.stack(yccms, dim=0)  # (S_unet,2,L)
+
+        return y_time, dbg
 
     # -----------------------
     # Mode 0: full inference (single pass, no windows)
@@ -278,7 +427,40 @@ def infer_ola(
         if S == 5:
             names += ["ref"]
 
-        return {names[i] if i < len(names) else f"head{i}": y[i] for i in range(S)}
+        stems = {names[i] if i < len(names) else f"head{i}": y[i] for i in range(S)}
+
+        dbg_ret = None
+        if unet_tap is not None and (unet_dump_what in ("out", "yccm", "both")):
+            dbg_ret = {}
+
+            # map unet heads to names (best effort)
+            n_unet = len(getattr(model, "residual_unets")) if hasattr(model, "residual_unets") else 0
+            unet_names = names[:n_unet]
+
+            if unet_dump_what in ("out", "both"):
+                tmp = {}
+                for hi in range(n_unet):
+                    out_t = _pick_tensor(unet_tap.last_out.get(hi, None))
+                    out_wav = _ri_to_stereo(stft, out_t, length=T) if out_t is not None else None
+                    if out_wav is not None:
+                        tmp[unet_names[hi]] = out_wav.detach().cpu()
+                if tmp:
+                    dbg_ret["unet_out"] = tmp
+
+            if unet_dump_what in ("yccm", "both"):
+                tmp = {}
+                for hi in range(n_unet):
+                    inp = unet_tap.last_inp.get(hi, None)
+                    yccm_t = None
+                    if isinstance(inp, (tuple, list)) and len(inp) >= 2 and isinstance(inp[1], torch.Tensor):
+                        yccm_t = inp[1]
+                    yccm_wav = _ri_to_stereo(stft, yccm_t, length=T) if yccm_t is not None else None
+                    if yccm_wav is not None:
+                        tmp[unet_names[hi]] = yccm_wav.detach().cpu()
+                if tmp:
+                    dbg_ret["unet_yccm"] = tmp
+
+        return stems, dbg_ret
 
     # -----------------------
     # Mode 1: classic OLA (fixed normalization: wsum += win)
@@ -313,23 +495,68 @@ def infer_ola(
             chunk = x_pad[:, s:e]
             ref_chunk = ref_pad[:, s:e] if (ref_pad is not None) else None
 
-            y = run_model_on_chunk(chunk, ref_chunk)  # (S,2,L)
+            y, dbg = run_model_on_chunk(chunk, ref_chunk)  # y: (S,2,L), dbg optional
 
             if out is None:
                 S = y.shape[0]
                 out = torch.zeros((S, 2, T_pad), device=device, dtype=torch.float32)
 
+                if unet_tap is not None:
+                    # allocate debug buffers lazily after we know S_unet
+                    pass
+
             out[:, :, s:e] += y * win_v
             wsum[:, :, s:e] += win_v
+            if dbg is not None:
+                # allocate debug buffers on first use
+                if (dbg_out is None) and ("unet_out" in dbg):
+                    Su = dbg["unet_out"].shape[0]
+                    dbg_out = torch.zeros((Su, 2, T_pad), device=device, dtype=torch.float32)
+                if (dbg_yccm is None) and ("unet_yccm" in dbg):
+                    Su = dbg["unet_yccm"].shape[0]
+                    dbg_yccm = torch.zeros((Su, 2, T_pad), device=device, dtype=torch.float32)
+
+                if dbg_out is not None and ("unet_out" in dbg):
+                    dbg_out[:, :, s:e] += dbg["unet_out"] * win_v
+                if dbg_yccm is not None and ("unet_yccm" in dbg):
+                    dbg_yccm[:, :, s:e] += dbg["unet_yccm"] * win_v
+
 
         out = out / wsum.clamp_min(1e-8)
         out = out[:, :, :T].detach().cpu()
+        dbg_ret = None
+        if (dbg_out is not None) or (dbg_yccm is not None):
+            dbg_ret = {}
+            if dbg_out is not None:
+                dbg_out = (dbg_out / wsum.clamp_min(1e-8))[:, :, :T].detach().cpu()
+                dbg_ret["unet_out"] = dbg_out
+            if dbg_yccm is not None:
+                dbg_yccm = (dbg_yccm / wsum.clamp_min(1e-8))[:, :, :T].detach().cpu()
+                dbg_ret["unet_yccm"] = dbg_yccm
+
 
         names = ["bass", "drums", "music", "vocals"]
         if out.shape[0] == 5:
             names = names + ["ref"]  # 5-я голова
 
-        return {names[i] if i < len(names) else f"head{i}": out[i] for i in range(out.shape[0])}
+        stems = {names[i] if i < len(names) else f"head{i}": out[i] for i in range(out.shape[0])}
+
+        if dbg_ret is not None:
+            # convert dbg tensors -> dict[name]->(2,T)
+            names_u = names[
+                : (dbg_ret["unet_out"].shape[0] if "unet_out" in dbg_ret else dbg_ret["unet_yccm"].shape[0])]
+            dbg_dict: Dict[str, torch.Tensor] = {}
+
+            if "unet_out" in dbg_ret:
+                for i, nm in enumerate(names_u):
+                    dbg_dict[f"unet_out_{nm}"] = dbg_ret["unet_out"][i]
+            if "unet_yccm" in dbg_ret:
+                for i, nm in enumerate(names_u):
+                    dbg_dict[f"unet_yccm_{nm}"] = dbg_ret["unet_yccm"][i]
+
+            return stems, dbg_dict
+
+        return stems, None
 
     # -----------------------
     # Mode 2: crop-stitching (take central 50-75% and stitch)
@@ -395,8 +622,16 @@ def infer_ola(
         chunk = get_chunk_by_start(x, in_s)
         ref_chunk = get_chunk_by_start(ref, in_s) if (ref is not None) else None
 
-        y = run_model_on_chunk(chunk, ref_chunk)
+        y, dbg = run_model_on_chunk(chunk, ref_chunk)
         y_keep = y[:, :, trim_left:trim_left + keep_len]  # (4,2,keep_len)
+        dbg_keep_out = None
+        dbg_keep_yccm = None
+        if dbg is not None:
+            if "unet_out" in dbg:
+                dbg_keep_out = dbg["unet_out"][:, :, trim_left:trim_left + keep_len]
+            if "unet_yccm" in dbg:
+                dbg_keep_yccm = dbg["unet_yccm"][:, :, trim_left:trim_left + keep_len]
+
 
         if xfade_len <= 0:
             out[:, :, out_s:out_e] = y_keep
@@ -467,6 +702,9 @@ def main():
         help="(crop) Optional crossfade length in milliseconds between kept regions (0 = off).",
     )
 
+    ap.add_argument("--dump-unet", action="store_true", help="Dump residual U-Net debug wavs (y_ccm input and/or U-Net output)")
+    ap.add_argument("--dump-unet-what", choices=["out", "yccm", "both"], default="both", help="What to dump: U-Net output, y_ccm input, or both")
+
 
     args = ap.parse_args()
 
@@ -496,7 +734,11 @@ def main():
     stft = STFT(StftCfg(n_fft=int(args.n_fft), hop=int(args.hop), win=int(args.win))).to(device)
 
     # infer
-    stems = infer_ola(
+    tap = None
+    if args.dump_unet:
+        tap = ResidualUnetTap(model)
+
+    stems, dbg = infer_ola(
         model=model,
         stft=stft,
         x_stereo=x,
@@ -509,7 +751,12 @@ def main():
         stitch=str(args.stitch),
         keep_frac=float(args.keep_frac),
         xfade_ms=float(args.xfade_ms),
+        unet_tap=tap,
+        unet_dump_what=str(args.dump_unet_what),
     )
+
+    if tap is not None:
+        tap.close()
 
     # write
     if args.write_mix:
@@ -518,6 +765,12 @@ def main():
     for name, y in stems.items():
         y_np = y.transpose(0, 1).numpy()  # (T,2)
         write_audio(outdir / f"{name}.wav", y_np, int(args.sr), fmt=args.format)
+
+    if dbg is not None:
+        for name, y in dbg.items():
+            y_np = y.transpose(0, 1).numpy()  # (T,2)
+            write_audio(outdir / f"{name}.wav", y_np, int(args.sr), fmt=args.format)
+
 
     if args.write_sum or args.write_sum5:
         # sum heads in time domain (already comes from ISTFT)

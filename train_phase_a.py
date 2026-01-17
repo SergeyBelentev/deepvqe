@@ -1355,6 +1355,7 @@ def main():
     ap.add_argument("--resume", type=str, default="")
     ap.add_argument("--reset-opt", action="store_true")
     ap.add_argument("--reset-rng", action="store_true")
+    ap.add_argument("--set-uset-gain-to-max", action="store_true")
 
     # Enable TF32
     ap.add_argument("--enable-tf32", action="store_true")
@@ -1653,6 +1654,12 @@ def main():
                 set_requires_grad(ru, True)
 
             print("[freeze] frozen everything except residual_unets")
+
+        if getattr(args, "set_uset_gain_to_max", False):
+            with torch.no_grad():
+                for ru in raw_model.residual_unets:
+                    ru._gain.fill_(6.0)  # _gain=0 => g=0.5
+            print("[unet] set all residual_unets._gain to 0.0 (g=0.5)")
 
     if start_epoch > args.epochs:
         print(f"[info] nothing to do: start_epoch={start_epoch} > --epochs={args.epochs}")
