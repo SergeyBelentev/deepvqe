@@ -742,9 +742,10 @@ class HeadAdapterDWGLU(nn.Module):
         m = x.amax(dim=1, keepdim=True)        # (B,1,T,F)
         s = torch.sigmoid(self.sa(torch.cat([a, m], dim=1)))  # (B,1,T,F)
 
-        # residual gating (важно! не убиваем x)
-        x = x * (1.0 + w)
-        x = x * (1.0 + s)
+        # bidirectional residual gating: scale in [1-alpha, 1+alpha]
+        alpha = 0.5  # 0.25..1.0
+        x = x * (1.0 + alpha * (2.0 * w - 1.0))
+        x = x * (1.0 + alpha * (2.0 * s - 1.0))
         return x
 
     def forward(self, feat: Tensor) -> Tensor:
