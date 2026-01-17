@@ -1039,6 +1039,26 @@ def _normalize_checkpoint_state_dict(state_dict: Dict[str, Any]) -> Dict[str, An
     sd = _strip_prefix_if_all_keys(sd, "module._orig_mod.")
     return sd
 
+
+def expand_shared_decoder_to_heads(sd: dict[str, torch.Tensor], num_heads_total: int) -> dict[str, torch.Tensor]:
+    out = dict(sd)  # копия
+
+    decoder_prefixes = ("deblock5.", "deblock4.", "deblock3.", "deblock2.", "deblock1.")
+    keys = list(sd.keys())
+
+    for k in keys:
+        if not k.startswith(decoder_prefixes):
+            continue
+        v = sd[k]
+        for i in range(num_heads_total):
+            out[f"decoders.{i}.{k}"] = v.clone()
+
+        # можно удалить старые shared ключи, чтобы strict=True проходил
+        del out[k]
+
+    return out
+
+
 def _upgrade_head_4_to_5(sd: Dict[str, Any], *, prefix: str = "") -> Dict[str, Any]:
     """
     Старый head: out=27*4, новый: out=27*5.
@@ -1519,9 +1539,8 @@ def main():
             )
         else:
             ckpt = load_ckpt(args.resume, device=device)
-
-            sd = _normalize_checkpoint_state_dict(ckpt["model"])
-            sd = _upgrade_head_4_to_5(sd)
+            sd = ckpt["model"]
+            # sd = expand_shared_decoder_to_heads(ckpt["model"], num_heads_total=raw_model.num_heads_total)
             try:
                 raw_model.load_state_dict(sd, strict=True)
             except RuntimeError as e:
@@ -1569,11 +1588,12 @@ def main():
         if getattr(args, "freeze_models_without_adapaters", False):
             raw_model = model.module if isinstance(model, DDP) else model
             set_requires_grad(raw_model, False)
+            for dec in raw_model.decoders:
+                set_requires_grad(dec, True)
             for ad in raw_model.adapters:
                 set_requires_grad(ad, True)
-            # если хочешь чуть гибче: можно оставить обучаемым deblock1
-            set_requires_grad(raw_model.deblock1, True)
-            print("[reinit] frozen everything except adapters (+deblock1)")
+
+            print("[reinit] frozen everything except adapters and per head decoders")
 
 
     if start_epoch > args.epochs:

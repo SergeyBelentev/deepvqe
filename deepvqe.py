@@ -5,6 +5,7 @@ from einops import rearrange
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.nn.functional as F
 
 
 FLOAT_EPS: Final[float] = torch.finfo(torch.float32).eps
@@ -274,140 +275,22 @@ class CCM(nn.Module):
         return torch.stack([x_enh_real, x_enh_imag], dim=-1).transpose(1, 2).contiguous()
 
 
-class DeepVQE(nn.Module):
-    """
-    Two-input DeepVQE for ref-conditioned cancellation:
-      mic: (B,F,T,2)
-      ref: (B,F,T,2)
-      out: (B,F,T,2)
-    """
-
-    def set_return_bg(self, flag: bool = True) -> None:
-        self._return_bg = flag
-
-    def __init__(
-        self,
-        n_fft: int = 1536,
-        delay_past_frames: int = 25,
-        delay_future_frames: int = 25,
-        align_hidden: int = 64,
-    ) -> None:
+class DecoderChain(nn.Module):
+    def __init__(self):
         super().__init__()
-        self._return_bg = False
-        self.n_fft = n_fft
-        self.fe = FE()
-
-        # shared encoders
-        self.enblock1 = EncoderBlock(2, 64)
-        self.enblock2 = EncoderBlock(64, 128)
-        self.enblock3 = EncoderBlock(128, 128)
-        self.enblock4 = EncoderBlock(128, 128)
-        self.enblock5 = EncoderBlock(128, 128)
-
-        self.align1 = AlignBlockBi(
-            in_channels=64,
-            hidden_channels=align_hidden,
-            delay_past=delay_past_frames,
-            delay_future=delay_future_frames
-        )
-        self.fuse1 = nn.Conv2d(64 + align_hidden, 64, kernel_size=1)
-
-        # ---- dynamic F5 computation ----
-        F_in = n_fft // 2 + 1
-        with torch.no_grad():
-            dummy = torch.zeros(1, 2, 8, F_in)  # (B,2,T,F)
-            y = self.enblock1(dummy)
-            y = self.enblock2(y)
-            y = self.enblock3(y)
-            y = self.enblock4(y)
-            y = self.enblock5(y)
-            F5 = y.shape[-1]
-        self.F5 = F5
-        # -------------------------------
-
-        self.bottle = Bottleneck(128 * F5, 64 * F5)
-
         self.deblock5 = DecoderBlock(128, 128)
         self.deblock4 = DecoderBlock(128, 128)
         self.deblock3 = DecoderBlock(128, 128)
         self.deblock2 = DecoderBlock(128, 64)
-        self.deblock1 = DecoderBlock(64, 27, is_last=True)
-        self.ccm = CCM()
+        self.deblock1 = DecoderBlock(64, 64, is_last=False)
 
-    def _align_ref_ri(self, ref_ri: Tensor, att: Tensor) -> Tensor:
-        """
-        ref_ri: (B,F,T,2)
-        att:    (B,1,T,K)
-        out:    aligned ref_ri (B,F,T,2)
-
-        Без unfold(): weighted sum of shifted ref_ri по лагам, block-wise.
-        """
-        B, Freq, T, _ = ref_ri.shape
-        K = self.align1.K
-        p = self.align1.delay_past
-        q = self.align1.delay_future
-
-        # (B,2,T,F)
-        r = ref_ri.permute(0, 3, 2, 1).contiguous()
-        r_pad = nn.functional.pad(r, (0, 0, p, q))  # (B,2,T+p+q,F)
-
-        kb = max(1, min(getattr(self.align1, "k_block", 8), K))
-
-        # копим в fp32 (даже если когда-то включишь AMP)
-        r_for = r_pad.float()
-        att_for = att.float()
-        aligned = r_for.new_zeros((B, 2, T, Freq), dtype=torch.float32)
-
-        for s in range(0, K, kb):
-            e = min(K, s + kb)
-            r_blk = torch.stack(
-                [r_for[:, :, (s + i):(s + i + T), :] for i in range(e - s)],
-                dim=3,  # (B,2,T,kb,F)
-            )
-            w_blk = att_for[:, 0, :, s:e]  # (B,T,kb)
-            aligned = aligned + (r_blk * w_blk[:, None, :, :, None]).sum(dim=3)
-
-        # back to (B,F,T,2)
-        return aligned.to(ref_ri.dtype).permute(0, 3, 2, 1).contiguous()
-
-    def forward(self, mic: Tensor, ref: Tensor) -> Tensor:
-        mic0 = self.fe(mic)   # (B,2,T,F)
-        ref0 = self.fe(ref)
-
-        mic1 = self.enblock1(mic0)  # (B,64,T,F')
-        ref1 = self.enblock1(ref0)
-
-        ref1a, att = self.align1(mic1, ref1, return_att=True)       # (B,align_hidden,T,F')
-        ref_ri_aligned = self._align_ref_ri(ref, att)
-        mic1f = self.fuse1(torch.cat([mic1, ref1a], 1)) # (B,64,T,F')
-
-        en2 = self.enblock2(mic1f)
-        en3 = self.enblock3(en2)
-        en4 = self.enblock4(en3)
-        en5 = self.enblock5(en4)
-
-        z = self.bottle(en5)
-
-        d5 = self.deblock5(z, en5)[..., :en4.shape[-1]]
+    def forward(self, z, en5, en4, en3, en2, x1f, x0):
+        d5 = self.deblock5(z,  en5)[..., :en4.shape[-1]]
         d4 = self.deblock4(d5, en4)[..., :en3.shape[-1]]
         d3 = self.deblock3(d4, en3)[..., :en2.shape[-1]]
-        d2 = self.deblock2(d3, en2)[..., :mic1f.shape[-1]]
-        d1 = self.deblock1(d2, mic1f)[..., :mic0.shape[-1]]
-
-        bg = self.ccm(d1, ref_ri_aligned)
-        out = mic - bg
-
-        # удобно для train: вернуть и out и bg
-        if isinstance(getattr(self, "_return_bg", False), bool) and self._return_bg:
-            return out, bg
-        return out
-
-
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
+        d2 = self.deblock2(d3, en2)[..., :x1f.shape[-1]]
+        d1 = self.deblock1(d2, x1f)[..., :x0.shape[-1]]   # (B,64,T,F_in)
+        return d1
 
 
 # ---------------------------
@@ -950,17 +833,10 @@ class DeepVQEConditionalStemSeparator(nn.Module):
             max_freq_bins=self.F5,
         )
 
-        # shared decoder (unchanged topology), but LAST outputs 64-ch features
-        self.deblock5 = DecoderBlock(128, 128)
-        self.deblock4 = DecoderBlock(128, 128)
-        self.deblock3 = DecoderBlock(128, 128)
-        self.deblock2 = DecoderBlock(128, 64)
-        self.deblock1 = DecoderBlock(64, 64, is_last=False)
-
-        # per-head adapters + CCM per head
         S = self.num_heads_total
+        self.decoders = nn.ModuleList([DecoderChain() for _ in range(S)])
         self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64) for _ in range(S)])
-        self.ccms = nn.ModuleList([CCM() for _ in range(S)])  # "per-head CCM"
+        self.ccms = nn.ModuleList([CCM() for _ in range(S)])
 
     def forward(self, mix_ri: Tensor, ref_ri: Tensor, ref_valid: Tensor | None = None) -> Tensor:
         # mix_ri/ref_ri: (B,F,T,2)
@@ -990,18 +866,12 @@ class DeepVQEConditionalStemSeparator(nn.Module):
 
         z = self.trunk(en5)  # (B,128,T,F5)
 
-        d5 = self.deblock5(z, en5)[..., :en4.shape[-1]]
-        d4 = self.deblock4(d5, en4)[..., :en3.shape[-1]]
-        d3 = self.deblock3(d4, en3)[..., :en2.shape[-1]]
-        d2 = self.deblock2(d3, en2)[..., :x1f.shape[-1]]
-        d1 = self.deblock1(d2, x1f)[..., :x0.shape[-1]]  # (B,64,T,F_in)
-
-        # per-head: adapter -> mask -> CCM
-        outs: list[Tensor] = []
+        outs = []
         for i in range(self.num_heads_total):
-            m = self.adapters[i](d1)          # (B,27,T,F)
-            y = self.ccms[i](m, mix_ri)       # (B,F,T,2)
+            d1_i = self.decoders[i](z, en5, en4, en3, en2, x1f, x0)
+            m = self.adapters[i](d1_i)
+            y = self.ccms[i](m, mix_ri)
             outs.append(y)
 
-        return torch.stack(outs, dim=1)  # (B,S,F,T,2)
+        return torch.stack(outs, dim=1)
 
