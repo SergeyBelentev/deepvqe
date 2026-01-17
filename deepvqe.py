@@ -871,7 +871,7 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         for i in range(self.num_heads_total):
             d1_i = self.decoders[i](z, en5, en4, en3, en2, x1f, x0)
             m = self.adapters[i](d1_i)
-            m = 0.5 * torch.tanh(m)
+            m = torch.tanh(m)
             y = self.ccms[i](m, mix_ri)
             outs.append(y)
 
