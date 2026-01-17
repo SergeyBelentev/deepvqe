@@ -1722,9 +1722,6 @@ def main():
                 loss = loss + float(args.w_mrstft) * mr_loss
 
             if mr_loss is not None:
-                run["mr"] += float(mr_loss.detach().cpu())
-
-            if mr_loss is not None:
                 mr_raw = float(mr_loss.detach().cpu())
                 mr_eff = float((mr_loss.detach() * float(args.w_mrstft)).cpu())
                 run["mr_raw"] += mr_raw
