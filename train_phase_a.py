@@ -486,9 +486,8 @@ class Recipe:
             raise ValueError(f"type must be unconditional|conditional, got {typ!r}")
 
         if typ == "conditional":
-            # по твоему описанию: conditional всегда mix_in=full и fixed (чтобы ref соответствовал этому full)
-            if mix_in != "full":
-                raise ValueError("conditional требует mix_in='full'")
+            if mix_in not in ("full", "stem_sum"):
+                raise ValueError("conditional: mix_in must be 'full' or 'stem_sum'")
             if mode != "fixed":
                 raise ValueError("conditional требует stem_sum_mode='fixed' (ref берется из того же сегмента)")
             if ref_stem_count < 1 or ref_stem_count > 4:
@@ -912,9 +911,16 @@ class FlexibleMixDataset(Dataset):
             # общий gain на стемы (чтобы mix/ref/targets были согласованы)
             apply_gain_block(recipe.gain_db, tgt, set(STEM_ORDER))
 
-            # mix_in = sum_stems, mix_target = sum_stems
-            mix_in = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
-            mix_target = mix_in
+            # stem_sum из стемов (это "истинная" сумма для mix-consistency)
+            stem_sum = tgt["bass"] + tgt["drums"] + tgt["music"] + tgt["vocals"]
+
+            # mix_target всегда лучше держать как stem_sum (full может быть mastered != stem_sum)
+            mix_target = stem_sum
+
+            if recipe.mix_in == "full":
+                mix_in = full
+            else:
+                mix_in = stem_sum
 
             # ref_in = sum(ref_stems)
             ref = torch.zeros((2, self.seg_len), dtype=torch.float32)
