@@ -1348,6 +1348,7 @@ def main():
     ap.add_argument("--save-every-epochs", type=int, default=1)
 
     ap.add_argument("--freeze-models-without-adapaters", action="store_true", default=False)
+    ap.add_argument("--freeze-only-residual-unets", action="store_true", default=False)
 
     ap.add_argument("--reinit-adapters", action="store_true", default=False)
     ap.add_argument("--load-shape-compatible", action="store_true", default=False)
@@ -1585,9 +1586,21 @@ def main():
                         for i in range(64):
                             raw_model.fuse1.weight[i, i, 0, 0] = 1.0
 
+            # если в текущей модели появились новые параметры (например residual_unets),
+            # старый optimizer state не совпадёт по param_groups -> пропускаем загрузку
             if (not args.reset_opt) and ("opt" in ckpt):
+                # если strict=False был использован, у нас есть переменная `missing`
+                # (IncompatibleKeys) — проверим missing_keys
                 try:
-                    opt.load_state_dict(ckpt["opt"])
+                    miss_keys = []
+                    if "missing" in locals() and hasattr(missing, "missing_keys"):
+                        miss_keys = list(missing.missing_keys)
+
+                    if any(k.startswith("residual_unets.") for k in miss_keys):
+                        print("[resume] detected new residual_unets params -> forcing reset_opt (skip optimizer load)")
+                        args.reset_opt = True
+                    else:
+                        opt.load_state_dict(ckpt["opt"])
                 except Exception as e:
                     print(f"[warn] failed to load optimizer state: {e}")
 
@@ -1617,13 +1630,29 @@ def main():
         if getattr(args, "freeze_models_without_adapaters", False):
             raw_model = model.module if isinstance(model, DDP) else model
             set_requires_grad(raw_model, False)
+
+            # per-head decoders + adapters
             for dec in raw_model.decoders:
                 set_requires_grad(dec, True)
             for ad in raw_model.adapters:
                 set_requires_grad(ad, True)
 
-            print("[reinit] frozen everything except adapters and per head decoders")
+            # NEW: residual U-Nets must be trainable too
+            if hasattr(raw_model, "residual_unets"):
+                for ru in raw_model.residual_unets:
+                    set_requires_grad(ru, True)
 
+            print("[freeze] frozen everything except per-head decoders, adapters, residual_unets")
+
+        if getattr(args, "freeze_only_residual_unets", False):
+            raw_model = model.module if isinstance(model, DDP) else model
+            set_requires_grad(raw_model, False)
+
+            # учим только residual_unets
+            for ru in raw_model.residual_unets:
+                set_requires_grad(ru, True)
+
+            print("[freeze] frozen everything except residual_unets")
 
     if start_epoch > args.epochs:
         print(f"[info] nothing to do: start_epoch={start_epoch} > --epochs={args.epochs}")
