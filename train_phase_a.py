@@ -203,8 +203,8 @@ class MRSTFTLoss(nn.Module):
         sc = err_n / (tgt_n + err_n + self.eps)
 
         # ---- log-mag L1 (как было) ----
-        logmag = (torch.log(magY + self.eps) - torch.log(magX + self.eps)).abs().mean(dim=(1, 2))
-
+        mag_floor = 1e-4  # 1e-4..1e-3
+        logmag = (torch.log(magY.clamp_min(mag_floor)) - torch.log(magX.clamp_min(mag_floor))).abs().mean(dim=(1, 2))
         return sc, logmag
 
     def forward(self, x: torch.Tensor, y: torch.Tensor, *, return_parts: bool = False):
