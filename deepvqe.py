@@ -529,6 +529,173 @@ class ConvModule2D(nn.Module):
         return y
 
 
+class DWResBlock2D(nn.Module):
+    """Depthwise-style residual block on (B,C,T,F)."""
+    def __init__(self, channels: int, k_t: int = 5, k_f: int = 3):
+        super().__init__()
+        self.m1 = ConvModule2D(channels, k_t=k_t, k_f=k_f, drop=0.0)
+        self.m2 = ConvModule2D(channels, k_t=k_t, k_f=k_f, drop=0.0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x + self.m2(self.m1(x))
+
+
+class FDownsample(nn.Module):
+    """Downsample only along F axis: stride=(1,2)."""
+    def __init__(self, in_ch: int, out_ch: int, k_t: int = 3, k_f: int = 5):
+        super().__init__()
+        self.dw = nn.Conv2d(
+            in_ch, in_ch,
+            kernel_size=(k_t, k_f),
+            stride=(1, 2),
+            padding=(k_t // 2, k_f // 2),
+            groups=in_ch,
+        )
+        self.pw = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.n = nn.GroupNorm(1, out_ch)
+        self.act = nn.SiLU()
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.dw(x)
+        x = self.pw(x)
+        x = self.n(x)
+        x = self.act(x)
+        return x
+
+
+class FUpsample(nn.Module):
+    """Upsample only along F axis by 2 and project channels."""
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        self.pw = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        self.n = nn.GroupNorm(1, out_ch)
+        self.act = nn.SiLU()
+
+    def forward(self, x: Tensor, target_F: int) -> Tensor:
+        # (B,C,T,F) -> upsample F only
+        x = F.interpolate(x, scale_factor=(1, 2), mode="nearest")
+        x = self.pw(x)
+        x = self.n(x)
+        x = self.act(x)
+        # crop to match skip (important when F is odd)
+        if x.shape[-1] != target_F:
+            x = x[..., :target_F]
+        return x
+
+
+class DepthwiseTFUNet2F(nn.Module):
+    """
+    Depthwise TF-U-Net, 2 levels, downsample ONLY along F.
+
+    Input:
+      d1:     (B,64,T,F)
+      y_ccm:  (B,F,T,2)   (we convert to (B,2,T,F) inside)
+    Output:
+      residual: (B,F,T,2)
+
+    Stability:
+      - zero-init out conv
+      - learnable gain (sigmoid) starting ~0
+    """
+    def __init__(
+        self,
+        d1_ch: int = 64,
+        hint_ch: int = 2,
+        base_ch: int = 96,
+        ch1: int = 128,
+        ch2: int = 160,
+        k_t: int = 5,
+        k_f: int = 3,
+        *,
+        detach_hint: bool = True,
+    ):
+        super().__init__()
+        self.detach_hint = bool(detach_hint)
+        in_ch = int(d1_ch + hint_ch)
+
+        self.in_proj = nn.Sequential(
+            nn.Conv2d(in_ch, int(base_ch), kernel_size=1),
+            nn.GroupNorm(1, int(base_ch)),
+            nn.SiLU(),
+        )
+
+        # enc level 0
+        self.e0 = DWResBlock2D(int(base_ch), k_t=k_t, k_f=k_f)
+
+        # down1 -> enc1
+        self.d1 = FDownsample(int(base_ch), int(ch1), k_t=3, k_f=5)
+        self.e1 = DWResBlock2D(int(ch1), k_t=k_t, k_f=k_f)
+
+        # down2 -> enc2
+        self.d2 = FDownsample(int(ch1), int(ch2), k_t=3, k_f=5)
+        self.e2 = DWResBlock2D(int(ch2), k_t=k_t, k_f=k_f)
+
+        # bottleneck
+        self.mid = nn.Sequential(
+            DWResBlock2D(int(ch2), k_t=k_t, k_f=k_f),
+            DWResBlock2D(int(ch2), k_t=k_t, k_f=k_f),
+        )
+
+        # up2 -> dec1
+        self.u2 = FUpsample(int(ch2), int(ch1))
+        self.dec1_in = nn.Conv2d(int(ch1 + ch1), int(ch1), kernel_size=1)
+        self.dec1 = DWResBlock2D(int(ch1), k_t=k_t, k_f=k_f)
+
+        # up1 -> dec0
+        self.u1 = FUpsample(int(ch1), int(base_ch))
+        self.dec0_in = nn.Conv2d(int(base_ch + base_ch), int(base_ch), kernel_size=1)
+        self.dec0 = DWResBlock2D(int(base_ch), k_t=k_t, k_f=k_f)
+
+        # out residual RI
+        self.out = nn.Conv2d(int(base_ch), 2, kernel_size=1)
+        nn.init.zeros_(self.out.weight)
+        if self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
+
+        # gain starts near 0 (sigmoid(-6) ~ 0.0025)
+        self._gain = nn.Parameter(torch.tensor(-6.0))
+
+    def forward(self, d1: Tensor, y_ccm: Tensor) -> Tensor:
+        # d1: (B,64,T,F)
+        # y_ccm: (B,F,T,2) -> (B,2,T,F)
+        h = y_ccm.permute(0, 3, 2, 1).contiguous()
+        if self.detach_hint:
+            h = h.detach()
+
+        x = torch.cat([d1, h], dim=1)  # (B,66,T,F)
+        x = self.in_proj(x)
+
+        s0 = self.e0(x)          # (B,base,T,F)
+
+        x1 = self.d1(s0)         # (B,ch1,T,F/2)
+        s1 = self.e1(x1)         # (B,ch1,T,F/2)
+
+        x2 = self.d2(s1)         # (B,ch2,T,F/4)
+        s2 = self.e2(x2)         # (B,ch2,T,F/4)
+
+        m = self.mid(s2)         # (B,ch2,T,F/4)
+
+        # up to F/2, concat skip s1
+        u1 = self.u2(m, target_F=s1.shape[-1])               # (B,ch1,T,F/2)
+        d1 = torch.cat([u1, s1], dim=1)                      # (B,2*ch1,T,F/2)
+        d1 = self.dec1_in(d1)
+        d1 = self.dec1(d1)
+
+        # up to F, concat skip s0
+        u0 = self.u1(d1, target_F=s0.shape[-1])              # (B,base,T,F)
+        d0 = torch.cat([u0, s0], dim=1)                      # (B,2*base,T,F)
+        d0 = self.dec0_in(d0)
+        d0 = self.dec0(d0)
+
+        r = self.out(d0)  # (B,2,T,F)
+        g = torch.sigmoid(self._gain)
+        r = r * g
+
+        # back to (B,F,T,2)
+        r = r.permute(0, 3, 2, 1).contiguous()
+        return r
+
+
 # ---------------------------
 # FFN (SwiGLU) on 2D map
 # ---------------------------
@@ -839,6 +1006,12 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64) for _ in range(S)])
         self.ccms = nn.ModuleList([CCM() for _ in range(S)])
 
+        # residual post-filter per head: U-Net gets (d1_i, y_ccm_i) and predicts RI residual
+        self.residual_unets = nn.ModuleList(
+            [DepthwiseTFUNet2F(d1_ch=64, hint_ch=2, base_ch=96, ch1=128, ch2=160, k_t=5, k_f=3, detach_hint=True)
+             for _ in range(S)]
+        )
+
     def forward(self, mix_ri: Tensor, ref_ri: Tensor, ref_valid: Tensor | None = None) -> Tensor:
         # mix_ri/ref_ri: (B,F,T,2)
         B = mix_ri.shape[0]
@@ -870,9 +1043,14 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         outs = []
         for i in range(self.num_heads_total):
             d1_i = self.decoders[i](z, en5, en4, en3, en2, x1f, x0)
+
             m = self.adapters[i](d1_i)
             m = 0.5 * torch.tanh(m)
-            y = self.ccms[i](m, mix_ri)
+            y_ccm = self.ccms[i](m, mix_ri)  # (B,F,T,2)
+
+            r = self.residual_unets[i](d1_i, y_ccm)  # (B,F,T,2)
+
+            y = y_ccm + r
             outs.append(y)
 
         return torch.stack(outs, dim=1)
