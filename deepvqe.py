@@ -1008,7 +1008,7 @@ class DeepVQEConditionalStemSeparator(nn.Module):
 
         # residual post-filter per head: U-Net gets (d1_i, y_ccm_i) and predicts RI residual
         self.residual_unets = nn.ModuleList(
-            [DepthwiseTFUNet2F(d1_ch=64, hint_ch=2, base_ch=96, ch1=128, ch2=160, k_t=5, k_f=3, detach_hint=True)
+            [DepthwiseTFUNet2F(d1_ch=64, hint_ch=2, base_ch=48, ch1=64, ch2=96, k_t=5, k_f=3, detach_hint=True)
              for _ in range(S)]
         )
 
