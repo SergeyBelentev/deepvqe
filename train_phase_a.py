@@ -1620,7 +1620,7 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)
 
-        run = {"stem": 0.0, "mix": 0.0, "ref": 0.0, "mr": 0.0, "total": 0.0}
+        run = {"stem": 0.0, "mix": 0.0, "ref": 0.0, "mr_raw": 0.0, "mr_eff": 0.0, "mr_n": 0, "total": 0.0}
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
         for mix_in, ref, ref_target, tgt, present_mask, mix_target, flags in pbar:
@@ -1702,6 +1702,7 @@ def main():
 
             # --- MR-STFT (time-domain) ---
             mr_loss = None
+            mr_eff_last = None
             if (mrstft is not None) and (int(args.mr_every) > 0) and ((global_step % int(args.mr_every)) == 0):
                 S_main = 4  # bass, drums, music, vocals
 
@@ -1723,6 +1724,14 @@ def main():
             if mr_loss is not None:
                 run["mr"] += float(mr_loss.detach().cpu())
 
+            if mr_loss is not None:
+                mr_raw = float(mr_loss.detach().cpu())
+                mr_eff = float((mr_loss.detach() * float(args.w_mrstft)).cpu())
+                run["mr_raw"] += mr_raw
+                run["mr_eff"] += mr_eff
+                run["mr_n"] += 1
+                mr_eff_last = mr_eff
+
             opt.zero_grad(set_to_none=True)
             loss.backward()
             if args.grad_clip and args.grad_clip > 0:
@@ -1736,12 +1745,14 @@ def main():
 
             if is_main:
                 denom = max(1, pbar.n + 1)
+                mr_denom = max(1, int(run["mr_n"]))
                 pbar.set_postfix(
                     total=f"{run['total'] / denom:.6f}",
                     stem=f"{run['stem'] / denom:.6f}",
                     mix=f"{run['mix'] / denom:.6f}",
                     ref=f"{run['ref'] / denom:.6f}",
-                    mr=f"{run['mr'] / denom:.6f}",
+                    mr_eff=f"{run['mr_eff'] / mr_denom:.6f}",
+                    mr_raw=f"{run['mr_raw'] / mr_denom:.6f}",
                 )
 
         raw_model = model.module if isinstance(model, DDP) else model
