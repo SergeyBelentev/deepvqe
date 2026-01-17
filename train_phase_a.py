@@ -205,9 +205,9 @@ class MRSTFTLoss(nn.Module):
         # ---- log-mag L1 (как было) ----
         logmag = (torch.log(magY + self.eps) - torch.log(magX + self.eps)).abs().mean(dim=(1, 2))
 
-        return (self.sc_weight * sc) + (self.logmag_weight * logmag)
+        return sc, logmag
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, y: torch.Tensor, *, return_parts: bool = False):
         """
         x,y: (N,T) any float dtype -> internally float32
         returns: (N,) per-example loss
@@ -224,19 +224,36 @@ class MRSTFTLoss(nn.Module):
         chunk = self.chunk if self.chunk and self.chunk > 0 else N
 
         outs: List[torch.Tensor] = []
+        sc_outs: List[torch.Tensor] = []
+        lm_outs: List[torch.Tensor] = []
         for s in range(0, N, chunk):
             e = min(N, s + chunk)
             xc = x[s:e]
             yc = y[s:e]
 
-            loss_c = xc.new_zeros((e - s,), dtype=torch.float32)
+            sc_c = xc.new_zeros((e - s,), dtype=torch.float32)
+            lm_c = xc.new_zeros((e - s,), dtype=torch.float32)
+
             for i in range(len(self.cfgs)):
-                loss_c = loss_c + self._one_res_loss(xc, yc, i)
-            loss_c = loss_c / float(len(self.cfgs))
+                sc_i, lm_i = self._one_res_loss(xc, yc, i)
+                sc_c = sc_c + sc_i
+                lm_c = lm_c + lm_i
+
+            sc_c = sc_c / float(len(self.cfgs))
+            lm_c = lm_c / float(len(self.cfgs))
+
+            loss_c = (self.sc_weight * sc_c) + (self.logmag_weight * lm_c)
+
             outs.append(loss_c)
+            sc_outs.append(sc_c)
+            lm_outs.append(lm_c)
 
-        return torch.cat(outs, dim=0)
-
+        loss = torch.cat(outs, dim=0)
+        if not return_parts:
+            return loss
+        sc = torch.cat(sc_outs, dim=0)
+        lm = torch.cat(lm_outs, dim=0)
+        return loss, sc, lm
 
 
 # -----------------------
@@ -1387,6 +1404,12 @@ def main():
     ap.add_argument("--w-music", type=float, default=1.0)
     ap.add_argument("--w-vocals", type=float, default=1.0)
     ap.add_argument("--silence-weight", type=float, default=0.35)
+    ap.add_argument(
+        "--silence-weight-mr",
+        type=float,
+        default=None,
+        help="Silence weight for MR-STFT. If not set, uses --silence-weight.",
+    )
 
     # ref head
     ap.add_argument("--with-ref-head", action="store_true", default=True)
@@ -1620,7 +1643,13 @@ def main():
         if sampler is not None:
             sampler.set_epoch(epoch)
 
-        run = {"stem": 0.0, "mix": 0.0, "ref": 0.0, "mr_raw": 0.0, "mr_eff": 0.0, "mr_n": 0, "total": 0.0}
+        run = {
+            "stem": 0.0, "mix": 0.0, "ref": 0.0,
+            "mr_raw": 0.0, "mr_eff": 0.0,
+            "mr_sc": 0.0, "mr_logmag": 0.0,
+            "mr_n": 0,
+            "total": 0.0,
+        }
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
         for mix_in, ref, ref_target, tgt, present_mask, mix_target, flags in pbar:
@@ -1673,9 +1702,9 @@ def main():
             # --- stem loss (L1 in RI) ---
             diff = (pred_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
 
-            sil_w = float(args.silence_weight)
-            w = head_w[None, :] * (pm_n * 1.0 + (1.0 - pm_n) * sil_w)
-            loss_stem = ((diff * w).sum(dim=1) / w.sum(dim=1).clamp_min(1e-8)).mean()
+            sil_w_ri = float(args.silence_weight)
+            w_ri = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_ri)
+            loss_stem = ((diff * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
 
             mix_hat = pred_main.sum(dim=1)  # (N,F,Tf,2)
             loss_mix = l1_ri(mix_hat, mt_ri)
@@ -1713,11 +1742,15 @@ def main():
                 # targets: (N,4,T) -> (N*4,T)
                 tgt_wav = torch.stack([bass_f, drums_f, music_f, vocals_f], dim=1).reshape(N * S_main, T)
 
-                mr_vec = mrstft(pred_wav, tgt_wav)  # (N*4,)
+                mr_vec, mr_sc_vec, mr_lm_vec = mrstft(pred_wav, tgt_wav, return_parts=True)  # each (N*4,)
 
-                # w: (N,4) -> (N*4,)
-                w_mr = w.reshape(N * S_main).float()
-                mr_loss = (mr_vec * w_mr).sum() / w_mr.sum().clamp_min(1e-8)
+                # w_mr_head: (N,4) -> (N*4,)
+                w_mr = w_mr_head.reshape(N * S_main).float()
+                den = w_mr.sum().clamp_min(1e-8)
+
+                mr_loss = (mr_vec * w_mr).sum() / den
+                mr_sc = (mr_sc_vec * w_mr).sum() / den
+                mr_logmag = (mr_lm_vec * w_mr).sum() / den
 
                 loss = loss + float(args.w_mrstft) * mr_loss
 
@@ -1726,8 +1759,9 @@ def main():
                 mr_eff = float((mr_loss.detach() * float(args.w_mrstft)).cpu())
                 run["mr_raw"] += mr_raw
                 run["mr_eff"] += mr_eff
+                run["mr_sc"] += float(mr_sc.detach().cpu())
+                run["mr_logmag"] += float(mr_logmag.detach().cpu())
                 run["mr_n"] += 1
-                mr_eff_last = mr_eff
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -1743,6 +1777,7 @@ def main():
             if is_main:
                 denom = max(1, pbar.n + 1)
                 mr_denom = max(1, int(run["mr_n"]))
+
                 pbar.set_postfix(
                     total=f"{run['total'] / denom:.6f}",
                     stem=f"{run['stem'] / denom:.6f}",
@@ -1750,6 +1785,8 @@ def main():
                     ref=f"{run['ref'] / denom:.6f}",
                     mr_eff=f"{run['mr_eff'] / mr_denom:.6f}",
                     mr_raw=f"{run['mr_raw'] / mr_denom:.6f}",
+                    mr_sc=f"{run['mr_sc'] / mr_denom:.6f}",
+                    mr_logmag=f"{run['mr_logmag'] / mr_denom:.6f}",
                 )
 
         raw_model = model.module if isinstance(model, DDP) else model
