@@ -1744,6 +1744,11 @@ def main():
 
                 mr_vec, mr_sc_vec, mr_lm_vec = mrstft(pred_wav, tgt_wav, return_parts=True)  # each (N*4,)
 
+                # ---- weights for MR (separate silence weight) ----
+                sil_w_mr = float(args.silence_weight_mr) if (args.silence_weight_mr is not None) else float(
+                    args.silence_weight)
+                w_mr_head = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_mr)  # (N,4)
+
                 # w_mr_head: (N,4) -> (N*4,)
                 w_mr = w_mr_head.reshape(N * S_main).float()
                 den = w_mr.sum().clamp_min(1e-8)
