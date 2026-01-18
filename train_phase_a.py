@@ -1410,6 +1410,9 @@ def main():
         default=None,
         help="Silence weight for MR-STFT. If not set, uses --silence-weight.",
     )
+    ap.add_argument("--w-res", type=float, default=1.0, help="Weight for residual-target loss")
+    ap.add_argument("--w-sum", type=float, default=0.0,
+                    help="Optional extra loss on final sum output (small stabilizer)")
 
     # ref head
     ap.add_argument("--with-ref-head", action="store_true", default=True)
@@ -1569,7 +1572,6 @@ def main():
         else:
             ckpt = load_ckpt(args.resume, device=device)
             sd = ckpt["model"]
-            # sd = expand_shared_decoder_to_heads(ckpt["model"], num_heads_total=raw_model.num_heads_total)
             try:
                 raw_model.load_state_dict(sd, strict=True)
             except RuntimeError as e:
@@ -1610,8 +1612,9 @@ def main():
                 reinit_head_adapter(ad)
 
             print(f"[reinit] adapters reset: {len(raw_model.adapters)}")
-            for ad in raw_model.adapters:
-                reset_optimizer_state_for_module(opt, ad)
+            if not args.reset_opt:
+                for ad in raw_model.adapters:
+                    reset_optimizer_state_for_module(opt, ad)
             print("[reinit] optimizer state cleared for adapters")
 
         if getattr(args, "freeze_models_without_adapaters", False):
@@ -1622,8 +1625,29 @@ def main():
             for ad in raw_model.adapters:
                 set_requires_grad(ad, True)
 
-            print("[reinit] frozen everything except adapters and per head decoders")
+            if hasattr(raw_model, "residuals"):
+                print("[reinit] residuals set_requires_grad True")
+                for rb in raw_model.residuals:
+                    set_requires_grad(rb, True)
 
+            print("[reinit] frozen everything except adapters, decoders and residuals")
+
+        # -----------------------
+        # reset optimizer
+        # -----------------------
+        if args.reset_opt:
+            # Важно: пересоздаём optimizer после freeze/unfreeze,
+            # чтобы в него попали ровно trainable параметры (decoders/adapters/residuals).
+            trainable = [p for p in model.parameters() if p.requires_grad]
+            opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
+
+            print(f"[reset-opt] optimizer recreated. trainable_tensors={len(trainable)}")
+
+        if hasattr(raw_model, "residuals") and getattr(args, "freeze_models_without_adapaters", False):
+            opt_ids = {id(p) for g in opt.param_groups for p in g["params"]}
+            res_params = [p for rb in raw_model.residuals for p in rb.parameters() if p.requires_grad]
+            if res_params and not any(id(p) in opt_ids for p in res_params):
+                raise RuntimeError("residuals require_grad=True, but they are NOT in optimizer param_groups")
 
     if start_epoch > args.epochs:
         print(f"[info] nothing to do: start_epoch={start_epoch} > --epochs={args.epochs}")
@@ -1649,6 +1673,8 @@ def main():
             "mr_sc": 0.0, "mr_logmag": 0.0,
             "mr_n": 0,
             "total": 0.0,
+            "stem_ccm": 0.0,
+            "stem_res": 0.0,
         }
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
 
@@ -1695,16 +1721,36 @@ def main():
 
             with sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
-                    pred = model(mix_ri, ref_ri, ref_valid=ref_valid_n)
+                    pred, pred_ccm, pred_res = model(mix_ri, ref_ri, ref_valid=ref_valid_n, return_parts=True)
 
-            pred_main = pred[:, :4]  # (N,4,F,Tf,2)
-
-            # --- stem loss (L1 in RI) ---
-            diff = (pred_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
+            pred_main = pred[:, :4]  # final
+            pred_ccm_main = pred_ccm[:, :4]  # CCM-only
+            pred_res_main = pred_res[:, :4]  # residual-only
 
             sil_w_ri = float(args.silence_weight)
-            w_ri = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_ri)
-            loss_stem = ((diff * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+            w_ri = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_ri)  # (N,4)
+
+            diff_ccm = (pred_ccm_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
+            loss_stem_ccm = ((diff_ccm * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+
+            res_tgt = (tgt_ri.float() - pred_ccm_main.float()).detach()  # (N,4,F,Tf,2)
+
+            if is_main and (global_step % 100 == 0):
+                with torch.no_grad():
+                    a = pred_ccm_main.float().abs().mean().item()
+                    b = pred_res_main.float().abs().mean().item()
+                    c = res_tgt.abs().mean().item()
+                print(f"[dbg] |ccm|={a:.3e} |res|={b:.3e} |res_tgt|={c:.3e}")
+
+            diff_res = (pred_res_main.float() - res_tgt).abs().mean(dim=(2, 3, 4))  # (N,4)
+            loss_stem_res = ((diff_res * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+
+            loss_stem_sum = pred_main.sum() * 0.0
+            if float(args.w_sum) > 0.0:
+                diff_sum = (pred_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
+                loss_stem_sum = ((diff_sum * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+
+            loss_stem = loss_stem_ccm + float(args.w_res) * loss_stem_res + float(args.w_sum) * loss_stem_sum
 
             mix_hat = pred_main.sum(dim=1)  # (N,F,Tf,2)
             loss_mix = l1_ri(mix_hat, mt_ri)
@@ -1777,6 +1823,8 @@ def main():
 
             run["stem"] += float(loss_stem.detach().cpu())
             run["mix"] += float(loss_mix.detach().cpu())
+            run["stem_ccm"] += float(loss_stem_ccm.detach().cpu())
+            run["stem_res"] += float(loss_stem_res.detach().cpu())
             run["total"] += float(loss.detach().cpu())
 
             if is_main:
@@ -1792,6 +1840,8 @@ def main():
                     mr_raw=f"{run['mr_raw'] / mr_denom:.6f}",
                     mr_sc=f"{run['mr_sc'] / mr_denom:.6f}",
                     mr_logmag=f"{run['mr_logmag'] / mr_denom:.6f}",
+                    stem_ccm=f"{run['stem_ccm'] / denom:.6f}",
+                    stem_res=f"{run['stem_res'] / denom:.6f}",
                 )
 
         raw_model = model.module if isinstance(model, DDP) else model

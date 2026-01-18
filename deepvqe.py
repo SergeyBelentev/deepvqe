@@ -682,7 +682,17 @@ class HeadAdapterDWGLU(nn.Module):
     Input:  (B,64,T,F)
     Output: (B,27,T,F)
     """
-    def __init__(self, in_ch: int = 64, bottleneck: int = 48, spatial_ks: int = 7, dw_ks: int = 3, se_ratio: int = 4):
+
+    def __init__(
+            self,
+            in_ch: int = 64,
+            bottleneck: int = 48,
+            spatial_ks: int = 7,
+            dw_ks: int = 3,
+            se_ratio: int = 4,
+            *,
+            out_ch: int = 27,
+    ):
         super().__init__()
         bn = int(bottleneck)
 
@@ -717,7 +727,13 @@ class HeadAdapterDWGLU(nn.Module):
         self.act = nn.GELU()
 
         # output
-        self.out = nn.Conv2d(bn, 27, kernel_size=1)
+        self.out_ch = int(out_ch)
+        self.out = nn.Conv2d(bn, self.out_ch, kernel_size=1)
+
+        # ---- init: zero-init out so early training is stable ----
+        nn.init.zeros_(self.out.weight)
+        if self.out.bias is not None:
+            nn.init.zeros_(self.out.bias)
 
         # ---- init: zero-init out so early training is stable ----
         nn.init.zeros_(self.out.weight)
@@ -767,6 +783,31 @@ class HeadAdapterDWGLU(nn.Module):
         x = r + y
 
         return self.out(x)          # (B,27,T,F)
+
+
+class ResidualRIBranch(nn.Module):
+    """
+    Residual RI branch:
+      (B,64,T,F) -> (B,2,T,F) -> permute -> (B,F,T,2)
+    Gain parameter in dB, initialized at 0 dB (gain=1).
+    """
+    def __init__(self, in_ch: int = 64, bottleneck: int = 64):
+        super().__init__()
+        self.core = HeadAdapterDWGLU(in_ch=in_ch, bottleneck=bottleneck, out_ch=2)
+        self.gain_db = nn.Parameter(torch.tensor(0.0))  # 0 dB => gain=1
+
+    def forward(self, feat: Tensor) -> Tensor:
+        r = self.core(feat)  # (B,2,T,F)
+
+        # 0 dB -> 1.0; positive dB amplifies, negative attenuates
+        # (optional) safety clamp if you ever want: db = self.gain_db.clamp(-12.0, 12.0)
+        db = self.gain_db
+        ten = r.new_tensor(10.0)
+        twenty = r.new_tensor(20.0)
+        gain = torch.pow(ten, db.to(dtype=r.dtype) / twenty)  # scalar
+        r = r * gain
+
+        return r
 
 
 class DeepVQEConditionalStemSeparator(nn.Module):
@@ -836,10 +877,18 @@ class DeepVQEConditionalStemSeparator(nn.Module):
 
         S = self.num_heads_total
         self.decoders = nn.ModuleList([DecoderChain() for _ in range(S)])
-        self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64) for _ in range(S)])
+        self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64, out_ch=27) for _ in range(S)])
+        self.residuals = nn.ModuleList([ResidualRIBranch(in_ch=64, bottleneck=64) for _ in range(S)])
         self.ccms = nn.ModuleList([CCM() for _ in range(S)])
 
-    def forward(self, mix_ri: Tensor, ref_ri: Tensor, ref_valid: Tensor | None = None) -> Tensor:
+    def forward(
+            self,
+            mix_ri: Tensor,
+            ref_ri: Tensor,
+            ref_valid: Tensor | None = None,
+            *,
+            return_parts: bool = False,
+    ) -> Tensor:
         # mix_ri/ref_ri: (B,F,T,2)
         B = mix_ri.shape[0]
 
@@ -868,12 +917,33 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         z = self.trunk(en5)  # (B,128,T,F5)
 
         outs = []
+        ccm_outs = []
+        res_outs = []
+
         for i in range(self.num_heads_total):
             d1_i = self.decoders[i](z, en5, en4, en3, en2, x1f, x0)
-            m = self.adapters[i](d1_i)
-            m = torch.tanh(m)
-            y = self.ccms[i](m, mix_ri)
-            outs.append(y)
 
-        return torch.stack(outs, dim=1)
+            # --- CCM path ---
+            m = self.adapters[i](d1_i)
+            m = 0.5 * torch.tanh(m)
+            y_ccm = self.ccms[i](m, mix_ri)  # (B,F,T,2)
+
+            # --- Residual path ---
+            r = self.residuals[i](d1_i)  # (B,2,T,F)
+            r = r.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)
+
+            y = y_ccm + r
+
+            outs.append(y)
+            ccm_outs.append(y_ccm)
+            res_outs.append(r)
+
+        y = torch.stack(outs, dim=1)
+
+        if return_parts:
+            y_ccm = torch.stack(ccm_outs, dim=1)
+            y_res = torch.stack(res_outs, dim=1)
+            return y, y_ccm, y_res
+
+        return y
 
