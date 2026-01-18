@@ -138,6 +138,14 @@ def _parse_int_csv(s: str) -> List[int]:
     return [int(x.strip()) for x in s.split(",") if x.strip()]
 
 
+def _parse_two_ints_csv(s: str) -> tuple[int, int]:
+    a = [int(x.strip()) for x in s.split(",") if x.strip()]
+    if len(a) != 2:
+        raise ValueError("--w-res-ramp must be 'start,end'")
+    return a[0], a[1]
+
+
+
 class MRSTFTLoss(nn.Module):
     """
     Multi-resolution STFT loss:
@@ -1331,6 +1339,18 @@ def capture_rng() -> Dict[str, Any]:
     return out
 
 
+def weighted_head_l1(pred_ri: torch.Tensor, tgt_ri: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """
+    pred_ri, tgt_ri: (N,4,F,T,2)
+    w:              (N,4)
+    return: scalar
+    """
+    diff = (pred_ri.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
+    num = (diff * w).sum(dim=1)
+    den = w.sum(dim=1).clamp_min(1e-8)
+    return (num / den).mean()
+
+
 # -----------------------
 # Training
 # -----------------------
@@ -1410,9 +1430,19 @@ def main():
         default=None,
         help="Silence weight for MR-STFT. If not set, uses --silence-weight.",
     )
+
+    # residual
     ap.add_argument("--w-res", type=float, default=1.0, help="Weight for residual-target loss")
     ap.add_argument("--w-sum", type=float, default=0.0,
                     help="Optional extra loss on final sum output (small stabilizer)")
+    ap.add_argument("--silence-weight-res", type=float, default=1.5,
+                    help="Silence weight specifically for residual loss (usually >= silence-weight).")
+    ap.add_argument("--res-focus-silence", action="store_true", default=True,
+                    help="Make residual target focus on cancelling leakage on absent stems.")
+    ap.add_argument("--w-res-l1", type=float, default=0.0,
+                    help="Small L1 penalty on residual output RI to keep it minimal.")
+    ap.add_argument("--w-res-ramp", type=str, default="0,3",
+                    help="Linear ramp epochs for w_res: 'start,end' (e.g. 0,3).")
 
     # ref head
     ap.add_argument("--with-ref-head", action="store_true", default=True)
@@ -1727,30 +1757,52 @@ def main():
             pred_ccm_main = pred_ccm[:, :4]  # CCM-only
             pred_res_main = pred_res[:, :4]  # residual-only
 
-            sil_w_ri = float(args.silence_weight)
-            w_ri = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_ri)  # (N,4)
+            # --- weights ---
+            sil_w_ccm = float(args.silence_weight)
+            w_ccm = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_ccm)  # (N,4)
 
-            diff_ccm = (pred_ccm_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
-            loss_stem_ccm = ((diff_ccm * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+            sil_w_res = float(args.silence_weight_res)
+            w_res = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_res)  # (N,4)
 
-            res_tgt = (tgt_ri.float() - pred_ccm_main.float()).detach()  # (N,4,F,Tf,2)
+            # --- CCM loss (учим именно CCM-ветку) ---
+            loss_stem_ccm = weighted_head_l1(pred_ccm_main, tgt_ri, w_ccm)
 
-            if is_main and (global_step % 100 == 0):
-                with torch.no_grad():
-                    a = pred_ccm_main.float().abs().mean().item()
-                    b = pred_res_main.float().abs().mean().item()
-                    c = res_tgt.abs().mean().item()
-                print(f"[dbg] |ccm|={a:.3e} |res|={b:.3e} |res_tgt|={c:.3e}")
+            # --- residual target ---
+            # базовый таргет: "что не дотянул CCM до настоящего стема"
+            res_base = (tgt_ri.float() - pred_ccm_main.float()).detach()  # (N,4,F,T,2)
 
-            diff_res = (pred_res_main.float() - res_tgt).abs().mean(dim=(2, 3, 4))  # (N,4)
-            loss_stem_res = ((diff_res * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+            if args.res_focus_silence:
+                pm = pm_n[:, :, None, None, None]  # (N,4,1,1,1)
+                # absent stems: хотим, чтобы residual гасил протечки CCM (таргет = -CCM)
+                res_sil = (-pred_ccm_main.float()).detach()
+                res_tgt = res_base * pm + res_sil * (1.0 - pm)
+            else:
+                res_tgt = res_base
 
+
+            # --- Residual loss (учим residual-ветку) ---
+            loss_stem_res = weighted_head_l1(pred_res_main, res_tgt, w_res)
+
+            # --- optional: keep residual small ---
+            loss_res_l1 = pred_res_main.float().abs().mean()
+
+            # --- optional: final-output per-head stabilizer (НЕ mix_consistency!)
+            # это "стем-стабилизатор" для pred_main (CCM+res), чтобы головы не уезжали в странные решения
             loss_stem_sum = pred_main.sum() * 0.0
             if float(args.w_sum) > 0.0:
-                diff_sum = (pred_main.float() - tgt_ri.float()).abs().mean(dim=(2, 3, 4))  # (N,4)
-                loss_stem_sum = ((diff_sum * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
+                loss_stem_sum = weighted_head_l1(pred_main, tgt_ri, w_ccm)
 
-            loss_stem = loss_stem_ccm + float(args.w_res) * loss_stem_res + float(args.w_sum) * loss_stem_sum
+            # --- ramp for residual ---
+            r0, r1 = _parse_two_ints_csv(args.w_res_ramp)
+            w_res_eff = linear_ramp(epoch, r0, r1, 0.0, float(args.w_res))
+
+            # --- FINAL stem loss (one place, ничего не затираем позже) ---
+            loss_stem = (
+                    loss_stem_ccm
+                    + w_res_eff * loss_stem_res
+                    + float(args.w_res_l1) * loss_res_l1
+                    + float(args.w_sum) * loss_stem_sum
+            )
 
             mix_hat = pred_main.sum(dim=1)  # (N,F,Tf,2)
             loss_mix = l1_ri(mix_hat, mt_ri)

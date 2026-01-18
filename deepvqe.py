@@ -785,29 +785,30 @@ class HeadAdapterDWGLU(nn.Module):
         return self.out(x)          # (B,27,T,F)
 
 
-class ResidualRIBranch(nn.Module):
+class ResidualMaskBranch(nn.Module):
     """
-    Residual RI branch:
-      (B,64,T,F) -> (B,2,T,F) -> permute -> (B,F,T,2)
-    Gain parameter in dB, initialized at 0 dB (gain=1).
+    Residual mask (delta) branch:
+      (B,64,T,F) -> (B,27,T,F)  (Δmask), which will be applied to mix via CCM.
     """
-    def __init__(self, in_ch: int = 64, bottleneck: int = 64):
+    def __init__(self, in_ch: int = 64, bottleneck: int = 64, *, out_ch: int = 27, delta_scale: float = 0.2):
         super().__init__()
-        self.core = HeadAdapterDWGLU(in_ch=in_ch, bottleneck=bottleneck, out_ch=2)
-        self.gain_db = nn.Parameter(torch.tensor(0.0))  # 0 dB => gain=1
+        self.core = HeadAdapterDWGLU(in_ch=in_ch, bottleneck=bottleneck, out_ch=out_ch)
+        self.gain_db = nn.Parameter(torch.tensor(0.0))  # 0 dB -> 1.0
+        self.delta_scale = float(delta_scale)
 
     def forward(self, feat: Tensor) -> Tensor:
-        r = self.core(feat)  # (B,2,T,F)
+        dm = self.core(feat)  # (B,27,T,F)
 
-        # 0 dB -> 1.0; positive dB amplifies, negative attenuates
-        # (optional) safety clamp if you ever want: db = self.gain_db.clamp(-12.0, 12.0)
-        db = self.gain_db
-        ten = r.new_tensor(10.0)
-        twenty = r.new_tensor(20.0)
-        gain = torch.pow(ten, db.to(dtype=r.dtype) / twenty)  # scalar
-        r = r * gain
+        # ограничиваем амплитуду и делаем "маленькую поправку"
+        dm = self.delta_scale * torch.tanh(dm)  # (B,27,T,F)
 
-        return r
+        # общий gain (если хочешь “подкручивать” влияние residual)
+        ten = dm.new_tensor(10.0)
+        twenty = dm.new_tensor(20.0)
+        gain = torch.pow(ten, self.gain_db.to(dtype=dm.dtype) / twenty)
+        dm = dm * gain
+
+        return dm
 
 
 class DeepVQEConditionalStemSeparator(nn.Module):
@@ -878,7 +879,7 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         S = self.num_heads_total
         self.decoders = nn.ModuleList([DecoderChain() for _ in range(S)])
         self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64, out_ch=27) for _ in range(S)])
-        self.residuals = nn.ModuleList([ResidualRIBranch(in_ch=64, bottleneck=64) for _ in range(S)])
+        self.residuals = nn.ModuleList([ResidualMaskBranch(in_ch=64, bottleneck=64, out_ch=27, delta_scale=1) for _ in range(S)])
         self.ccms = nn.ModuleList([CCM() for _ in range(S)])
 
     def forward(
@@ -924,26 +925,31 @@ class DeepVQEConditionalStemSeparator(nn.Module):
             d1_i = self.decoders[i](z, en5, en4, en3, en2, x1f, x0)
 
             # --- CCM path ---
-            m = self.adapters[i](d1_i)
-            m = 0.5 * torch.tanh(m)
-            y_ccm = self.ccms[i](m, mix_ri)  # (B,F,T,2)
+            m0 = self.adapters[i](d1_i)  # (B,27,T,F)
+            m0 = torch.tanh(m0)
 
-            # --- Residual path ---
-            r = self.residuals[i](d1_i)  # (B,2,T,F)
-            r = r.permute(0, 3, 2, 1).contiguous()  # (B,F,T,2)
+            feat_for_res = d1_i.detach()
+            dm = self.residuals[i](feat_for_res)
 
-            y = y_ccm + r
+            # опционально: ограничить итоговую маску тем же диапазоном
+            m = (m0 + dm).clamp(-0.5, 0.5)
+
+            y = self.ccms[i](m, mix_ri)  # (B,F,T,2)
+
+            # для дебага/return_parts можно дополнительно посчитать:
+            if return_parts:
+                y_ccm = self.ccms[i](m0, mix_ri)
+                y_res = self.ccms[i](dm, mix_ri)
+                ccm_outs.append(y_ccm)
+                res_outs.append(y_res)
 
             outs.append(y)
-            ccm_outs.append(y_ccm)
-            res_outs.append(r)
+
 
         y = torch.stack(outs, dim=1)
 
         if return_parts:
-            y_ccm = torch.stack(ccm_outs, dim=1)
-            y_res = torch.stack(res_outs, dim=1)
-            return y, y_ccm, y_res
+            return y, torch.stack(ccm_outs, dim=1), torch.stack(res_outs, dim=1)
 
         return y
 
