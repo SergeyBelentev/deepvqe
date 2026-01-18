@@ -1383,6 +1383,11 @@ def main():
     # HEADS: bass, drums, music(inst+melody), vocals
     ap.add_argument("--num-heads", type=int, default=4)
 
+    # leak losses
+    ap.add_argument("--leak-thr", type=float, default=0.1)
+    ap.add_argument("--silence-weight-leak", type=float, default=20.0)
+    ap.add_argument("--w-leak", type=float, default=1.0)
+
     # losses
     ap.add_argument("--w-stem", type=float, default=1.0)
     ap.add_argument("--w-mix", type=float, default=0.5)
@@ -1621,8 +1626,38 @@ def main():
                 set_requires_grad(dec, True)
             for ad in raw_model.adapters:
                 set_requires_grad(ad, True)
+            for ad in raw_model.post_trunk:
+                set_requires_grad(ad, True)
 
-            print("[reinit] frozen everything except adapters and per head decoders")
+            print("[reinit] frozen everything except: post trunk, decoders and adapters")
+
+        # -----------------------
+        # reset optimizer
+        # -----------------------
+        if args.reset_opt:
+            if not getattr(args, "freeze_models_without_adapaters", False):
+                trainable = [p for p in model.parameters() if p.requires_grad]
+                opt = torch.optim.AdamW(trainable, lr=args.lr, betas=(0.9, 0.999), weight_decay=1e-4)
+                print(f"[reset-opt] optimizer recreated. trainable_tensors={len(trainable)}")
+            else:
+                base_params = []
+                refiner_params = []
+
+                for n, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if n.startswith("post_trunk."):
+                        refiner_params.append(p)
+                    else:
+                        base_params.append(p)
+
+                opt = torch.optim.AdamW([
+                    {"params": base_params, "lr": args.lr, "weight_decay": 1e-4},
+                    {"params": refiner_params, "lr": args.lr * 5, "weight_decay": 1e-4},  # или *10
+                ])
+                print(f"[reset-opt] optimizer recreated. trainable_base_tensors={len(base_params)} and trainable_refiner_tensors={len(refiner_params)}")
+
+
 
 
     if start_epoch > args.epochs:
@@ -1648,6 +1683,7 @@ def main():
             "mr_raw": 0.0, "mr_eff": 0.0,
             "mr_sc": 0.0, "mr_logmag": 0.0,
             "mr_n": 0,
+            "loss_leak": 0.0,
             "total": 0.0,
         }
         pbar = tqdm(dl, desc=f"Epoch {epoch}", dynamic_ncols=True) if is_main else dl
@@ -1706,6 +1742,28 @@ def main():
             w_ri = head_w[None, :] * (pm_n + (1.0 - pm_n) * sil_w_ri)
             loss_stem = ((diff * w_ri).sum(dim=1) / w_ri.sum(dim=1).clamp_min(1e-8)).mean()
 
+            # leak loss
+            # pred_main, tgt_ri: (N,4,F,Tf,2)
+            pred_pow = (pred_main.float() ** 2).sum(dim=-1)  # (N,4,F,Tf)
+            tgt_pow = (tgt_ri.float() ** 2).sum(dim=-1)  # (N,4,F,Tf)
+
+            # "тишина" по стему: порог относительно среднего уровня таргета
+            eps = 1e-8
+            tgt_lvl = tgt_pow.mean(dim=(2, 3), keepdim=True).clamp_min(eps)  # (N,4,1,1)
+            thr = float(args.leak_thr)  # например 0.05..0.2
+            silent = (tgt_pow < (thr * thr) * tgt_lvl).float()  # (N,4,F,Tf)
+
+            # веса: отдельный silence_weight_leak (обычно сильно больше 1)
+            sil_w_leak = float(args.silence_weight_leak)  # 10..50 типично
+            w_tf = head_w[None, :, None, None] * (pm_n[:, :, None, None] + (1.0 - pm_n[:, :, None, None]) * sil_w_leak)
+
+            num = (pred_pow * silent * w_tf).sum()
+            den = (silent * w_tf).sum().clamp_min(1e-8)
+            loss_leak = num / den
+
+            run["loss_leak"] += float(loss_leak.detach().cpu())
+            # leak loss end
+
             mix_hat = pred_main.sum(dim=1)  # (N,F,Tf,2)
             loss_mix = l1_ri(mix_hat, mt_ri)
 
@@ -1727,6 +1785,7 @@ def main():
                     float(args.w_stem) * loss_stem
                     + float(args.w_mix) * loss_mix
                     + float(args.w_ref) * loss_ref
+                    + float(args.w_leak) * loss_leak
             )
 
             # --- MR-STFT (time-domain) ---
@@ -1788,6 +1847,7 @@ def main():
                     stem=f"{run['stem'] / denom:.6f}",
                     mix=f"{run['mix'] / denom:.6f}",
                     ref=f"{run['ref'] / denom:.6f}",
+                    loss_leak=f"{run['loss_leak'] / denom:.6f}",
                     mr_eff=f"{run['mr_eff'] / mr_denom:.6f}",
                     mr_raw=f"{run['mr_raw'] / mr_denom:.6f}",
                     mr_sc=f"{run['mr_sc'] / mr_denom:.6f}",

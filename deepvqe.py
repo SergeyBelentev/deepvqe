@@ -550,6 +550,64 @@ class FFN2D(nn.Module):
         return y
 
 
+class DWConvOnly2D(nn.Module):
+    """Depthwise conv + pointwise projection on (B,C,T,F)."""
+    def __init__(self, channels: int, k_t: int = 7, k_f: int = 5, drop: float = 0.0):
+        super().__init__()
+        C = int(channels)
+        self.dw = nn.Conv2d(C, C, kernel_size=(k_t, k_f), padding=(k_t // 2, k_f // 2), groups=C)
+        self.n = nn.GroupNorm(1, C)
+        self.pw = nn.Conv2d(C, C, kernel_size=1)
+        self.drop = nn.Dropout(float(drop))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.dw(x)
+        y = self.n(y)
+        y = F.silu(y)
+        y = self.pw(y)
+        y = self.drop(y)
+        return y
+
+
+class HeadPostTrunkRefiner(nn.Module):
+    """
+    Per-head local refinement AFTER trunk, BEFORE decoder.
+    Structure (no global attention):
+      x + 0.5 * FFN2D(LN(x))
+      x + DWConv(LN(x))
+
+    Input/Output: (B, C=128, T, F5)
+    """
+    def __init__(
+        self,
+        channels: int = 128,
+        ff_mult: int = 4,
+        drop: float = 0.0,
+        drop_path: float = 0.0,
+        k_t: int = 7,
+        k_f: int = 5,
+        layer_scale: float = 1e-2,
+    ):
+        super().__init__()
+        C = int(channels)
+        self.n1 = LayerNorm2D(C)
+        self.ff = FFN2D(C, mult=int(ff_mult), drop=float(drop))
+
+        self.n2 = LayerNorm2D(C)
+        self.dw = DWConvOnly2D(C, k_t=int(k_t), k_f=int(k_f), drop=float(drop))
+
+        self.dp = DropPath(float(drop_path))
+
+        # LayerScale for stability
+        self.g1 = nn.Parameter(torch.ones(1, C, 1, 1) * float(layer_scale))
+        self.g2 = nn.Parameter(torch.ones(1, C, 1, 1) * float(layer_scale))
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.dp(self.g1 * self.ff(self.n1(x)))
+        x = x + self.dp(self.g2 * self.dw(self.n2(x)))
+        return x
+
+
 # ---------------------------
 # TF-Conformer block: (FFN/2) + MHSA2D + Conv + (FFN/2)
 # ---------------------------
@@ -835,6 +893,18 @@ class DeepVQEConditionalStemSeparator(nn.Module):
         )
 
         S = self.num_heads_total
+        self.post_trunk = nn.ModuleList([
+            HeadPostTrunkRefiner(
+                channels=128,
+                ff_mult=4,
+                drop=0.0,
+                drop_path=0.0,
+                k_t=7,
+                k_f=5,
+                layer_scale=1,
+            )
+            for _ in range(S)
+        ])
         self.decoders = nn.ModuleList([DecoderChain() for _ in range(S)])
         self.adapters = nn.ModuleList([HeadAdapterDWGLU(in_ch=64, bottleneck=64) for _ in range(S)])
         self.ccms = nn.ModuleList([CCM() for _ in range(S)])
@@ -869,9 +939,9 @@ class DeepVQEConditionalStemSeparator(nn.Module):
 
         outs = []
         for i in range(self.num_heads_total):
-            d1_i = self.decoders[i](z, en5, en4, en3, en2, x1f, x0)
+            z_i = self.post_trunk[i](z)  # (B,128,T,F5) per-head refinement
+            d1_i = self.decoders[i](z_i, en5, en4, en3, en2, x1f, x0)
             m = self.adapters[i](d1_i)
-            m = torch.tanh(m)
             y = self.ccms[i](m, mix_ri)
             outs.append(y)
 
