@@ -848,35 +848,34 @@ class HeadDecoder(nn.Module):
         # D5 @ T/4
         skip5 = self._build_skip(enc_stages, stage=5)
         x = self.fuse5(torch.cat([x, skip5], dim=1))
-        x = self.a5(self.d5(x))
+        x = self.d5(x)
+        x = self.a5(x)
 
         # D4 @ T/4
         skip4 = self._build_skip(enc_stages, stage=4)
-        # before d4, x is (B,192,T/4,K)
         x = self.fuse4(torch.cat([x, skip4], dim=1))
-        x = self.a4(self.d4(x))
+        x = self.d4(x)
+        x = self.a4(x)
 
-        # D3 upsample -> T/2
-        skip3 = self._build_skip(enc_stages, stage=3)
-        # upsample decoder x first to match skip3 T
-        x = self.d3(x)
-        x = self.fuse3(torch.cat([x, skip3], dim=1))
+        # D3: fuse на T/4, потом upsample внутри d3 -> T/2
+        skip3 = self._build_skip(enc_stages, stage=3)  # (B,160,T/4,K)
+        x = self.fuse3(torch.cat([x, skip3], dim=1))  # (B,160,T/4,K)
+        x = self.d3(x)  # -> (B,96,T/2,K)
         x = self.a3(x)
 
-        # D2 upsample -> T
-        skip2 = self._build_skip(enc_stages, stage=2)
-        x = self.d2(x)
-        x = self.fuse2(torch.cat([x, skip2], dim=1))
+        # D2: fuse на T/2, потом upsample внутри d2 -> T
+        skip2 = self._build_skip(enc_stages, stage=2)  # (B,96,T/2,K)
+        x = self.fuse2(torch.cat([x, skip2], dim=1))  # (B,96,T/2,K)
+        x = self.d2(x)  # -> (B,32,T,K)
         x = self.a2(x)
 
-        # D1 @ T
-        skip1 = self._build_skip(enc_stages, stage=1)
-        x = self.d1(x)
-        x = self.fuse1(torch.cat([x, skip1], dim=1))
+        # D1: fuse на T
+        skip1 = self._build_skip(enc_stages, stage=1)  # (B,32,T,K)
+        x = self.fuse1(torch.cat([x, skip1], dim=1))  # (B,32,T,K)
+        x = self.d1(x)  # -> (B,96,T,K)
         x = self.a1(x)
 
-        return x  # (B,96,T,K_total)
-
+        return x
 
 # -------------------------
 # Shared detokenizers (K->F) + per-head mask heads
