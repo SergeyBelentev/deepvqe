@@ -217,26 +217,6 @@ class LossComputer(nn.Module):
         l1_per_norm = l1_per / mix_scale.squeeze(-1)  # (B,4)
         l1_head = (l1_per_norm * present_mask).sum() / (present_mask.sum() + self.eps)
 
-        # MR per head, only when present
-        mr_head_vals = []
-        mr_sc_vals = []
-        mr_lm_vals = []
-        for i in range(4):
-            if present_mask[:, i].sum().item() <= 0:
-                continue
-            li, stat = self.mr(pred_stems[:, i], tgt_stems[:, i])
-            mr_head_vals.append(li)
-            mr_sc_vals.append(stat["mr_sc"])
-            mr_lm_vals.append(stat["mr_logmag"])
-        if mr_head_vals:
-            mr_head = torch.stack(mr_head_vals).mean()
-            mr_sc = torch.stack(mr_sc_vals).mean()
-            mr_lm = torch.stack(mr_lm_vals).mean()
-        else:
-            mr_head = pred_stems.sum() * 0.0
-            mr_sc = pred_stems.sum() * 0.0
-            mr_lm = pred_stems.sum() * 0.0
-
         # mix consistency: sum heads should match mix_target (stem_sum)
         mix_pred = pred_stems.sum(dim=1)  # (B,2,T)
         l1_mix = (mix_pred - mix_target).abs().mean(dim=(1, 2)) / mix_scale.squeeze(-1).squeeze(-1)
@@ -264,6 +244,32 @@ class LossComputer(nn.Module):
                 leak_terms.append(sim[other_ok].mean())
         leak_loss = torch.stack(leak_terms).mean() if leak_terms else pred_stems.sum() * 0.0
 
+        # MR per head, only when present AND target is not silent
+        mr_head_vals = []
+        mr_sc_vals = []
+        mr_lm_vals = []
+
+        mr_mask = (present_mask > 0.5) & (tgt_rms >= self.silence_rms_thr)  # (B,4) bool
+
+        for i in range(4):
+            sel = mr_mask[:, i]
+            if not bool(sel.any()):
+                continue
+            li, stat = self.mr(pred_stems[sel, i], tgt_stems[sel, i])  # (B',2,T)
+            mr_head_vals.append(li)
+            mr_sc_vals.append(stat["mr_sc"])
+            mr_lm_vals.append(stat["mr_logmag"])
+
+        if mr_head_vals:
+            mr_head = torch.stack(mr_head_vals).mean()
+            mr_sc = torch.stack(mr_sc_vals).mean()
+            mr_lm = torch.stack(mr_lm_vals).mean()
+        else:
+            mr_head = pred_stems.sum() * 0.0
+            mr_sc = pred_stems.sum() * 0.0
+            mr_lm = pred_stems.sum() * 0.0
+
+        # total
         total = (
             weights["w_l1_head"] * l1_head +
             weights["w_mr_head"] * mr_head +
@@ -332,7 +338,7 @@ def load_ckpt(
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
     map_location: str = "cpu",
 ) -> Tuple[int, int, Dict[str, Any]]:
-    ckpt = torch.load(str(path), map_location=map_location)
+    ckpt = torch.load(str(path), map_location=map_location, weights_only=False)
 
     sd = ckpt["model"]
     (model.module if hasattr(model, "module") else model).load_state_dict(sd, strict=True)
