@@ -14,10 +14,8 @@
 from __future__ import annotations
 
 import argparse
-import os
 import math
 import time
-import json
 import random
 from dataclasses import asdict
 from pathlib import Path
@@ -26,20 +24,12 @@ from typing import Dict, Tuple, Optional, Any
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-# --- your model ---
 from deep_separator import StemSeparator, SeparatorConfig
 
-# --- your dataset code must be importable; adjust module name as needed ---
-# It should provide:
-#   - scan_root_to_items(root) or load_manifest_csv(path)
-#   - RecipeBook.from_json_path(path)
-#   - FlexibleMixDataset(items, sr, segment_sec, recipe_book, epoch_size=...)
-#   - collate(batch)
-#   - STEM_ORDER (["bass","drums","music","vocals"])
 from train_phase_a import (
     scan_root_to_items,
     load_manifest_csv,
@@ -65,15 +55,18 @@ def set_tf32(enabled: bool) -> None:
         pass
 
 
-def make_autocast(amp: str):
+def make_autocast(amp: str, device: torch.device):
     amp = amp.lower().strip()
+    if device.type != "cuda":
+        return autocast("cpu", enabled=False), None, False  # на CPU amp не нужен
+
     if amp in ("off", "none", "0"):
-        return torch.cuda.amp.autocast(enabled=False), None, False
+        return autocast("cuda", enabled=False), None, False
     if amp == "fp16":
-        return torch.cuda.amp.autocast(dtype=torch.float16), torch.float16, True
+        return autocast("cuda", dtype=torch.float16), torch.float16, True
     if amp == "bf16":
-        return torch.cuda.amp.autocast(dtype=torch.bfloat16), torch.bfloat16, False
-    raise ValueError(f"--amp must be off|fp16|bf16, got {amp!r}")
+        return autocast("cuda", dtype=torch.bfloat16), torch.bfloat16, False
+    raise ValueError(...)
 
 
 # -------------------------
@@ -491,8 +484,8 @@ def main():
     sched = make_scheduler(opt, total_steps=total_steps, warmup_steps=int(args.warmup_steps))
 
     # amp
-    autocast_ctx, amp_dtype, use_scaler = make_autocast(args.amp)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    autocast_ctx, amp_dtype, use_scaler = make_autocast(args.amp, device)
+    scaler = GradScaler("cuda", enabled=use_scaler)
 
     # losses
     loss_comp = LossComputer(

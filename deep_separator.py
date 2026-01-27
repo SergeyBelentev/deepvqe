@@ -915,31 +915,35 @@ class MaskHeadPerResolution(nn.Module):
         gate_logits = self.head_gate(feat)     # (B,2,T,F)
 
         # gate probs (common for L/R)
-        gate_probs = torch.softmax(gate_logits, dim=1)  # (B,2,T,F)
-        p_crm = gate_probs[:, 0:1]
-        p_mp = gate_probs[:, 1:2]
+        gate_probs = torch.softmax(gate_logits.float(), dim=1)  # (B,2,T,F)
+        p_crm = gate_probs[:, 0:1]  # fp32
+        p_mp = gate_probs[:, 1:2]  # fp32
 
-        # cRM mask
-        L_re, L_im, R_re, R_im = crm_logits[:, 0], crm_logits[:, 1], crm_logits[:, 2], crm_logits[:, 3]
-        Mcrm_L = torch.complex(L_re, L_im)
-        Mcrm_R = torch.complex(R_re, R_im)
+        # --- cRM mask (собираем complex из fp32 -> complex64) ---
+        crm_f = crm_logits.float()
+        L_re, L_im, R_re, R_im = crm_f[:, 0], crm_f[:, 1], crm_f[:, 2], crm_f[:, 3]
+
+        Mcrm_L = torch.complex(L_re, L_im)  # complex64
+        Mcrm_R = torch.complex(R_re, R_im)  # complex64
         Mcrm_L = _crm_soft_scale(Mcrm_L)
         Mcrm_R = _crm_soft_scale(Mcrm_R)
 
-        # Mag+Phase mask
-        magL, magR, phiL, phiR = mp_logits[:, 0], mp_logits[:, 1], mp_logits[:, 2], mp_logits[:, 3]
+        # --- Mag+Phase mask (polar только fp32) ---
+        mp_f = mp_logits.float()
+        magL, magR, phiL, phiR = mp_f[:, 0], mp_f[:, 1], mp_f[:, 2], mp_f[:, 3]
         magL = torch.sigmoid(magL)
         magR = torch.sigmoid(magR)
         dphiL = torch.tanh(phiL) * math.pi
         dphiR = torch.tanh(phiR) * math.pi
-        Mmp_L = torch.polar(magL, dphiL)  # complex
+
+        Mmp_L = torch.polar(magL, dphiL)  # complex64 (теперь работает)
         Mmp_R = torch.polar(magR, dphiR)
 
-        # Mix candidates with gate
-        M_L = p_crm[:, 0] * Mcrm_L + p_mp[:, 0] * Mmp_L  # (B,T,F)
-        M_R = p_crm[:, 0] * Mcrm_R + p_mp[:, 0] * Mmp_R  # same p for both channels
+        # Mix candidates with gate (p_* fp32, маски complex64 -> итог complex64)
+        M_L = p_crm[:, 0] * Mcrm_L + p_mp[:, 0] * Mmp_L  # (B,T,F) complex64
+        M_R = p_crm[:, 0] * Mcrm_R + p_mp[:, 0] * Mmp_R
 
-        M = torch.stack([M_L, M_R], dim=1)  # (B,2,T,F) complex
+        M = torch.stack([M_L, M_R], dim=1)  # (B,2,T,F) complex64
         return M, gate_probs
 
 
@@ -1089,31 +1093,28 @@ class StemSeparator(nn.Module):
         return skips
 
     def _istft(self, S: torch.Tensor, n_fft: int, length: int) -> torch.Tensor:
-        """
-        S: (B,2,T,F) complex
-        length: desired output length (e.g. original N)
-        """
         device = S.device
         win = torch.hann_window(n_fft, periodic=True, device=device, dtype=torch.float32)
 
         out = []
-        for ch in range(2):
-            X = S[:, ch].transpose(-2, -1).contiguous()  # (B,F,T)
-            x = torch.istft(
-                X,
-                n_fft=n_fft,
-                hop_length=self.cfg.hop,
-                win_length=n_fft,
-                window=win,
-                center=self.cfg.center,
-                normalized=self.cfg.normalized,
-                onesided=True,
-                length=length,
-                return_complex=False,
-            )
-            out.append(x)
-
-        return torch.stack(out, dim=1)  # (B,2,length)
+        with torch.autocast(device_type=device.type, enabled=False):
+            S = S.to(torch.complex64)  # на всякий
+            for ch in range(2):
+                X = S[:, ch].transpose(-2, -1).contiguous()  # (B,F,T)
+                x = torch.istft(
+                    X,
+                    n_fft=n_fft,
+                    hop_length=self.cfg.hop,
+                    win_length=n_fft,
+                    window=win,
+                    center=self.cfg.center,
+                    normalized=self.cfg.normalized,
+                    onesided=True,
+                    length=length,
+                    return_complex=False,
+                )
+                out.append(x.float())
+        return torch.stack(out, dim=1)
 
     def forward(self, wav: torch.Tensor, return_debug: bool = False) -> Dict[str, torch.Tensor]:
         """
@@ -1142,7 +1143,8 @@ class StemSeparator(nn.Module):
             # zero-pad is simplest and stable; reflect is also possible but needs care with very short segments
             wav = F.pad(wav, (0, pad))
 
-        pack = self.fe(wav)  # STFT now sees padded wav
+        with torch.autocast(device_type=wav.device.type, enabled=False):
+            pack = self.fe(wav.float())
         X4096 = pack["X4096"]   # (B,2,T,2049) complex
         X2048 = pack["X2048"]   # (B,2,T,1025) complex
         Feat4096 = pack["Feat4096"]
