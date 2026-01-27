@@ -595,13 +595,18 @@ def _hz_to_bin_ceil(hz: float, sr: int, n_fft: int) -> int:
 
 def _build_band_bins(cfg, bands):
     out = {}
+    nyq = cfg.sample_rate / 2
     for b in bands:
         F = b.n_fft // 2 + 1
         k0 = _hz_to_bin_floor(b.hz_low, cfg.sample_rate, b.n_fft)
-        k1 = _hz_to_bin_ceil(b.hz_high, cfg.sample_rate, b.n_fft)
+
+        if b.hz_high >= nyq - 1e-6:
+            k1 = F
+        else:
+            k1 = _hz_to_bin_ceil(b.hz_high, cfg.sample_rate, b.n_fft)
 
         k0 = max(0, min(F - 1, k0))
-        k1 = max(k0 + 1, min(F, k1))  # k1 может быть == F (нормально для slice)
+        k1 = max(k0 + 1, min(F, k1))
         out[b.band_id] = slice(k0, k1)
     return out
 
