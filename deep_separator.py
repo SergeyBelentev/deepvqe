@@ -569,8 +569,9 @@ class StereoFeatureExtractor(nn.Module):
 
         # align T (they should be equal with same hop+center, but in practice can differ by 1)
         T = min(X4096.shape[2], X2048.shape[2])
-        X4096 = X4096[:, :, :T]
-        X2048 = X2048[:, :, :T]
+        T4 = (T // 4) * 4
+        X4096 = X4096[:, :, :T4]
+        X2048 = X2048[:, :, :T4]
 
         F4096 = X4096.shape[-1]
         F2048 = X2048.shape[-1]
@@ -1074,12 +1075,21 @@ class StemSeparator(nn.Module):
     def _istft(self, S: torch.Tensor, n_fft: int, length: int) -> torch.Tensor:
         """
         S: (B,2,T,F) complex
-        returns wav: (B,2,N)
+        length: desired output length (e.g. original N)
         """
         B, Ch, T, F_ = S.shape
         device = S.device
         dtype = S.real.dtype
         win = _make_hann_window(n_fft, device=device, dtype=dtype)
+
+        # Max reconstructable length given number of frames T
+        if self.cfg.center:
+            max_len = (T - 1) * self.cfg.hop
+        else:
+            max_len = (T - 1) * self.cfg.hop + n_fft
+
+        # You cannot ask istft for a longer signal than max_len when frames are truncated.
+        istft_len = min(length, max_len)
 
         out = []
         for ch in range(2):
@@ -1093,11 +1103,16 @@ class StemSeparator(nn.Module):
                 center=self.cfg.center,
                 normalized=self.cfg.normalized,
                 onesided=True,
-                length=length,
+                length=istft_len,
                 return_complex=False,
-            )  # (B,N)
+            )  # (B,istft_len)
+
+            # If you still want exact `length`, pad zeros (tail is uncovered anyway after frame truncation)
+            if istft_len < length:
+                x = F.pad(x, (0, length - istft_len))
             out.append(x)
-        return torch.stack(out, dim=1)  # (B,2,N)
+
+        return torch.stack(out, dim=1)  # (B,2,length)
 
     def forward(self, wav: torch.Tensor, return_debug: bool = False) -> Dict[str, torch.Tensor]:
         """
