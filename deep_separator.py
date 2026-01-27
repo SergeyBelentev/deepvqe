@@ -817,10 +817,9 @@ class DecoderStage(nn.Module):
 
 
 class HeadDecoder(nn.Module):
-    def __init__(self, cfg: SeparatorConfig, skip_tokenizers: Dict[int, StageSkipTokenizer]):
+    def __init__(self, cfg: SeparatorConfig):
         super().__init__()
         self.cfg = cfg
-        self.skip_tokenizers = skip_tokenizers  # stage -> tokenizer
 
         # Fusion convs per stage: concat([dec, skip]) -> 1x1 -> dec
         self.fuse5 = Conv1x1(cfg.c_d5 + cfg.c_e5, cfg.c_d5)
@@ -845,52 +844,41 @@ class HeadDecoder(nn.Module):
         self.a2 = AxialAttnF(cfg.c_d2, cfg.axial_heads, cfg.attn_dropout, cfg.ffn_dropout, use_log_rope=True)
         self.a1 = AxialAttnF(cfg.c_d1, cfg.axial_heads, cfg.attn_dropout, cfg.ffn_dropout, use_log_rope=True)
 
-    def _build_skip(self, enc_stages: Dict[int, Dict[int, torch.Tensor]], stage: int) -> torch.Tensor:
-        """
-        enc_stages[band_id][stage] = (B,Cs,Ts,Fb)
-        returns Skip_s: (B,Cs,Ts,K_total)
-        """
-        parts = []
-        for b in range(10):
-            xb = enc_stages[b][stage]
-            qb = self.skip_tokenizers[stage](xb, band_id=b)  # (B,Cs,Ts,Kb)
-            parts.append(qb)
-        return torch.cat(parts, dim=-1)  # (B,Cs,Ts,K_total)
-
-    def forward(self, trunk_out: torch.Tensor, enc_stages: Dict[int, Dict[int, torch.Tensor]]) -> torch.Tensor:
+    def forward(self, trunk_out: torch.Tensor, skips: Dict[int, torch.Tensor]) -> torch.Tensor:
         """
         trunk_out: (B,192,T/4,K_total)
-        returns D1_out: (B,96,T,K_total)
+        skips[s]:  (B,C_s,T_s,K_total) for s=1..5
+        returns: (B,96,T,K_total)
         """
         x = trunk_out
         # D5 @ T/4
-        skip5 = self._build_skip(enc_stages, stage=5)
+        skip5 = skips[5]
         x = self.fuse5(torch.cat([x, skip5], dim=1))
         x = self.d5(x)
         x = self.a5(x)
 
         # D4 @ T/4
-        skip4 = self._build_skip(enc_stages, stage=4)
+        skip4 = skips[4]
         x = self.fuse4(torch.cat([x, skip4], dim=1))
         x = self.d4(x)
         x = self.a4(x)
 
-        # D3: fuse на T/4, потом upsample внутри d3 -> T/2
-        skip3 = self._build_skip(enc_stages, stage=3)  # (B,160,T/4,K)
-        x = self.fuse3(torch.cat([x, skip3], dim=1))  # (B,160,T/4,K)
-        x = self.d3(x)  # -> (B,96,T/2,K)
+        # D3: fuse @ T/4, then upsample -> T/2
+        skip3 = skips[3]
+        x = self.fuse3(torch.cat([x, skip3], dim=1))
+        x = self.d3(x)
         x = self.a3(x)
 
-        # D2: fuse на T/2, потом upsample внутри d2 -> T
-        skip2 = self._build_skip(enc_stages, stage=2)  # (B,96,T/2,K)
-        x = self.fuse2(torch.cat([x, skip2], dim=1))  # (B,96,T/2,K)
-        x = self.d2(x)  # -> (B,32,T,K)
+        # D2: fuse @ T/2, then upsample -> T
+        skip2 = skips[2]
+        x = self.fuse2(torch.cat([x, skip2], dim=1))
+        x = self.d2(x)
         x = self.a2(x)
 
-        # D1: fuse на T
-        skip1 = self._build_skip(enc_stages, stage=1)  # (B,32,T,K)
-        x = self.fuse1(torch.cat([x, skip1], dim=1))  # (B,32,T,K)
-        x = self.d1(x)  # -> (B,96,T,K)
+        # D1 @ T
+        skip1 = skips[1]
+        x = self.fuse1(torch.cat([x, skip1], dim=1))
+        x = self.d1(x)
         x = self.a1(x)
 
         return x
@@ -1060,11 +1048,8 @@ class StemSeparator(nn.Module):
             "4": StageSkipTokenizer(cfg, stage=4, C=cfg.c_e4),
             "5": StageSkipTokenizer(cfg, stage=5, C=cfg.c_e5),
         })
-        skip_tok_map = {i: self.skip_tokenizers[str(i)] for i in range(1, 6)}
-
-        # Per-head decoders
         self.decoders = nn.ModuleDict({
-            h: HeadDecoder(cfg, skip_tok_map) for h in cfg.heads
+            h: HeadDecoder(cfg) for h in cfg.heads
         })
 
         # Shared detokenizers for mask heads
@@ -1089,6 +1074,23 @@ class StemSeparator(nn.Module):
             return Feat4096[..., sl]  # (B,7,T,Fb)
         else:
             return Feat2048[..., sl]
+
+    def _precompute_skips(self, enc_stages: Dict[int, Dict[int, torch.Tensor]]) -> Dict[int, torch.Tensor]:
+        """
+        Precompute Skip_s once per stage (independent of head).
+        Returns:
+          skips[s] = (B, C_s, T_s, K_total) for s in 1..5
+        """
+        skips: Dict[int, torch.Tensor] = {}
+        for s in range(1, 6):
+            tok = self.skip_tokenizers[str(s)]
+            parts = []
+            for b in range(10):
+                xb = enc_stages[b][s]  # (B,Cs,Ts,Fb)
+                qb = tok(xb, band_id=b)  # (B,Cs,Ts,Kb)
+                parts.append(qb)
+            skips[s] = torch.cat(parts, dim=-1)  # (B,Cs,Ts,K_total)
+        return skips
 
     def _istft(self, S: torch.Tensor, n_fft: int, length: int) -> torch.Tensor:
         """
@@ -1180,9 +1182,11 @@ class StemSeparator(nn.Module):
         out: Dict[str, torch.Tensor] = {}
         debug: Dict[str, Dict[str, torch.Tensor]] = {} if return_debug else None
 
+        skips = self._precompute_skips(enc_stages)
+
         for h in self.cfg.heads:
             # 4.1) per-head decoder
-            d1_tokens = self.decoders[h](x_trunk, enc_stages)  # (B,96,T,K_total)
+            d1_tokens = self.decoders[h](x_trunk, skips)  # (B,96,T,K_total)
 
             # 4.2) per-resolution masks
             M4096, gate4096 = self.mask_heads_4096[h](d1_tokens)  # (B,2,T,2049)
