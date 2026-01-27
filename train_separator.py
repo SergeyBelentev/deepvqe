@@ -93,23 +93,20 @@ class MultiResolutionSTFTLoss(nn.Module):
     ):
         super().__init__()
         assert len(n_ffts) == len(hops)
-        self.n_ffts = tuple(int(x) for x in n_ffts)
-        self.hops = tuple(int(x) for x in hops)
-        self.win_lengths = tuple(int(x) for x in (win_lengths or n_ffts))
+        self.n_ffts = tuple(map(int, n_ffts))
+        self.hops = tuple(map(int, hops))
+        self.win_lengths = tuple(map(int, (win_lengths or n_ffts)))
         self.center = bool(center)
         self.normalized = bool(normalized)
         self.eps = float(eps)
         self.w_sc = float(w_sc)
         self.w_lm = float(w_lm)
 
-        self.register_buffer("_dummy", torch.tensor(0.0), persistent=False)
-
     def _stft_mag(self, x: torch.Tensor, n_fft: int, hop: int, win_length: int) -> torch.Tensor:
-        # x: (B,2,T) float
+        # x: (B,2,T)
         B, C, T = x.shape
-        dev = x.device
-        win = torch.hann_window(win_length, periodic=True, device=dev, dtype=torch.float32)
-        x2 = x.reshape(B * C, T)  # (B*C, T)
+        win = torch.hann_window(win_length, periodic=True, device=x.device, dtype=torch.float32)
+        x2 = x.reshape(B * C, T)
         S = torch.stft(
             x2,
             n_fft=n_fft,
@@ -120,24 +117,28 @@ class MultiResolutionSTFTLoss(nn.Module):
             normalized=self.normalized,
             onesided=True,
             return_complex=True,
-        )  # (B*C, F, TT) complex64/complex32
-        mag = S.abs()  # (B*C, F, TT)
+        )  # (B*C, F, TT)
+        mag = S.abs().reshape(B, C, S.shape[-2], S.shape[-1])  # (B,C,F,TT)
         return mag
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
         # x,y: (B,2,T)
-        sc_all = []
-        lm_all = []
+        sc_all, lm_all = [], []
         for n_fft, hop, wl in zip(self.n_ffts, self.hops, self.win_lengths):
-            mx = self._stft_mag(x, n_fft, hop, wl)
+            mx = self._stft_mag(x, n_fft, hop, wl)  # (B,C,F,TT)
             my = self._stft_mag(y, n_fft, hop, wl)
 
-            diff = (mx - my)
-            sc = diff.norm(p="fro") / (my.norm(p="fro") + self.eps)
+            diff = mx - my  # (B,C,F,TT)
 
+            # SC per (B,C)
+            diff_fro = torch.linalg.vector_norm(diff.flatten(2), dim=2)  # (B,C)
+            my_fro   = torch.linalg.vector_norm(my.flatten(2), dim=2).clamp_min(self.eps)  # (B,C)
+            sc = (diff_fro / my_fro).mean()  # scalar
+
+            # LogMag per (B,C)
             lmx = (mx + self.eps).log()
             lmy = (my + self.eps).log()
-            lm = (lmx - lmy).abs().mean()
+            lm = (lmx - lmy).abs().mean(dim=(2, 3)).mean()  # scalar
 
             sc_all.append(sc)
             lm_all.append(lm)
@@ -234,14 +235,19 @@ class LossComputer(nn.Module):
 
         # leak loss (simple but effective):
         # minimize similarity of pred_i to sum(target_other)
+        mix_tgt_present = (tgt_stems * pm).sum(dim=1)  # (B,2,T) сумма только присутствующих таргетов
+
         leak_terms = []
         for i in range(4):
-            other = tgt_stems.sum(dim=1) - tgt_stems[:, i]  # (B,2,T)
-            sim = cosine_abs(pred_stems[:, i], other)       # (B,)
-            # ignore cases where other is ~0
-            other_ok = (rms(other) > self.silence_rms_thr)
-            if other_ok.any():
-                leak_terms.append(sim[other_ok].mean())
+            sel_i = present_mask[:, i] > 0.5
+            if not bool(sel_i.any()):
+                continue
+
+            other = mix_tgt_present - tgt_stems[:, i] * pm[:, i]  # только "другие присутствующие"
+            ok = sel_i & (rms(other) > self.silence_rms_thr) & (rms(tgt_stems[:, i]) > self.silence_rms_thr)
+            if bool(ok.any()):
+                leak_terms.append(cosine_abs(pred_stems[ok, i], other[ok]).mean())
+
         leak_loss = torch.stack(leak_terms).mean() if leak_terms else pred_stems.sum() * 0.0
 
         # MR per head, only when present AND target is not silent
