@@ -154,14 +154,13 @@ class MHSA(nn.Module):
 
 class MHCA(nn.Module):
     """Multi-head Cross-Attention: queries attend to context (keys/values)."""
-    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0, use_rope_on_ctx: bool = False):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0):
         super().__init__()
         assert dim % num_heads == 0
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.dropout = dropout
-        self.use_rope_on_ctx = use_rope_on_ctx
 
         self.q_proj = nn.Linear(dim, dim, bias=True)
         self.k_proj = nn.Linear(dim, dim, bias=True)
@@ -172,7 +171,6 @@ class MHCA(nn.Module):
         self,
         q_in: torch.Tensor,          # (B, Lq, C)
         ctx: torch.Tensor,           # (B, Lk, C)
-        rope_cache_ctx: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         B, Lq, C = q_in.shape
         _, Lk, _ = ctx.shape
@@ -180,13 +178,6 @@ class MHCA(nn.Module):
         q = self.q_proj(q_in).view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)  # (B,H,Lq,D)
         k = self.k_proj(ctx).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)   # (B,H,Lk,D)
         v = self.v_proj(ctx).view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)   # (B,H,Lk,D)
-
-        if self.use_rope_on_ctx:
-            assert rope_cache_ctx is not None, "rope_cache_ctx required when use_rope_on_ctx=True"
-            sin, cos = rope_cache_ctx  # (Lk, D/2)
-            # apply RoPE to k (and also q if desired). Here we apply only to k for "ctx positioning".
-            # If you want strict RoPE, apply to both q and k with the SAME cache based on positions.
-            q, k = _apply_rope(q, k, sin[:Lq], cos[:Lq]) if Lq == Lk else (q, k)
 
         attn = F.scaled_dot_product_attention(
             q, k, v,
@@ -324,7 +315,7 @@ class PerTimeTokenizer(nn.Module):
         self.q = nn.Parameter(torch.randn(K, dim) * 0.02)
         self.ln_q = nn.LayerNorm(dim)
         self.ln_ctx = nn.LayerNorm(dim)
-        self.ca = MHCA(dim, num_heads, dropout=attn_dropout, use_rope_on_ctx=False)
+        self.ca = MHCA(dim, num_heads, dropout=attn_dropout)
 
     def forward(self, x: torch.Tensor, q_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B,C,T,F)
@@ -354,7 +345,7 @@ class PerTimeDetokenizer(nn.Module):
         self.q = nn.Parameter(torch.randn(F_out, dim) * 0.02)
         self.ln_q = nn.LayerNorm(dim)
         self.ln_ctx = nn.LayerNorm(dim)
-        self.ca = MHCA(dim, num_heads, dropout=attn_dropout, use_rope_on_ctx=False)
+        self.ca = MHCA(dim, num_heads, dropout=attn_dropout)
 
     def forward(self, x: torch.Tensor, q_bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # x: (B,C,T,K)
@@ -781,7 +772,7 @@ class StageSkipTokenizer(nn.Module):
         assert C % self.num_heads == 0
 
         # shared cross-attn projections:
-        self.ca = MHCA(C, cfg.trunk_heads, dropout=cfg.attn_dropout, use_rope_on_ctx=False)
+        self.ca = MHCA(C, cfg.trunk_heads, dropout=cfg.attn_dropout)
         self.ln_q = nn.LayerNorm(C)
         self.ln_ctx = nn.LayerNorm(C)
 
