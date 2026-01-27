@@ -32,10 +32,9 @@ def _crm_soft_scale(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     mag = torch.abs(z)
     return z / (1.0 + mag + eps)
 
-def _make_hann_window(n_fft: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    # keep window in float32 for numerical stability even under autocast
-    win = torch.hann_window(n_fft, periodic=True, device=device, dtype=torch.float32)
-    return win.to(dtype=dtype)
+def _make_hann_window(n_fft: int, device: torch.device) -> torch.Tensor:
+    return torch.hann_window(n_fft, periodic=True, device=device, dtype=torch.float32)
+
 
 def _downsample_logits_4096_to_2048(a4096: torch.Tensor) -> torch.Tensor:
     """
@@ -507,10 +506,8 @@ class StereoFeatureExtractor(nn.Module):
         wav: (B,2,N)
         returns complex STFT: (B,2,T,F)
         """
-        B, Ch, N = wav.shape
         device = wav.device
-        dtype = wav.dtype
-        win = _make_hann_window(n_fft, device=device, dtype=dtype)
+        win = _make_hann_window(n_fft, device=device)
 
         # torch.stft expects (B,N) or (N,)
         X = []
@@ -716,6 +713,26 @@ class TrunkFPosEmbedding(nn.Module):
         assert K == self.band_ids.numel()
         pe = self.band_emb(self.band_ids) + self.slot_emb(self.slot_ids)  # (K,C)
         pe = pe.t().unsqueeze(0).unsqueeze(2)  # (1,C,1,K)
+        return x + pe
+
+
+class TrunkTPosEmbedding(nn.Module):
+    """
+    Adds abs position embedding on T' axis:
+      x: (B,C,T,K) -> x + pe_t where pe_t broadcasted over K
+    """
+    def __init__(self, cfg: SeparatorConfig):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, cfg.c_trunk),
+            nn.SiLU(),
+            nn.Linear(cfg.c_trunk, cfg.c_trunk),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, T, K = x.shape
+        pos = torch.linspace(0, 1, steps=T, device=x.device, dtype=x.dtype).view(T, 1)  # (T,1)
+        pe = self.mlp(pos).t().unsqueeze(0).unsqueeze(-1)  # (1,C,T,1)
         return x + pe
 
 
@@ -1031,6 +1048,7 @@ class StemSeparator(nn.Module):
 
         # Trunk embeddings and trunk
         self.trunk_pos = TrunkFPosEmbedding(cfg)
+        self.trunk_tpos = TrunkTPosEmbedding(cfg)
         self.trunk = TrunkMSHA(cfg)
 
         # Skip tokenizers per stage (shared per stage)
@@ -1150,6 +1168,7 @@ class StemSeparator(nn.Module):
 
         # add factorized (band+slot) embedding on pseudo-frequency axis
         x_trunk = self.trunk_pos(x_trunk)
+        x_trunk = self.trunk_tpos(x_trunk)  # abs-pos on T' axis
 
         # 3) Trunk MSHA
         x_trunk = self.trunk(x_trunk)  # (B,192,T/4,K_total)
