@@ -1,12 +1,4 @@
 # train_separator.py
-# Train script for StemSeparator (deep_separator.py)
-# Added:
-#  1) validation split by whole songs (items) not segments
-#  2) auto validation after each epoch
-#  3) optional ckpt upload to S3
-#  4) optional validation artifacts save to disk
-#  5) optional validation artifacts upload to S3 (tar.gz)
-
 from __future__ import annotations
 
 import argparse
@@ -18,12 +10,16 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any, List
+import os
+import datetime
+from contextlib import nullcontext
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from deep_separator import StemSeparator, SeparatorConfig
@@ -598,6 +594,88 @@ def run_validation(
         model.train()
     return means
 
+# DDP Helpers
+def ddp_enabled_from_env() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+def ddp_setup(backend: str = "nccl", timeout_sec: int = 1800) -> Dict[str, int]:
+    """
+    Инициализация DDP через env:// (torchrun задаёт RANK/WORLD_SIZE/LOCAL_RANK).
+    """
+    import torch.distributed as dist
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=datetime.timedelta(seconds=int(timeout_sec)),
+        )
+
+    return {"world_size": world_size, "rank": rank, "local_rank": local_rank}
+
+def ddp_cleanup() -> None:
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+def ddp_barrier() -> None:
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
+
+def ddp_broadcast_object(obj, src: int = 0):
+    """
+    Удобно для broadcast списков/словарей (python objects) через dist.broadcast_object_list.
+    """
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        return obj
+    box = [obj]
+    dist.broadcast_object_list(box, src=src)
+    return box[0]
+
+def ddp_reduce_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """
+    Усредняет скаляры stats по всем ранкам (1 all_reduce на вектор).
+    Вызывай НЕ каждый итерационный шаг, а только когда реально логируешь.
+    """
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        return {k: float(v.item()) for k, v in stats.items()}
+
+    keys = sorted(stats.keys())
+    vec = torch.stack([stats[k].detach().float() for k in keys], dim=0)
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    vec /= dist.get_world_size()
+
+    return {k: float(vec[i].item()) for i, k in enumerate(keys)}
+
+def item_uid_for_split(it: Any) -> str:
+    """
+    Стабильный uid для split'а по песням.
+    """
+    try:
+        if isinstance(it, dict):
+            for k in ("uid", "id", "key", "folder", "name", "full"):
+                v = it.get(k, None)
+                if v:
+                    return str(v)
+        # на случай объектов
+        for k in ("uid", "id", "key", "folder", "name", "full"):
+            if hasattr(it, k):
+                v = getattr(it, k)
+                if v:
+                    return str(v)
+    except Exception:
+        pass
+    return repr(it)
 
 # -------------------------
 # CLI
@@ -670,6 +748,13 @@ def parse_args():
     p.add_argument("--upload-ckpt-s3", type=int, default=0, help="1 to upload checkpoints to S3")
     p.add_argument("--upload-val-s3", type=int, default=0, help="1 to upload validation artifacts to S3 (tar.gz)")
 
+    # --- DDP
+    p.add_argument("--ddp", type=int, default=0, help="1 to force DDP (requires torchrun env vars)")
+    p.add_argument("--ddp-backend", type=str, default="nccl", choices=["nccl", "gloo"])
+    p.add_argument("--ddp-timeout-sec", type=int, default=1800)
+    p.add_argument("--ddp-broadcast-buffers", type=int, default=0)
+    p.add_argument("--ddp-gradient-as-bucket-view", type=int, default=1)
+
     return p.parse_args()
 
 
@@ -682,12 +767,41 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # --- DDP init (torchrun sets env)
+    force_ddp = bool(int(args.ddp))
+    env_ddp = ddp_enabled_from_env()
+    use_ddp = env_ddp or force_ddp
+
+    if force_ddp and not env_ddp:
+        raise RuntimeError("DDP forced (--ddp=1) but WORLD_SIZE=1. Run with torchrun.")
+
+    ddp_info = {"world_size": 1, "rank": 0, "local_rank": 0}
+    if use_ddp:
+        ddp_info = ddp_setup(backend=args.ddp_backend, timeout_sec=int(args.ddp_timeout_sec))
+
+    rank = int(ddp_info["rank"])
+    world_size = int(ddp_info["world_size"])
+    local_rank = int(ddp_info["local_rank"])
+    main_proc = is_main_process(rank)
+
+    # --- device: one process -> one GPU (LOCAL_RANK)
+    if torch.cuda.is_available():
+        if use_ddp:
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
     set_tf32(bool(args.tf32))
 
-    torch.manual_seed(1234)
-    np.random.seed(1234)
-    random.seed(1234)
+    base_seed = 1234
+    seed = base_seed + (rank if use_ddp else 0)
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     # dataset items (each item ~= song)
     if args.root:
@@ -696,16 +810,34 @@ def main():
         items = load_manifest_csv(args.manifest)
 
     # split by full songs
-    train_items, val_items = split_items_train_val(
-        items,
-        val_frac=float(args.val_frac),
-        val_count=int(args.val_count),
-        seed=int(args.val_seed),
-    )
+    if use_ddp:
+        if main_proc:
+            train_items0, val_items0 = split_items_train_val(
+                items,
+                val_frac=float(args.val_frac),
+                val_count=int(args.val_count),
+                seed=int(args.val_seed),
+            )
+            val_ids = [item_uid_for_split(x) for x in val_items0]
+        else:
+            val_ids = None
+
+        val_ids = ddp_broadcast_object(val_ids, src=0)
+        val_id_set = set(val_ids or [])
+
+        train_items = [it for it in items if item_uid_for_split(it) not in val_id_set]
+        val_items = [it for it in items if item_uid_for_split(it) in val_id_set]
+    else:
+        train_items, val_items = split_items_train_val(
+            items,
+            val_frac=float(args.val_frac),
+            val_count=int(args.val_count),
+            seed=int(args.val_seed),
+        )
 
     if len(train_items) == 0:
         raise RuntimeError("Train set is empty after split. Reduce --val-frac/--val-count or check dataset.")
-    if len(val_items) == 0:
+    if len(val_items) == 0 and main_proc:
         print("[warn] validation set is empty (val_frac/val_count resulted in 0). Validation will be skipped.")
 
     book = RecipeBook.from_json_path(args.recipes)
@@ -720,10 +852,22 @@ def main():
         epoch_size=int(args.epoch_size),
     )
 
+    train_sampler = None
+    if use_ddp:
+        train_sampler = DistributedSampler(
+            ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=base_seed,
+            drop_last=True,
+        )
+
     dl = DataLoader(
         ds,
         batch_size=int(args.batch),
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=int(args.num_workers),
         pin_memory=True,
         persistent_workers=(int(args.num_workers) > 0),
@@ -734,7 +878,7 @@ def main():
 
     # val dataset (segments sampled ONLY from held-out songs)
     dl_val = None
-    if len(val_items) > 0:
+    if main_proc and len(val_items) > 0:
         ds_val = FlexibleMixDataset(
             val_items,
             sr=cfg.sample_rate,
@@ -757,6 +901,16 @@ def main():
     # model
     model = StemSeparator(cfg).to(device)
     model.train()
+
+    if use_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            broadcast_buffers=bool(int(args.ddp_broadcast_buffers)),
+            gradient_as_bucket_view=bool(int(args.ddp_gradient_as_bucket_view)),
+        )
 
     # optimizer (fused if possible)
     opt = None
@@ -817,7 +971,7 @@ def main():
     if (upload_ckpt_s3 or upload_val_s3) and not s3_bucket:
         raise RuntimeError("S3 upload enabled but --s3-bucket is empty.")
 
-    if (upload_ckpt_s3 or upload_val_s3) and s3_bucket:
+    if main_proc and (upload_ckpt_s3 or upload_val_s3) and s3_bucket:
         s3 = build_s3_client(
             region=args.s3_region,
             endpoint_url=args.s3_endpoint_url,
@@ -828,6 +982,8 @@ def main():
         )
 
     def maybe_upload(local_path: Path, key_name: str) -> None:
+        if not main_proc:
+            return
         if s3 is None or not s3_bucket:
             return
         key = join_s3_key(s3_prefix, key_name)
@@ -854,6 +1010,9 @@ def main():
 
     for epoch in range(start_epoch, int(args.epochs) + 1):
         ds.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         if dl_val is not None:
             # чтобы валидация тоже была воспроизводимой по эпохам
             try:
@@ -861,7 +1020,7 @@ def main():
             except Exception:
                 pass
 
-        pbar = tqdm(dl, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True)
+        pbar = tqdm(dl, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True) if main_proc else dl
         ema: Dict[str, float] = {}
 
         accum = int(args.grad_accum)
@@ -884,12 +1043,16 @@ def main():
                 )
                 loss_scaled = loss / float(accum)
 
-            if use_scaler:
-                scaler.scale(loss_scaled).backward()
-            else:
-                loss_scaled.backward()
-
             do_step = ((it + 1) % accum == 0)
+            sync_ctx = nullcontext()
+            if use_ddp and not do_step:
+                sync_ctx = model.no_sync()  # type: ignore[union-attr]
+            with sync_ctx:
+                if use_scaler:
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
+
             if do_step:
                 if use_scaler:
                     scaler.unscale_(opt)
@@ -906,24 +1069,25 @@ def main():
                 sched.step()
                 global_step += 1
 
-                if (global_step % int(args.log_every)) == 0:
-                    for k, v in stats.items():
-                        x = float(v.item())
+                if main_proc and (global_step % int(args.log_every)) == 0:
+                    stats_f = ddp_reduce_stats(stats) if use_ddp else {k: float(v.item()) for k, v in stats.items()}
+
+                    for k, x in stats_f.items():
                         ema[k] = x if k not in ema else (0.9 * ema[k] + 0.1 * x)
 
                     lr = opt.param_groups[0]["lr"]
                     pbar.set_postfix({
                         "lr": f"{lr:.2e}",
-                        "loss": f"{ema.get('loss_total', float(stats['loss_total'])):.4f}",
-                        "l1h": f"{ema.get('l1_head', float(stats['l1_head'])):.3f}",
-                        "mrh": f"{ema.get('mr_head', float(stats['mr_head'])):.3f}",
-                        "mix": f"{ema.get('l1_mix', float(stats['l1_mix'])):.3f}",
-                        "sil": f"{ema.get('silence', float(stats['silence'])):.3f}",
-                        "leak": f"{ema.get('leak', float(stats['leak'])):.3f}",
+                        "loss": f"{ema.get('loss_total', stats_f['loss_total']):.4f}",
+                        "l1h": f"{ema.get('l1_head', stats_f['l1_head']):.3f}",
+                        "mrh": f"{ema.get('mr_head', stats_f['mr_head']):.3f}",
+                        "mix": f"{ema.get('l1_mix', stats_f['l1_mix']):.3f}",
+                        "sil": f"{ema.get('silence', stats_f['silence']):.3f}",
+                        "leak": f"{ema.get('leak', stats_f['leak']):.3f}",
                     })
 
                 # step ckpt
-                if int(args.save_every_step) > 0 and (global_step % int(args.save_every_step)) == 0:
+                if main_proc and int(args.save_every_step) > 0 and (global_step % int(args.save_every_step)) == 0:
                     ckpt_step = out_dir / f"ckpt_step_{global_step:08d}.pt"
                     save_ckpt(
                         ckpt_step,
@@ -953,7 +1117,7 @@ def main():
                         maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
 
         # end epoch: save epoch ckpt (by epoch counter, not by global_step)
-        if int(args.save_every_epoch) > 0 and (epoch % int(args.save_every_epoch)) == 0:
+        if main_proc and int(args.save_every_epoch) > 0 and (epoch % int(args.save_every_epoch)) == 0:
             ckpt_epoch = out_dir / f"ckpt_epoch_{epoch:04d}.pt"
             save_ckpt(
                 ckpt_epoch,
@@ -969,23 +1133,27 @@ def main():
             if upload_ckpt_s3:
                 maybe_upload(ckpt_epoch, key_name=f"ckpt/ckpt_epoch_{epoch:04d}.pt")
 
-        # always update last
-        save_ckpt(
-            out_dir / "ckpt_last.pt",
-            model=model,
-            opt=opt,
-            sched=sched,
-            scaler=scaler if use_scaler else None,
-            epoch=epoch,
-            step=global_step,
-            cfg=cfg,
-            extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
-        )
-        if upload_ckpt_s3:
-            maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
+        if main_proc:
+            # always update last
+            save_ckpt(
+                out_dir / "ckpt_last.pt",
+                model=model,
+                opt=opt,
+                sched=sched,
+                scaler=scaler if use_scaler else None,
+                epoch=epoch,
+                step=global_step,
+                cfg=cfg,
+                extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
+            )
+            if upload_ckpt_s3:
+                maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
 
         # --- validation after epoch
-        if dl_val is not None:
+        if use_ddp:
+            ddp_barrier()
+
+        if main_proc and dl_val is not None:
             save_audio = bool(int(args.val_save_audio))
             save_n_audio = int(args.val_save_n_audio)
 
@@ -998,7 +1166,7 @@ def main():
                 autocast_ctx=autocast_ctx,
                 weights=weights,
                 max_batches=int(args.val_max_batches),
-                save_dir=val_root if (save_audio or True) else None,
+                save_dir=val_root,
                 save_n_audio=save_n_audio,
                 save_audio=save_audio,
                 sr=int(cfg.sample_rate),
@@ -1023,14 +1191,20 @@ def main():
 
             # upload validation artifacts (tar.gz) if requested
             if upload_val_s3:
-                # pack whole epoch folder to single object
-                base_name = str(epoch_dir)  # shutil will append .tar.gz
+                base_name = str(epoch_dir)
                 archive_path = Path(shutil.make_archive(base_name, "gztar", root_dir=str(epoch_dir)))
                 maybe_upload(archive_path, key_name=f"val/epoch_{epoch:04d}.tar.gz")
+
+        if use_ddp:
+            ddp_barrier()  # rank0 закончил валидацию — отпускаем остальных
+
 
     dt = time.time() - t0
     print(f"[done] time={dt/3600:.2f}h, steps={global_step}, out={out_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        ddp_cleanup()
