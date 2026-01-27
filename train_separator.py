@@ -1,25 +1,23 @@
 # train_separator.py
-# Train script for StemSeparator (stem_separator.py)
-# - AMP: fp16/bf16/off
-# - TF32 on/off
-# - resume checkpoints
-# - tqdm logging
-# - segment-sec dataset control (default 8s)
-#
-# Usage examples:
-#   python train_separator.py --root /path/to/ds --recipes recipes.json --out runs/exp1
-#   python train_separator.py --manifest manifest.csv --recipes recipes.json --out runs/exp1 --amp bf16 --tf32 1
-#   python train_separator.py --root /path/to/ds --recipes recipes.json --out runs/exp1 --resume runs/exp1/ckpt_last.pt
+# Train script for StemSeparator (deep_separator.py)
+# Added:
+#  1) validation split by whole songs (items) not segments
+#  2) auto validation after each epoch
+#  3) optional ckpt upload to S3
+#  4) optional validation artifacts save to disk
+#  5) optional validation artifacts upload to S3 (tar.gz)
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
-import time
 import random
+import shutil
+import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Dict, Tuple, Optional, Any
+from typing import Dict, Tuple, Optional, Any, List
 
 import numpy as np
 import torch
@@ -45,10 +43,8 @@ from train_phase_a import (
 # -------------------------
 
 def set_tf32(enabled: bool) -> None:
-    # affects matmul/conv on Ampere+; attention SDPA may also benefit indirectly
     torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
     torch.backends.cudnn.allow_tf32 = bool(enabled)
-    # optional: matmul precision hint (PyTorch 2.x)
     try:
         torch.set_float32_matmul_precision("high" if enabled else "highest")
     except Exception:
@@ -58,7 +54,7 @@ def set_tf32(enabled: bool) -> None:
 def make_autocast(amp: str, device: torch.device):
     amp = amp.lower().strip()
     if device.type != "cuda":
-        return autocast("cpu", enabled=False), None, False  # на CPU amp не нужен
+        return autocast("cpu", enabled=False), None, False
 
     if amp in ("off", "none", "0"):
         return autocast("cuda", enabled=False), None, False
@@ -66,7 +62,7 @@ def make_autocast(amp: str, device: torch.device):
         return autocast("cuda", dtype=torch.float16), torch.float16, True
     if amp == "bf16":
         return autocast("cuda", dtype=torch.bfloat16), torch.bfloat16, False
-    raise ValueError(...)
+    raise ValueError(f"Unknown --amp={amp!r}. Use off|fp16|bf16.")
 
 
 # -------------------------
@@ -154,12 +150,10 @@ class MultiResolutionSTFTLoss(nn.Module):
 # -------------------------
 
 def rms(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    # x: (B,2,T) -> (B,)
     return torch.sqrt(x.pow(2).mean(dim=(1, 2)).clamp_min(eps))
 
 
 def cosine_abs(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # a,b: (B,2,T) -> (B,)
     av = a.reshape(a.shape[0], -1)
     bv = b.reshape(b.shape[0], -1)
     num = (av * bv).sum(dim=1)
@@ -169,7 +163,6 @@ def cosine_abs(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Ten
 
 @torch.no_grad()
 def _mean_where(x: torch.Tensor, m: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    # x: (B,4) or (B,) ; m same shape bool/float
     mf = m.float()
     return (x * mf).sum() / (mf.sum() + eps)
 
@@ -209,48 +202,37 @@ class LossComputer(nn.Module):
         B, H, C, T = pred_stems.shape
         assert H == 4 and C == 2
 
-        # normalize by mix amplitude (stabilizes scale; matches "L1 on stem / mix")
         mix_scale = mix_target.abs().mean(dim=(1, 2), keepdim=True).clamp_min(self.eps)  # (B,1,1)
-
-        # reconstruction per head only when present (unconditional partial mixes)
         pm = present_mask.view(B, H, 1, 1)  # (B,4,1,1)
+
         l1_per = (pred_stems - tgt_stems).abs().mean(dim=(2, 3))  # (B,4)
         l1_per_norm = l1_per / mix_scale.squeeze(-1)  # (B,4)
         l1_head = (l1_per_norm * present_mask).sum() / (present_mask.sum() + self.eps)
 
-        # mix consistency: sum heads should match mix_target (stem_sum)
         mix_pred = pred_stems.sum(dim=1)  # (B,2,T)
         l1_mix = (mix_pred - mix_target).abs().mean(dim=(1, 2)) / mix_scale.squeeze(-1).squeeze(-1)
         l1_mix = l1_mix.mean()
         mr_mix, mr_mix_stat = self.mr(mix_pred, mix_target)
 
-        # silence loss:
-        #   1) stems that are absent in recipe (present_mask==0)
-        #   2) or stems that are actually quiet by RMS in target
         tgt_rms = torch.stack([rms(tgt_stems[:, i]) for i in range(4)], dim=1)  # (B,4)
         silence_mask = (present_mask <= 0.0) | (tgt_rms < self.silence_rms_thr)  # (B,4) bool
-        # penalize absolute energy of prediction for silence stems
         pred_abs = pred_stems.abs().mean(dim=(2, 3))  # (B,4)
         silence_loss = _mean_where(pred_abs, silence_mask)
 
-        # leak loss (simple but effective):
-        # minimize similarity of pred_i to sum(target_other)
-        mix_tgt_present = (tgt_stems * pm).sum(dim=1)  # (B,2,T) сумма только присутствующих таргетов
+        mix_tgt_present = (tgt_stems * pm).sum(dim=1)  # (B,2,T)
 
         leak_terms = []
         for i in range(4):
             sel_i = present_mask[:, i] > 0.5
             if not bool(sel_i.any()):
                 continue
-
-            other = mix_tgt_present - tgt_stems[:, i] * pm[:, i]  # только "другие присутствующие"
+            other = mix_tgt_present - tgt_stems[:, i] * pm[:, i]
             ok = sel_i & (rms(other) > self.silence_rms_thr) & (rms(tgt_stems[:, i]) > self.silence_rms_thr)
             if bool(ok.any()):
                 leak_terms.append(cosine_abs(pred_stems[ok, i], other[ok]).mean())
 
         leak_loss = torch.stack(leak_terms).mean() if leak_terms else pred_stems.sum() * 0.0
 
-        # MR per head, only when present AND target is not silent
         mr_head_vals = []
         mr_sc_vals = []
         mr_lm_vals = []
@@ -261,7 +243,7 @@ class LossComputer(nn.Module):
             sel = mr_mask[:, i]
             if not bool(sel.any()):
                 continue
-            li, stat = self.mr(pred_stems[sel, i], tgt_stems[sel, i])  # (B',2,T)
+            li, stat = self.mr(pred_stems[sel, i], tgt_stems[sel, i])
             mr_head_vals.append(li)
             mr_sc_vals.append(stat["mr_sc"])
             mr_lm_vals.append(stat["mr_logmag"])
@@ -275,7 +257,6 @@ class LossComputer(nn.Module):
             mr_sc = pred_stems.sum() * 0.0
             mr_lm = pred_stems.sum() * 0.0
 
-        # total
         total = (
             weights["w_l1_head"] * l1_head +
             weights["w_mr_head"] * mr_head +
@@ -374,11 +355,10 @@ def load_ckpt(
 
 
 # -------------------------
-# Schedulers
+# Scheduler
 # -------------------------
 
 def make_scheduler(opt, total_steps: int, warmup_steps: int):
-    # cosine with linear warmup
     def lr_lambda(s: int):
         if s < warmup_steps:
             return float(s) / float(max(1, warmup_steps))
@@ -389,7 +369,238 @@ def make_scheduler(opt, total_steps: int, warmup_steps: int):
 
 
 # -------------------------
-# Main
+# Train/Val split by songs (items)
+# -------------------------
+
+def split_items_train_val(
+    items: List[Any],
+    *,
+    val_frac: float,
+    val_count: int,
+    seed: int,
+) -> Tuple[List[Any], List[Any]]:
+    n = len(items)
+    if n == 0:
+        return [], []
+    if val_count > 0:
+        nv = int(val_count)
+    else:
+        nv = int(round(float(val_frac) * n))
+
+    # guarantee: val uses whole songs, and train has at least 1 song if possible
+    nv = max(0, nv)
+    if n >= 2:
+        nv = min(nv, n - 1)
+    else:
+        nv = min(nv, n)
+
+    if nv == 0:
+        return list(items), []
+
+    idx = list(range(n))
+    rng = random.Random(int(seed))
+    rng.shuffle(idx)
+    val_idx = set(idx[:nv])
+
+    train_items = [items[i] for i in range(n) if i not in val_idx]
+    val_items = [items[i] for i in range(n) if i in val_idx]
+    return train_items, val_items
+
+
+# -------------------------
+# S3 helpers (optional)
+# -------------------------
+
+def build_s3_client(
+    *,
+    region: str = "",
+    endpoint_url: str = "",
+    access_key_id: str = "",
+    secret_access_key: str = "",
+    session_token: str = "",
+    profile: str = "",
+):
+    try:
+        import boto3
+        from botocore.config import Config as BotocoreConfig
+    except Exception as e:
+        raise RuntimeError(f"S3 requested but boto3/botocore not available: {e}")
+
+    cfg = BotocoreConfig(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
+    )
+    endpoint = endpoint_url or None
+
+    if profile:
+        sess = boto3.session.Session(profile_name=profile, region_name=(region or None))
+        return sess.client("s3", endpoint_url=endpoint, config=cfg)
+
+    if access_key_id and secret_access_key:
+        sess = boto3.session.Session(
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            aws_session_token=(session_token or None),
+            region_name=(region or None),
+        )
+        return sess.client("s3", endpoint_url=endpoint, config=cfg)
+
+    sess = boto3.session.Session(region_name=(region or None))
+    return sess.client("s3", endpoint_url=endpoint, config=cfg)
+
+
+def s3_upload_file(s3, local_path: Path, bucket: str, key: str) -> None:
+    # не 1-в-1 с твоим кодом, но логика та же: multipart + concurrency
+    from boto3.s3.transfer import TransferConfig
+
+    local_path = Path(local_path)
+    cfg = TransferConfig(
+        multipart_threshold=64 * 1024 * 1024,
+        multipart_chunksize=64 * 1024 * 1024,
+        max_concurrency=8,
+        use_threads=True,
+    )
+    s3.upload_file(str(local_path), bucket, key, Config=cfg)
+
+
+def join_s3_key(prefix: str, name: str) -> str:
+    p = (prefix or "").strip("/")
+    return f"{p}/{name}" if p else name
+
+
+# -------------------------
+# Validation runner
+# -------------------------
+
+def _safe_item_name(flags: Any, fallback: str) -> str:
+    # batch[6] is "flags" in твоём collate; структура может отличаться.
+    # Пытаемся вытащить что-то стабильное для имени файла.
+    try:
+        if isinstance(flags, dict):
+            for k in ("uid", "id", "key", "name", "kind", "folder"):
+                if k in flags and flags[k]:
+                    return str(flags[k])
+        if isinstance(flags, (list, tuple)) and len(flags) > 0:
+            # часто flags = list[dict] по batch
+            f0 = flags[0]
+            if isinstance(f0, dict):
+                for k in ("uid", "id", "key", "name", "kind", "folder"):
+                    if k in f0 and f0[k]:
+                        return str(f0[k])
+    except Exception:
+        pass
+    return fallback
+
+
+def _save_audio_bundle(
+    out_dir: Path,
+    *,
+    sr: int,
+    mix: torch.Tensor,        # (2,T) cpu
+    mix_target: torch.Tensor, # (2,T) cpu
+    pred: torch.Tensor,       # (4,2,T) cpu
+    tgt: torch.Tensor,        # (4,2,T) cpu
+    pm: torch.Tensor,         # (4,) cpu
+):
+    try:
+        import soundfile as sf
+    except Exception as e:
+        raise RuntimeError(f"Saving validation audio requested but soundfile is missing: {e}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _w(name: str, x: torch.Tensor):
+        x_np = x.transpose(0, 1).contiguous().numpy()  # (T,2)
+        sf.write(str(out_dir / name), x_np, sr, subtype="FLOAT")
+
+    _w("mix_in.wav", mix)
+    _w("mix_target.wav", mix_target)
+
+    for i, stem in enumerate(STEM_ORDER):
+        present = int(pm[i].item() > 0.5)
+        _w(f"pred_{stem}_p{present}.wav", pred[i])
+        _w(f"gt_{stem}_p{present}.wav", tgt[i])
+
+
+@torch.no_grad()
+def run_validation(
+    *,
+    epoch: int,
+    model: nn.Module,
+    loss_comp: LossComputer,
+    dl_val: DataLoader,
+    device: torch.device,
+    autocast_ctx,
+    weights: Dict[str, float],
+    max_batches: int,
+    save_dir: Optional[Path],
+    save_n_audio: int,
+    save_audio: bool,
+    sr: int,
+) -> Dict[str, float]:
+    was_training = model.training
+    model.eval()
+
+    sums: Dict[str, float] = {}
+    n = 0
+
+    # audio save folder per epoch
+    epoch_dir = None
+    if save_dir is not None:
+        epoch_dir = Path(save_dir) / f"epoch_{epoch:04d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    for bidx, batch in enumerate(tqdm(dl_val, desc=f"val epoch {epoch}", dynamic_ncols=True)):
+        mix = batch[0].to(device, non_blocking=True)         # (B,2,T)
+        tgt = batch[3].to(device, non_blocking=True)         # (B,4,2,T)
+        pm  = batch[4].to(device, non_blocking=True)         # (B,4)
+        mix_target = batch[5].to(device, non_blocking=True)  # (B,2,T)
+        flags = batch[6] if len(batch) > 6 else None
+
+        with autocast_ctx:
+            out = model(mix, return_debug=False)  # dict head -> (B,2,T)
+            pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
+            loss, stats = loss_comp(
+                pred_stems=pred,
+                tgt_stems=tgt,
+                present_mask=pm,
+                mix_target=mix_target,
+                weights=weights,
+            )
+
+        # accumulate means
+        for k, v in stats.items():
+            sums[k] = sums.get(k, 0.0) + float(v.item())
+        n += 1
+
+        # optional: save first N audio examples
+        if save_audio and epoch_dir is not None and bidx < int(save_n_audio):
+            name = _safe_item_name(flags, fallback=f"sample_{bidx:04d}")
+            sample_dir = epoch_dir / name
+            # only first sample in batch
+            _save_audio_bundle(
+                sample_dir,
+                sr=sr,
+                mix=mix[0].detach().cpu(),
+                mix_target=mix_target[0].detach().cpu(),
+                pred=pred[0].detach().cpu(),
+                tgt=tgt[0].detach().cpu(),
+                pm=pm[0].detach().cpu(),
+            )
+
+        if int(max_batches) > 0 and n >= int(max_batches):
+            break
+
+    means = {k: (v / max(1, n)) for k, v in sums.items()}
+
+    if was_training:
+        model.train()
+    return means
+
+
+# -------------------------
+# CLI
 # -------------------------
 
 def parse_args():
@@ -432,8 +643,39 @@ def parse_args():
     p.add_argument("--w-leak", type=float, default=0.2)
     p.add_argument("--silence-rms", type=float, default=1e-3)
 
+    # --- validation split by songs (items)
+    p.add_argument("--val-frac", type=float, default=0.02, help="fraction of songs(items) held out for validation")
+    p.add_argument("--val-count", type=int, default=0, help="override val size by number of songs (0 = use val-frac)")
+    p.add_argument("--val-seed", type=int, default=12345, help="seed for train/val song split")
+
+    # --- validation runner controls
+    p.add_argument("--val-epoch-size", type=int, default=1, help="validation dataset epoch_size (segments)")
+    p.add_argument("--val-batch", type=int, default=1)
+    p.add_argument("--val-num-workers", type=int, default=0)
+    p.add_argument("--val-max-batches", type=int, default=200, help="max val batches per epoch (0 = full loader)")
+    p.add_argument("--val-save-dir", type=str, default="val", help="subdir under --out to store val artifacts")
+    p.add_argument("--val-save-audio", type=int, default=1, help="1 to save example wavs for first N batches")
+    p.add_argument("--val-save-n-audio", type=int, default=4, help="how many validation batches to dump audio for")
+
+    # --- S3 for checkpoints / validation artifacts
+    p.add_argument("--s3-bucket", type=str, default="")
+    p.add_argument("--s3-prefix", type=str, default="")
+    p.add_argument("--s3-region", type=str, default="")
+    p.add_argument("--s3-endpoint-url", type=str, default="")
+    p.add_argument("--s3-access-key-id", type=str, default="")
+    p.add_argument("--s3-secret-access-key", type=str, default="")
+    p.add_argument("--s3-session-token", type=str, default="")
+    p.add_argument("--s3-profile", type=str, default="")
+
+    p.add_argument("--upload-ckpt-s3", type=int, default=0, help="1 to upload checkpoints to S3")
+    p.add_argument("--upload-val-s3", type=int, default=0, help="1 to upload validation artifacts to S3 (tar.gz)")
+
     return p.parse_args()
 
+
+# -------------------------
+# Main
+# -------------------------
 
 def main():
     args = parse_args()
@@ -443,22 +685,35 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     set_tf32(bool(args.tf32))
 
-    # reproducibility baseline (dataset also seeds per-worker)
     torch.manual_seed(1234)
     np.random.seed(1234)
     random.seed(1234)
 
-    # dataset
+    # dataset items (each item ~= song)
     if args.root:
         items = scan_root_to_items(args.root)
     else:
         items = load_manifest_csv(args.manifest)
 
-    book = RecipeBook.from_json_path(args.recipes)
-
-    cfg = SeparatorConfig()
-    ds = FlexibleMixDataset(
+    # split by full songs
+    train_items, val_items = split_items_train_val(
         items,
+        val_frac=float(args.val_frac),
+        val_count=int(args.val_count),
+        seed=int(args.val_seed),
+    )
+
+    if len(train_items) == 0:
+        raise RuntimeError("Train set is empty after split. Reduce --val-frac/--val-count or check dataset.")
+    if len(val_items) == 0:
+        print("[warn] validation set is empty (val_frac/val_count resulted in 0). Validation will be skipped.")
+
+    book = RecipeBook.from_json_path(args.recipes)
+    cfg = SeparatorConfig()
+
+    # train dataset
+    ds = FlexibleMixDataset(
+        train_items,
         sr=cfg.sample_rate,
         segment_sec=float(args.segment_sec),
         recipe_book=book,
@@ -471,36 +726,71 @@ def main():
         shuffle=True,
         num_workers=int(args.num_workers),
         pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
+        persistent_workers=(int(args.num_workers) > 0),
         collate_fn=collate,
         drop_last=True,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        prefetch_factor=2 if int(args.num_workers) > 0 else None,
     )
+
+    # val dataset (segments sampled ONLY from held-out songs)
+    dl_val = None
+    if len(val_items) > 0:
+        ds_val = FlexibleMixDataset(
+            val_items,
+            sr=cfg.sample_rate,
+            segment_sec=float(args.segment_sec),
+            recipe_book=book,
+            epoch_size=int(args.val_epoch_size),
+        )
+        dl_val = DataLoader(
+            ds_val,
+            batch_size=int(args.val_batch),
+            shuffle=False,
+            num_workers=int(args.val_num_workers),
+            pin_memory=True,
+            persistent_workers=(int(args.val_num_workers) > 0),
+            collate_fn=collate,
+            drop_last=False,
+            prefetch_factor=2 if int(args.val_num_workers) > 0 else None,
+        )
 
     # model
     model = StemSeparator(cfg).to(device)
     model.train()
 
-    # optimizer
-    fused_ok = (device.type == "cuda") and hasattr(torch.optim, "AdamW")
-    opt = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(args.lr),
-        betas=(0.9, 0.95),
-        weight_decay=float(args.wd),
-        fused=True if fused_ok else False,  # if not supported, PyTorch will error; so keep guarded
-    )
+    # optimizer (fused if possible)
+    opt = None
+    try:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(args.lr),
+            betas=(0.9, 0.95),
+            weight_decay=float(args.wd),
+            fused=(device.type == "cuda"),
+        )
+    except TypeError:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(args.lr),
+            betas=(0.9, 0.95),
+            weight_decay=float(args.wd),
+        )
+    except Exception:
+        # fallback hard
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(args.lr),
+            betas=(0.9, 0.95),
+            weight_decay=float(args.wd),
+        )
 
-    # total steps
-    steps_per_epoch = len(dl) // max(1, int(args.grad_accum))
-    total_steps = int(args.epochs) * max(1, steps_per_epoch)
+    steps_per_epoch = max(1, (len(dl) // max(1, int(args.grad_accum))))
+    total_steps = int(args.epochs) * steps_per_epoch
     sched = make_scheduler(opt, total_steps=total_steps, warmup_steps=int(args.warmup_steps))
 
-    # amp
     autocast_ctx, amp_dtype, use_scaler = make_autocast(args.amp, device)
     scaler = GradScaler("cuda", enabled=use_scaler)
 
-    # losses
     loss_comp = LossComputer(
         sr=cfg.sample_rate,
         mr_w_sc=1.0,
@@ -517,6 +807,32 @@ def main():
         "w_leak": float(args.w_leak),
     }
 
+    # S3 init (optional)
+    s3 = None
+    s3_bucket = (args.s3_bucket or "").strip()
+    s3_prefix = (args.s3_prefix or "").strip()
+    upload_ckpt_s3 = bool(int(args.upload_ckpt_s3))
+    upload_val_s3 = bool(int(args.upload_val_s3))
+
+    if (upload_ckpt_s3 or upload_val_s3) and not s3_bucket:
+        raise RuntimeError("S3 upload enabled but --s3-bucket is empty.")
+
+    if (upload_ckpt_s3 or upload_val_s3) and s3_bucket:
+        s3 = build_s3_client(
+            region=args.s3_region,
+            endpoint_url=args.s3_endpoint_url,
+            access_key_id=args.s3_access_key_id,
+            secret_access_key=args.s3_secret_access_key,
+            session_token=args.s3_session_token,
+            profile=args.s3_profile,
+        )
+
+    def maybe_upload(local_path: Path, key_name: str) -> None:
+        if s3 is None or not s3_bucket:
+            return
+        key = join_s3_key(s3_prefix, key_name)
+        s3_upload_file(s3, local_path, bucket=s3_bucket, key=key)
+
     # resume
     start_epoch = 1
     global_step = 0
@@ -530,28 +846,33 @@ def main():
         else:
             raise FileNotFoundError(f"--resume not found: {ckpt_path}")
 
-    # training loop
+    # train loop
     opt.zero_grad(set_to_none=True)
     t0 = time.time()
 
+    val_root = out_dir / str(args.val_save_dir)
+
     for epoch in range(start_epoch, int(args.epochs) + 1):
         ds.set_epoch(epoch)
-        pbar = tqdm(dl, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True)
+        if dl_val is not None:
+            # чтобы валидация тоже была воспроизводимой по эпохам
+            try:
+                dl_val.dataset.set_epoch(epoch)  # type: ignore[attr-defined]
+            except Exception:
+                pass
 
-        # simple EMA for nicer logs
+        pbar = tqdm(dl, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True)
         ema: Dict[str, float] = {}
 
         accum = int(args.grad_accum)
         for it, batch in enumerate(pbar):
-            # batch:
-            # mix, ref, ref_tgt, tgt, pm, mix_target, flags
             mix = batch[0].to(device, non_blocking=True)         # (B,2,T)
             tgt = batch[3].to(device, non_blocking=True)         # (B,4,2,T)
             pm  = batch[4].to(device, non_blocking=True)         # (B,4)
             mix_target = batch[5].to(device, non_blocking=True)  # (B,2,T)
 
             with autocast_ctx:
-                out = model(mix, return_debug=False)  # dict head -> (B,2,T)
+                out = model(mix, return_debug=False)
                 pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
 
                 loss, stats = loss_comp(
@@ -585,7 +906,6 @@ def main():
                 sched.step()
                 global_step += 1
 
-                # logging
                 if (global_step % int(args.log_every)) == 0:
                     for k, v in stats.items():
                         x = float(v.item())
@@ -602,10 +922,11 @@ def main():
                         "leak": f"{ema.get('leak', float(stats['leak'])):.3f}",
                     })
 
-                # checkpointing
-                if (global_step % int(args.save_every_step)) == 0:
+                # step ckpt
+                if int(args.save_every_step) > 0 and (global_step % int(args.save_every_step)) == 0:
+                    ckpt_step = out_dir / f"ckpt_step_{global_step:08d}.pt"
                     save_ckpt(
-                        out_dir / f"ckpt_step_{global_step:08d}.pt",
+                        ckpt_step,
                         model=model,
                         opt=opt,
                         sched=sched,
@@ -626,10 +947,16 @@ def main():
                         cfg=cfg,
                         extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
                     )
-        if (global_step % int(args.save_every_epoch)) == 0:
-            # end epoch
+
+                    if upload_ckpt_s3:
+                        maybe_upload(ckpt_step, key_name=f"ckpt/ckpt_step_{global_step:08d}.pt")
+                        maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
+
+        # end epoch: save epoch ckpt (by epoch counter, not by global_step)
+        if int(args.save_every_epoch) > 0 and (epoch % int(args.save_every_epoch)) == 0:
+            ckpt_epoch = out_dir / f"ckpt_epoch_{epoch:04d}.pt"
             save_ckpt(
-                out_dir / f"ckpt_epoch_{epoch:04d}.pt",
+                ckpt_epoch,
                 model=model,
                 opt=opt,
                 sched=sched,
@@ -639,6 +966,10 @@ def main():
                 cfg=cfg,
                 extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
             )
+            if upload_ckpt_s3:
+                maybe_upload(ckpt_epoch, key_name=f"ckpt/ckpt_epoch_{epoch:04d}.pt")
+
+        # always update last
         save_ckpt(
             out_dir / "ckpt_last.pt",
             model=model,
@@ -650,6 +981,52 @@ def main():
             cfg=cfg,
             extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
         )
+        if upload_ckpt_s3:
+            maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
+
+        # --- validation after epoch
+        if dl_val is not None:
+            save_audio = bool(int(args.val_save_audio))
+            save_n_audio = int(args.val_save_n_audio)
+
+            val_means = run_validation(
+                epoch=epoch,
+                model=model,
+                loss_comp=loss_comp,
+                dl_val=dl_val,
+                device=device,
+                autocast_ctx=autocast_ctx,
+                weights=weights,
+                max_batches=int(args.val_max_batches),
+                save_dir=val_root if (save_audio or True) else None,
+                save_n_audio=save_n_audio,
+                save_audio=save_audio,
+                sr=int(cfg.sample_rate),
+            )
+
+            # write metrics.json
+            epoch_dir = val_root / f"epoch_{epoch:04d}"
+            epoch_dir.mkdir(parents=True, exist_ok=True)
+            metrics_path = epoch_dir / "metrics.json"
+            with metrics_path.open("w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "epoch": int(epoch),
+                        "global_step": int(global_step),
+                        "val_batches": int(min(int(args.val_max_batches), len(dl_val)) if int(args.val_max_batches) > 0 else len(dl_val)),
+                        "metrics": val_means,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            # upload validation artifacts (tar.gz) if requested
+            if upload_val_s3:
+                # pack whole epoch folder to single object
+                base_name = str(epoch_dir)  # shutil will append .tar.gz
+                archive_path = Path(shutil.make_archive(base_name, "gztar", root_dir=str(epoch_dir)))
+                maybe_upload(archive_path, key_name=f"val/epoch_{epoch:04d}.tar.gz")
 
     dt = time.time() - t0
     print(f"[done] time={dt/3600:.2f}h, steps={global_step}, out={out_dir}")
