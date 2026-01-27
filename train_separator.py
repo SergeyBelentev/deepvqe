@@ -412,7 +412,8 @@ def parse_args():
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--clip-grad", type=float, default=1.0)
 
-    p.add_argument("--save-every", type=int, default=1)
+    p.add_argument("--save-every-step", type=int, default=200_000)
+    p.add_argument("--save-every-epoch", type=int, default=1)
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--resume", type=str, default="")
 
@@ -596,7 +597,7 @@ def main():
                     })
 
                 # checkpointing
-                if (global_step % int(args.save_every)) == 0:
+                if (global_step % int(args.save_every_step)) == 0:
                     save_ckpt(
                         out_dir / f"ckpt_step_{global_step:08d}.pt",
                         model=model,
@@ -619,19 +620,19 @@ def main():
                         cfg=cfg,
                         extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
                     )
-
-        # end epoch
-        save_ckpt(
-            out_dir / f"ckpt_epoch_{epoch:04d}.pt",
-            model=model,
-            opt=opt,
-            sched=sched,
-            scaler=scaler if use_scaler else None,
-            epoch=epoch,
-            step=global_step,
-            cfg=cfg,
-            extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
-        )
+        if (global_step % int(args.save_every_epoch)) == 0:
+            # end epoch
+            save_ckpt(
+                out_dir / f"ckpt_epoch_{epoch:04d}.pt",
+                model=model,
+                opt=opt,
+                sched=sched,
+                scaler=scaler if use_scaler else None,
+                epoch=epoch,
+                step=global_step,
+                cfg=cfg,
+                extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
+            )
         save_ckpt(
             out_dir / "ckpt_last.pt",
             model=model,
