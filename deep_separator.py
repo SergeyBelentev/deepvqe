@@ -569,9 +569,8 @@ class StereoFeatureExtractor(nn.Module):
 
         # align T (they should be equal with same hop+center, but in practice can differ by 1)
         T = min(X4096.shape[2], X2048.shape[2])
-        T4 = (T // 4) * 4
-        X4096 = X4096[:, :, :T4]
-        X2048 = X2048[:, :, :T4]
+        X4096 = X4096[:, :, :T]
+        X2048 = X2048[:, :, :T]
 
         F4096 = X4096.shape[-1]
         F2048 = X2048.shape[-1]
@@ -1122,7 +1121,26 @@ class StemSeparator(nn.Module):
         B, Ch, N = wav.shape
         assert Ch == 2
 
-        pack = self.fe(wav)
+        # --- NEW: pad waveform so that STFT frame count T is divisible by 4 ---
+        hop = self.cfg.hop
+        mult = 4  # because you downsample time twice (T -> T/2 -> T/4)
+
+        if not self.cfg.center:
+            # For center=False formula depends on n_fft; if you ever need it, we can implement precisely.
+            # For now assume center=True as in your setup.
+            raise ValueError(
+                "This padding logic assumes center=True. Set cfg.center=True or implement center=False case.")
+
+        # With center=True, torch.stft frame count is essentially: T = floor(N/hop) + 1
+        T0 = (N // hop) + 1
+        Tt = ((T0 + mult - 1) // mult) * mult  # ceil to multiple of 4
+        N_pad = max(N, (Tt - 1) * hop)
+        pad = N_pad - N
+        if pad > 0:
+            # zero-pad is simplest and stable; reflect is also possible but needs care with very short segments
+            wav = F.pad(wav, (0, pad))
+
+        pack = self.fe(wav)  # STFT now sees padded wav
         X4096 = pack["X4096"]   # (B,2,T,2049) complex
         X2048 = pack["X2048"]   # (B,2,T,1025) complex
         Feat4096 = pack["Feat4096"]
@@ -1176,10 +1194,10 @@ class StemSeparator(nn.Module):
             S2048_g = S2048 * g2048
 
             # 4.4) ISTFT per resolution and sum in time domain
-            s4096 = self._istft(S4096_g, n_fft=self.cfg.n_fft_main, length=N)
-            s2048 = self._istft(S2048_g, n_fft=self.cfg.n_fft_sub, length=N)
-            stem = s4096 + s2048  # (B,2,N)
-
+            s4096 = self._istft(S4096_g, n_fft=self.cfg.n_fft_main, length=wav.shape[-1])  # N_pad
+            s2048 = self._istft(S2048_g, n_fft=self.cfg.n_fft_sub, length=wav.shape[-1])  # N_pad
+            stem = s4096 + s2048
+            stem = stem[..., :N]  # back to original length
             out[h] = stem
 
             if return_debug:
