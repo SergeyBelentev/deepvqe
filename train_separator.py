@@ -1036,10 +1036,10 @@ def main():
 
             with torch.autocast(device_type="cuda", enabled=False):
                 loss, stats = loss_comp(
-                    pred_stems=pred,
-                    tgt_stems=tgt,
-                    present_mask=pm,
-                    mix_target=mix_target,
+                    pred_stems=pred.float(),
+                    tgt_stems=tgt.float(),
+                    present_mask=pm.float(),
+                    mix_target=mix_target.float(),
                     weights=weights,
                 )
                 loss_scaled = loss / float(accum)
