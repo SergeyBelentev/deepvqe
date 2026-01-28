@@ -1034,6 +1034,7 @@ def main():
                 out = model(mix, return_debug=False)
                 pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
 
+            with torch.autocast(device_type="cuda", enabled=False):
                 loss, stats = loss_comp(
                     pred_stems=pred,
                     tgt_stems=tgt,
