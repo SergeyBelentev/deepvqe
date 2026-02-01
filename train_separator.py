@@ -1281,6 +1281,7 @@ def main():
             )
 
             if main_proc:
+                print(f"Validation epoch {epoch}: {val_means}")
                 epoch_dir = val_root / f"epoch_{epoch:04d}"
                 epoch_dir.mkdir(parents=True, exist_ok=True)
                 metrics_path = epoch_dir / "metrics.json"
