@@ -1107,6 +1107,7 @@ def main():
                 ckpt_path, model, opt=opt, sched=sched, scaler=scaler, map_location="cpu"
             )
             print(f"[resume] from {ckpt_path} epoch={start_epoch} step={global_step} extra={extra}")
+            start_epoch += 1
         else:
             raise FileNotFoundError(f"--resume not found: {ckpt_path}")
 
@@ -1116,7 +1117,7 @@ def main():
 
     val_root = out_dir / str(args.val_save_dir)
 
-    for epoch in range(start_epoch + 1, int(args.epochs) + 1):
+    for epoch in range(start_epoch, int(args.epochs) + 1):
         ds.set_epoch(epoch)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
