@@ -193,15 +193,8 @@ def _l1_ri_norm(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tens
     return ((dr + di) / scale).mean()
 
 
-def _l1_logmag_norm(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tensor:
-    """
-    pred,tgt: (B,2,T,F) complex
-    """
-    scale = tgt.abs().mean(dim=(1, 2, 3)).clamp_min(eps)  # (B,)
-    lp_map = torch.log(pred.abs() + eps)
-    lt_map = torch.log(tgt.abs() + eps)
-    d = (lp_map - lt_map).abs().mean(dim=(1, 2, 3))
-    return (d / torch.log(scale + eps)).mean()
+def _l1_logmag(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tensor:
+    return (torch.log(pred.abs() + eps) - torch.log(tgt.abs() + eps)).abs().mean()
 
 
 def rms(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -333,10 +326,10 @@ class LossComputer(nn.Module):
 
             # TF mix losses
             tf_ri_4096 = _l1_ri_norm(S4096_sum, X4096_tgt, self.eps)
-            tf_lm_4096 = _l1_logmag_norm(S4096_sum, X4096_tgt, self.eps)
+            tf_lm_4096 = _l1_logmag(S4096_sum, X4096_tgt, self.eps)
 
             tf_ri_2048 = _l1_ri_norm(S2048_sum, X2048_tgt, self.eps)
-            tf_lm_2048 = _l1_logmag_norm(S2048_sum, X2048_tgt, self.eps)
+            tf_lm_2048 = _l1_logmag(S2048_sum, X2048_tgt, self.eps)
 
             tf_ri_mix = tf_ri_4096 + tf_ri_2048
             tf_lm_mix = tf_lm_4096 + tf_lm_2048
