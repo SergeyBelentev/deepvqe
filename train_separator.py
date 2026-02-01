@@ -33,7 +33,9 @@ from train_phase_a import (
     collate,
     STEM_ORDER,
 )
-
+from validation import (
+    run_validation_full_tracks,
+)
 
 # -------------------------
 # Precision / TF32 helpers
@@ -858,15 +860,7 @@ def parse_args():
     p.add_argument("--val-frac", type=float, default=0.02, help="fraction of songs(items) held out for validation")
     p.add_argument("--val-count", type=int, default=0, help="override val size by number of songs (0 = use val-frac)")
     p.add_argument("--val-seed", type=int, default=12345, help="seed for train/val song split")
-
-    # --- validation runner controls
-    p.add_argument("--val-epoch-size", type=int, default=1, help="validation dataset epoch_size (segments)")
-    p.add_argument("--val-batch", type=int, default=1)
-    p.add_argument("--val-num-workers", type=int, default=0)
-    p.add_argument("--val-max-batches", type=int, default=200, help="max val batches per epoch (0 = full loader)")
     p.add_argument("--val-save-dir", type=str, default="val", help="subdir under --out to store val artifacts")
-    p.add_argument("--val-save-audio", type=int, default=1, help="1 to save example wavs for first N batches")
-    p.add_argument("--val-save-n-audio", type=int, default=4, help="how many validation batches to dump audio for")
 
     # --- S3 for checkpoints / validation artifacts
     p.add_argument("--s3-bucket", type=str, default="")
@@ -1009,28 +1003,6 @@ def main():
         prefetch_factor=2 if int(args.num_workers) > 0 else None,
     )
 
-    # val dataset (segments sampled ONLY from held-out songs)
-    dl_val = None
-    if main_proc and len(val_items) > 0:
-        ds_val = FlexibleMixDataset(
-            val_items,
-            sr=cfg.sample_rate,
-            segment_sec=float(args.segment_sec),
-            recipe_book=book,
-            epoch_size=int(args.val_epoch_size),
-        )
-        dl_val = DataLoader(
-            ds_val,
-            batch_size=int(args.val_batch),
-            shuffle=False,
-            num_workers=int(args.val_num_workers),
-            pin_memory=True,
-            persistent_workers=(int(args.val_num_workers) > 0),
-            collate_fn=collate,
-            drop_last=False,
-            prefetch_factor=2 if int(args.val_num_workers) > 0 else None,
-        )
-
     # model
     model = StemSeparator(cfg).to(device)
     model.train()
@@ -1144,17 +1116,10 @@ def main():
 
     val_root = out_dir / str(args.val_save_dir)
 
-    for epoch in range(start_epoch, int(args.epochs) + 1):
+    for epoch in range(start_epoch + 1, int(args.epochs) + 1):
         ds.set_epoch(epoch)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
-
-        if dl_val is not None:
-            # чтобы валидация тоже была воспроизводимой по эпохам
-            try:
-                dl_val.dataset.set_epoch(epoch)  # type: ignore[attr-defined]
-            except Exception:
-                pass
 
         pbar = tqdm(dl, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True) if main_proc else dl
         ema: Dict[str, float] = {}
@@ -1297,51 +1262,48 @@ def main():
         if use_ddp:
             ddp_barrier()
 
-        if main_proc and dl_val is not None:
-            save_audio = bool(int(args.val_save_audio))
-            save_n_audio = int(args.val_save_n_audio)
-
-            val_means = run_validation(
+        if len(val_items) > 0:
+            val_means = run_validation_full_tracks(
                 epoch=epoch,
                 model=model,
                 loss_comp=loss_comp,
-                dl_val=dl_val,
+                val_items=val_items,
                 device=device,
                 autocast_ctx=autocast_ctx,
                 weights=weights,
-                max_batches=int(args.val_max_batches),
-                save_dir=val_root,
-                save_n_audio=save_n_audio,
-                save_audio=save_audio,
+                seg_len=int(round(float(args.segment_sec) * float(cfg.sample_rate))),  # 8s chunks
                 sr=int(cfg.sample_rate),
+                silence_rms_thr=float(args.silence_rms),
+                use_ddp=use_ddp,
+                rank=rank,
+                world_size=world_size,
+                STEM_ORDER=STEM_ORDER,
             )
 
-            # write metrics.json
-            epoch_dir = val_root / f"epoch_{epoch:04d}"
-            epoch_dir.mkdir(parents=True, exist_ok=True)
-            metrics_path = epoch_dir / "metrics.json"
-            with metrics_path.open("w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "epoch": int(epoch),
-                        "global_step": int(global_step),
-                        "val_batches": int(min(int(args.val_max_batches), len(dl_val)) if int(args.val_max_batches) > 0 else len(dl_val)),
-                        "metrics": val_means,
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
+            if main_proc:
+                epoch_dir = val_root / f"epoch_{epoch:04d}"
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+                metrics_path = epoch_dir / "metrics.json"
+                with metrics_path.open("w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "epoch": int(epoch),
+                            "global_step": int(global_step),
+                            "val_tracks": int(len(val_items)),
+                            "metrics": val_means,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
 
-            # upload validation artifacts (tar.gz) if requested
-            if upload_val_s3:
-                base_name = str(epoch_dir)
-                archive_path = Path(shutil.make_archive(base_name, "gztar", root_dir=str(epoch_dir)))
-                maybe_upload(archive_path, key_name=f"val/epoch_{epoch:04d}.tar.gz")
+                if upload_val_s3:
+                    base_name = str(epoch_dir)
+                    archive_path = Path(shutil.make_archive(base_name, "gztar", root_dir=str(epoch_dir)))
+                    maybe_upload(archive_path, key_name=f"val/epoch_{epoch:04d}.tar.gz")
 
         if use_ddp:
-            ddp_barrier()  # rank0 закончил валидацию — отпускаем остальных
-
+            ddp_barrier()
 
     dt = time.time() - t0
     print(f"[done] time={dt/3600:.2f}h, steps={global_step}, out={out_dir}")
