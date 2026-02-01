@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 import numpy as np
 import soundfile as sf
 import torch
 from torch import nn
+from tqdm import tqdm
 
 
 # -----------------------------
@@ -43,15 +44,13 @@ def _load_track_full(
     """
     waves: dict[str, torch.Tensor] = {}
 
-    # full mandatory
     full, sr_full = _read_stereo_full(it.full)
     if sr_full != sr:
         raise RuntimeError(f"SR mismatch for {it.full}: {sr_full} != {sr}")
     waves["full"] = full
 
-    lens = [waves["full"].shape[1]]
+    lens = [int(waves["full"].shape[1])]
 
-    # helper
     def _read_opt(p: Optional[str], key: str) -> None:
         if not p:
             return
@@ -79,7 +78,7 @@ def _load_track_full(
     vocals = waves.get("vocals", torch.zeros((2, T), dtype=torch.float32))
 
     tgt = torch.stack([bass, drums, music, vocals], dim=0)  # (4,2,T)
-    mix = waves["full"]  # (2,T)
+    mix = waves["full"]                                     # (2,T)
     return mix, tgt
 
 
@@ -152,31 +151,48 @@ def _ddp_allreduce_sum_count(x_sum: torch.Tensor, x_cnt: torch.Tensor) -> tuple[
 
 
 # -----------------------------
-# One-chunk forward (pred + tf)
+# One-batch forward (pred + tf)
 # -----------------------------
 
 @torch.no_grad()
-def _forward_chunk_with_tf(
+def _forward_batch_with_tf(
     model: nn.Module,
-    chunk: torch.Tensor,          # (1,2,seg_len) on device
+    batch_chunks: torch.Tensor,   # (B,2,seg_len) on device
     *,
     autocast_ctx,
     STEM_ORDER: list[str],
 ) -> tuple[torch.Tensor, dict]:
     """
     returns:
-      pred_seg: (1,4,2,seg_len) float32 on device (caller may cast)
-      tf_pack: dict from model["_tf"]
+      pred: (B,H,2,seg_len)
+      tf_pack: dict from model["_tf"] (batched)
     """
     with autocast_ctx:
-        out = model(chunk, return_debug=False, return_tf=True)
+        out = model(batch_chunks, return_debug=False, return_tf=True)
         tf_pack = out.pop("_tf")
-        pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (1,4,2,seg)
+        pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,H,2,seg)
     return pred, tf_pack
 
 
 # -----------------------------
-# Main validation
+# Internal: track state for interleaving
+# -----------------------------
+
+@dataclass
+class _TrackState:
+    mix: torch.Tensor          # (2,T) CPU
+    tgt: torch.Tensor          # (H,2,T) CPU
+    pred_full: torch.Tensor    # (H,2,T) CPU
+    T: int
+    pos: int                  # next segment start
+
+
+def _num_segs(T: int, seg_len: int) -> int:
+    return (T + seg_len - 1) // seg_len
+
+
+# -----------------------------
+# Main validation (batched)
 # -----------------------------
 
 @torch.no_grad()
@@ -196,10 +212,11 @@ def run_validation_full_tracks(
     rank: int,
     world_size: int,
     STEM_ORDER: list[str],             # ["bass","drums","music","vocals"]
+    batch_size: int,                   # <-- batch like training
     compute_losses: bool = True,       # includes TF-mix when True
 ) -> Dict[str, float]:
     """
-    Full-track deterministic validation:
+    Full-track deterministic validation (batched segments):
       - all tracks, full length
       - sequential chunks of seg_len (no overlap)
       - no RecipeBook, no gains, no clip-safe scaling
@@ -209,6 +226,11 @@ def run_validation_full_tracks(
     """
     was_training = model.training
     model.eval()
+
+    H = len(STEM_ORDER)
+    B = int(batch_size)
+    if B <= 0:
+        raise ValueError(f"batch_size must be >0, got {batch_size}")
 
     # --- loss accumulators (segment-averaged)
     loss_keys = [
@@ -230,75 +252,130 @@ def run_validation_full_tracks(
     loss_count = 0
 
     # --- metric accumulators per stem
-    H = len(STEM_ORDER)
     sdr_sum = torch.zeros((H,), dtype=torch.float64, device=device)
     sisdr_sum = torch.zeros((H,), dtype=torch.float64, device=device)
     met_cnt = torch.zeros((H,), dtype=torch.float64, device=device)
 
-    # iterate shard
+    # --------
+    # Load shard tracks into states (CPU)
+    # --------
+    states: List[_TrackState] = []
+    total_segs = 0
     for ti in range(rank, len(val_items), world_size):
         it = val_items[ti]
-        mix_cpu, tgt_cpu = _load_track_full(it, sr=sr)  # (2,T), (H,2,T) CPU
+        mix_cpu, tgt_cpu = _load_track_full(it, sr=sr)
         T = int(mix_cpu.shape[1])
-
-        # full prediction for metrics (CPU)
         pred_full_cpu = torch.zeros((H, 2, T), dtype=torch.float32, device="cpu")
+        states.append(_TrackState(mix=mix_cpu, tgt=tgt_cpu, pred_full=pred_full_cpu, T=T, pos=0))
+        total_segs += _num_segs(T, seg_len)
 
-        pos = 0
-        while pos < T:
-            end = min(T, pos + seg_len)
+    # tqdm over segments on this rank only
+    pbar = tqdm(total=total_segs, desc=f"val full epoch {epoch} rank{rank}", dynamic_ncols=True)
+
+    # --------
+    # Interleaved sequential batching:
+    # take next segment from tracks in order, build batch, run model once
+    # --------
+    active = [i for i in range(len(states)) if states[i].pos < states[i].T]
+
+    while active:
+        batch_chunks = torch.zeros((0, 2, seg_len), device=device, dtype=torch.float32)
+        # per-sample metadata
+        meta: List[Tuple[int, int, int]] = []  # (state_index, pos, valid)
+
+        # fill batch
+        # we iterate active in a stable order and pull one segment per track per round
+        # to keep segments sequential within each track.
+        ai = 0
+        while len(meta) < B and active:
+            if ai >= len(active):
+                ai = 0
+                # if we made a full cycle without adding anything, break
+                if len(meta) == 0:
+                    break
+
+            si = active[ai]
+            st = states[si]
+            if st.pos >= st.T:
+                # remove finished
+                active.pop(ai)
+                continue
+
+            pos = st.pos
+            end = min(st.T, pos + seg_len)
             valid = end - pos
 
-            # build padded chunk
             chunk = torch.zeros((1, 2, seg_len), device=device, dtype=torch.float32)
-            chunk[:, :, :valid] = mix_cpu[:, pos:end].to(device=device, dtype=torch.float32)
+            chunk[:, :, :valid] = st.mix[:, pos:end].to(device=device, dtype=torch.float32)
 
-            # forward once (pred + tf_pack)
-            pred_seg, tf_pack = _forward_chunk_with_tf(
-                model,
-                chunk,
-                autocast_ctx=autocast_ctx,
-                STEM_ORDER=STEM_ORDER,
-            )  # pred_seg: (1,H,2,seg)
+            batch_chunks = torch.cat([batch_chunks, chunk], dim=0)  # (b,2,seg)
+            meta.append((si, pos, valid))
 
-            # stash to full buffer
-            pred_full_cpu[:, :, pos:end] = pred_seg[0].to(dtype=torch.float32).detach().cpu()[:, :, :valid]
+            st.pos = end  # advance sequentially
+            ai += 1
 
-            if compute_losses:
-                # build targets for this segment
-                tgt_seg = torch.zeros((1, H, 2, seg_len), device=device, dtype=torch.float32)
-                tgt_seg[:, :, :, :valid] = tgt_cpu[:, :, pos:end].to(device=device, dtype=torch.float32)
+        if len(meta) == 0:
+            break
 
-                # present mask from target RMS (segment-wise)
-                pm_seg = torch.zeros((1, H), device=device, dtype=torch.float32)
-                for si in range(H):
-                    seg_rms = torch.sqrt(tgt_seg[0, si].pow(2).mean()).item()
-                    pm_seg[0, si] = 1.0 if seg_rms >= float(silence_rms_thr) else 0.0
+        # forward once for the whole batch
+        pred_b, tf_pack = _forward_batch_with_tf(
+            model,
+            batch_chunks,
+            autocast_ctx=autocast_ctx,
+            STEM_ORDER=STEM_ORDER,
+        )  # pred_b: (b,H,2,seg)
 
-                # mix_target = stem_sum
-                mt_seg = tgt_seg.sum(dim=1)  # (1,2,seg)
+        # write predictions back to full buffers
+        for bi, (si, pos, valid) in enumerate(meta):
+            st = states[si]
+            end = pos + valid
+            st.pred_full[:, :, pos:end] = pred_b[bi].to(dtype=torch.float32).detach().cpu()[:, :, :valid]
 
-                # compute loss pack with TF mix
-                with torch.autocast(device_type="cuda", enabled=False):
-                    loss, stats = loss_comp(
-                        pred_stems=pred_seg.float(),
-                        tgt_stems=tgt_seg.float(),
-                        present_mask=pm_seg.float(),
-                        mix_target=mt_seg.float(),
-                        weights=weights,
-                        tf_pack=tf_pack,  # <-- TF LOSS MIX INCLUDED
-                    )
+        # compute losses (batched) with TF-mix
+        if compute_losses:
+            bsz = len(meta)
+            tgt_b = torch.zeros((bsz, H, 2, seg_len), device=device, dtype=torch.float32)
+            pm_b  = torch.zeros((bsz, H), device=device, dtype=torch.float32)
 
-                for k in loss_keys:
-                    loss_sums[k] += float(stats[k].item())
-                loss_count += 1
+            for bi, (si, pos, valid) in enumerate(meta):
+                st = states[si]
+                tgt_b[bi, :, :, :valid] = st.tgt[:, :, pos:pos+valid].to(device=device, dtype=torch.float32)
 
-            pos += seg_len
+                # per-stem present by segment RMS
+                for h in range(H):
+                    seg_rms = torch.sqrt(tgt_b[bi, h].pow(2).mean()).item()
+                    pm_b[bi, h] = 1.0 if seg_rms >= float(silence_rms_thr) else 0.0
 
-        # --- metrics per stem over whole track
+            mt_b = tgt_b.sum(dim=1)  # (B,2,seg)
+
+            with torch.autocast(device_type="cuda", enabled=False):
+                loss, stats = loss_comp(
+                    pred_stems=pred_b.float(),
+                    tgt_stems=tgt_b.float(),
+                    present_mask=pm_b.float(),
+                    mix_target=mt_b.float(),
+                    weights=weights,
+                    tf_pack=tf_pack,
+                )
+
+            for k in loss_keys:
+                loss_sums[k] += float(stats[k].item())
+            loss_count += 1
+
+        pbar.update(len(meta))
+
+        # refresh active list (some tracks may have ended)
+        active = [i for i in active if states[i].pos < states[i].T]
+
+    pbar.close()
+
+    # --------
+    # Metrics per stem over whole tracks (CPU -> device for compute)
+    # --------
+    for st in states:
         for si in range(H):
-            tgt_s = tgt_cpu[si]          # (2,T) CPU
-            pred_s = pred_full_cpu[si]   # (2,T) CPU
+            tgt_s = st.tgt[si]        # (2,T) CPU
+            pred_s = st.pred_full[si] # (2,T) CPU
 
             if float(_rms2ch(tgt_s).item()) < float(silence_rms_thr):
                 continue
@@ -310,7 +387,9 @@ def run_validation_full_tracks(
             sisdr_sum[si] += _si_sdr(p, t).to(dtype=torch.float64)
             met_cnt[si] += 1.0
 
-    # --- DDP all-reduce
+    # --------
+    # DDP all-reduce
+    # --------
     if use_ddp and _ddp_is_init():
         import torch.distributed as dist
 
@@ -318,15 +397,17 @@ def run_validation_full_tracks(
         sisdr_sum, _ = _ddp_allreduce_sum_count(sisdr_sum, met_cnt.clone())
 
         if compute_losses:
-            keys = loss_keys
-            vec = torch.tensor([loss_sums[k] for k in keys] + [float(loss_count)], device=device, dtype=torch.float64)
+            vec = torch.tensor([loss_sums[k] for k in loss_keys] + [float(loss_count)],
+                               device=device, dtype=torch.float64)
             dist.all_reduce(vec, op=dist.ReduceOp.SUM)
             loss_count_g = float(vec[-1].item())
-            for i, k in enumerate(keys):
+            for i, k in enumerate(loss_keys):
                 loss_sums[k] = float(vec[i].item())
             loss_count = int(loss_count_g)
 
-    # finalize
+    # --------
+    # Finalize dict
+    # --------
     out: Dict[str, float] = {}
 
     if compute_losses and loss_count > 0:

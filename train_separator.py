@@ -1278,6 +1278,7 @@ def main():
                 rank=rank,
                 world_size=world_size,
                 STEM_ORDER=STEM_ORDER,
+                batch_size=args.batch,
             )
 
             if main_proc:
