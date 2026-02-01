@@ -9,6 +9,8 @@ import soundfile as sf
 import torch
 from torch import nn
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, Future
+from collections import deque
 
 
 # -----------------------------
@@ -87,45 +89,32 @@ def _load_track_full(
 # -----------------------------
 
 def _sdr(pred: torch.Tensor, tgt: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    pred,tgt: (2,T) or (B,2,T) float
-    returns: scalar tensor (mean over batch and channels)
-    SDR = 10 log10(||t||^2 / ||t - p||^2)
-    """
     if pred.ndim == 2:
         pred = pred.unsqueeze(0)
         tgt = tgt.unsqueeze(0)
     e = tgt - pred
-    num = (tgt ** 2).sum(dim=-1)  # (B,2)
+    num = (tgt ** 2).sum(dim=-1)
     den = (e ** 2).sum(dim=-1).clamp_min(eps)
     sdr = 10.0 * torch.log10((num.clamp_min(eps) / den))
     return sdr.mean()
 
 
 def _si_sdr(pred: torch.Tensor, tgt: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """
-    pred,tgt: (2,T) or (B,2,T) float
-    SI-SDR:
-      s = <p,t>/<t,t> * t
-      e = p - s
-      10 log10(||s||^2 / ||e||^2)
-    """
     if pred.ndim == 2:
         pred = pred.unsqueeze(0)
         tgt = tgt.unsqueeze(0)
-    dot = (pred * tgt).sum(dim=-1)                       # (B,2)
-    tt  = (tgt * tgt).sum(dim=-1).clamp_min(eps)         # (B,2)
-    alpha = (dot / tt).unsqueeze(-1)                     # (B,2,1)
+    dot = (pred * tgt).sum(dim=-1)
+    tt = (tgt * tgt).sum(dim=-1).clamp_min(eps)
+    alpha = (dot / tt).unsqueeze(-1)
     s = alpha * tgt
     e = pred - s
-    num = (s * s).sum(dim=-1)                            # (B,2)
+    num = (s * s).sum(dim=-1)
     den = (e * e).sum(dim=-1).clamp_min(eps)
     sisdr = 10.0 * torch.log10((num.clamp_min(eps) / den))
     return sisdr.mean()
 
 
 def _rms2ch(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    # x: (2,T)
     return torch.sqrt(x.pow(2).mean().clamp_min(eps))
 
 
@@ -162,11 +151,6 @@ def _forward_batch_with_tf(
     autocast_ctx,
     STEM_ORDER: list[str],
 ) -> tuple[torch.Tensor, dict]:
-    """
-    returns:
-      pred: (B,H,2,seg_len)
-      tf_pack: dict from model["_tf"] (batched)
-    """
     with autocast_ctx:
         out = model(batch_chunks, return_debug=False, return_tf=True)
         tf_pack = out.pop("_tf")
@@ -175,7 +159,7 @@ def _forward_batch_with_tf(
 
 
 # -----------------------------
-# Internal: track state for interleaving
+# Internal: track state
 # -----------------------------
 
 @dataclass
@@ -192,7 +176,7 @@ def _num_segs(T: int, seg_len: int) -> int:
 
 
 # -----------------------------
-# Main validation (batched)
+# Main validation (batched + IO workers)
 # -----------------------------
 
 @torch.no_grad()
@@ -201,7 +185,7 @@ def run_validation_full_tracks(
     epoch: int,
     model: nn.Module,
     loss_comp: nn.Module,
-    val_items: list[Any],              # list[TrackItem]
+    val_items: list[Any],
     device: torch.device,
     autocast_ctx,
     weights: Dict[str, float],
@@ -211,19 +195,14 @@ def run_validation_full_tracks(
     use_ddp: bool,
     rank: int,
     world_size: int,
-    STEM_ORDER: list[str],             # ["bass","drums","music","vocals"]
-    batch_size: int,                   # <-- batch like training
-    compute_losses: bool = True,       # includes TF-mix when True
+    STEM_ORDER: list[str],
+    batch_size: int,
+
+    # NEW: parallel IO
+    io_workers: int = 0,          # set = train num_workers
+    prefetch_tracks: int = 0,     # default: 2*io_workers
+    compute_losses: bool = True,
 ) -> Dict[str, float]:
-    """
-    Full-track deterministic validation (batched segments):
-      - all tracks, full length
-      - sequential chunks of seg_len (no overlap)
-      - no RecipeBook, no gains, no clip-safe scaling
-      - DDP: split tracks by rank, then all-reduce
-      - metrics: SDR + SI-SDR per stem + macro avg
-      - optional loss pack: uses loss_comp and tf_pack from model(return_tf=True)
-    """
     was_training = model.training
     model.eval()
 
@@ -232,7 +211,13 @@ def run_validation_full_tracks(
     if B <= 0:
         raise ValueError(f"batch_size must be >0, got {batch_size}")
 
-    # --- loss accumulators (segment-averaged)
+    io_workers = int(io_workers)
+    if io_workers < 0:
+        raise ValueError(f"io_workers must be >=0, got {io_workers}")
+    if prefetch_tracks <= 0:
+        prefetch_tracks = max(1, 2 * io_workers) if io_workers > 0 else 1
+    prefetch_tracks = int(prefetch_tracks)
+
     loss_keys = [
         "loss_total",
         "l1_head",
@@ -251,53 +236,89 @@ def run_validation_full_tracks(
     loss_sums: Dict[str, float] = {k: 0.0 for k in loss_keys}
     loss_count = 0
 
-    # --- metric accumulators per stem
     sdr_sum = torch.zeros((H,), dtype=torch.float64, device=device)
     sisdr_sum = torch.zeros((H,), dtype=torch.float64, device=device)
     met_cnt = torch.zeros((H,), dtype=torch.float64, device=device)
 
-    # --------
-    # Load shard tracks into states (CPU)
-    # --------
+    # shard indices for this rank
+    shard_indices = list(range(rank, len(val_items), world_size))
+
+    # precompute total segments for tqdm (approx exact: need lengths; we compute after load)
+    # We'll update tqdm.total dynamically as we load (supported by tqdm).
+    pbar = tqdm(total=0, desc=f"val full epoch {epoch} rank{rank}", dynamic_ncols=True)
+
+    # futures queue: holds loaded (mix,tgt,it_index)
+    futs: deque[Future] = deque()
+    loaded_tracks = 0
+
+    def submit(ex: ThreadPoolExecutor, it: Any, idx: int) -> None:
+        futs.append(ex.submit(_load_track_full, it, sr=sr))
+
+    # consume loaded into states gradually
     states: List[_TrackState] = []
-    total_segs = 0
-    for ti in range(rank, len(val_items), world_size):
-        it = val_items[ti]
-        mix_cpu, tgt_cpu = _load_track_full(it, sr=sr)
-        T = int(mix_cpu.shape[1])
-        pred_full_cpu = torch.zeros((H, 2, T), dtype=torch.float32, device="cpu")
-        states.append(_TrackState(mix=mix_cpu, tgt=tgt_cpu, pred_full=pred_full_cpu, T=T, pos=0))
-        total_segs += _num_segs(T, seg_len)
 
-    # tqdm over segments on this rank only
-    pbar = tqdm(total=total_segs, desc=f"val full epoch {epoch} rank{rank}", dynamic_ncols=True)
+    if io_workers > 0:
+        with ThreadPoolExecutor(max_workers=io_workers) as ex:
+            # kick initial prefetch
+            ptr = 0
+            while ptr < len(shard_indices) and len(futs) < prefetch_tracks:
+                ti = shard_indices[ptr]
+                submit(ex, val_items[ti], ti)
+                ptr += 1
+
+            while futs:
+                # get next loaded
+                fut = futs.popleft()
+                mix_cpu, tgt_cpu = fut.result()
+
+                T = int(mix_cpu.shape[1])
+                pred_full_cpu = torch.zeros((H, 2, T), dtype=torch.float32, device="cpu")
+                states.append(_TrackState(mix=mix_cpu, tgt=tgt_cpu, pred_full=pred_full_cpu, T=T, pos=0))
+
+                loaded_tracks += 1
+                pbar.total += _num_segs(T, seg_len)
+                pbar.set_postfix_str(f"tracks_loaded={loaded_tracks}/{len(shard_indices)}")
+
+                # submit more
+                while ptr < len(shard_indices) and len(futs) < prefetch_tracks:
+                    ti = shard_indices[ptr]
+                    submit(ex, val_items[ti], ti)
+                    ptr += 1
+
+                if ptr >= len(shard_indices) and not futs:
+                    break
+    else:
+        # sequential load
+        for ti in shard_indices:
+            it = val_items[ti]
+            mix_cpu, tgt_cpu = _load_track_full(it, sr=sr)
+            T = int(mix_cpu.shape[1])
+            pred_full_cpu = torch.zeros((H, 2, T), dtype=torch.float32, device="cpu")
+            states.append(_TrackState(mix=mix_cpu, tgt=tgt_cpu, pred_full=pred_full_cpu, T=T, pos=0))
+
+            loaded_tracks += 1
+            pbar.total += _num_segs(T, seg_len)
+            pbar.set_postfix_str(f"tracks_loaded={loaded_tracks}/{len(shard_indices)}")
 
     # --------
-    # Interleaved sequential batching:
-    # take next segment from tracks in order, build batch, run model once
+    # Batched segment inference (same as before)
     # --------
     active = [i for i in range(len(states)) if states[i].pos < states[i].T]
 
     while active:
         batch_chunks = torch.zeros((0, 2, seg_len), device=device, dtype=torch.float32)
-        # per-sample metadata
         meta: List[Tuple[int, int, int]] = []  # (state_index, pos, valid)
 
-        # fill batch
-        # we iterate active in a stable order and pull one segment per track per round
-        # to keep segments sequential within each track.
         ai = 0
         while len(meta) < B and active:
             if ai >= len(active):
                 ai = 0
-                # if we made a full cycle without adding anything, break
                 if len(meta) == 0:
                     break
 
             si = active[ai]
             st = states[si]
             if st.pos >= st.T:
-                # remove finished
                 active.pop(ai)
                 continue
 
@@ -308,45 +329,40 @@ def run_validation_full_tracks(
             chunk = torch.zeros((1, 2, seg_len), device=device, dtype=torch.float32)
             chunk[:, :, :valid] = st.mix[:, pos:end].to(device=device, dtype=torch.float32)
 
-            batch_chunks = torch.cat([batch_chunks, chunk], dim=0)  # (b,2,seg)
+            batch_chunks = torch.cat([batch_chunks, chunk], dim=0)
             meta.append((si, pos, valid))
 
-            st.pos = end  # advance sequentially
+            st.pos = end
             ai += 1
 
         if len(meta) == 0:
             break
 
-        # forward once for the whole batch
         pred_b, tf_pack = _forward_batch_with_tf(
             model,
             batch_chunks,
             autocast_ctx=autocast_ctx,
             STEM_ORDER=STEM_ORDER,
-        )  # pred_b: (b,H,2,seg)
+        )
 
-        # write predictions back to full buffers
         for bi, (si, pos, valid) in enumerate(meta):
             st = states[si]
             end = pos + valid
             st.pred_full[:, :, pos:end] = pred_b[bi].to(dtype=torch.float32).detach().cpu()[:, :, :valid]
 
-        # compute losses (batched) with TF-mix
         if compute_losses:
             bsz = len(meta)
             tgt_b = torch.zeros((bsz, H, 2, seg_len), device=device, dtype=torch.float32)
-            pm_b  = torch.zeros((bsz, H), device=device, dtype=torch.float32)
+            pm_b = torch.zeros((bsz, H), device=device, dtype=torch.float32)
 
             for bi, (si, pos, valid) in enumerate(meta):
                 st = states[si]
                 tgt_b[bi, :, :, :valid] = st.tgt[:, :, pos:pos+valid].to(device=device, dtype=torch.float32)
-
-                # per-stem present by segment RMS
                 for h in range(H):
                     seg_rms = torch.sqrt(tgt_b[bi, h].pow(2).mean()).item()
                     pm_b[bi, h] = 1.0 if seg_rms >= float(silence_rms_thr) else 0.0
 
-            mt_b = tgt_b.sum(dim=1)  # (B,2,seg)
+            mt_b = tgt_b.sum(dim=1)
 
             with torch.autocast(device_type="cuda", enabled=False):
                 loss, stats = loss_comp(
@@ -363,19 +379,17 @@ def run_validation_full_tracks(
             loss_count += 1
 
         pbar.update(len(meta))
-
-        # refresh active list (some tracks may have ended)
         active = [i for i in active if states[i].pos < states[i].T]
 
     pbar.close()
 
     # --------
-    # Metrics per stem over whole tracks (CPU -> device for compute)
+    # Metrics per stem over whole tracks
     # --------
     for st in states:
         for si in range(H):
-            tgt_s = st.tgt[si]        # (2,T) CPU
-            pred_s = st.pred_full[si] # (2,T) CPU
+            tgt_s = st.tgt[si]
+            pred_s = st.pred_full[si]
 
             if float(_rms2ch(tgt_s).item()) < float(silence_rms_thr):
                 continue
@@ -405,9 +419,6 @@ def run_validation_full_tracks(
                 loss_sums[k] = float(vec[i].item())
             loss_count = int(loss_count_g)
 
-    # --------
-    # Finalize dict
-    # --------
     out: Dict[str, float] = {}
 
     if compute_losses and loss_count > 0:

@@ -1280,6 +1280,8 @@ def main():
                 world_size=world_size,
                 STEM_ORDER=STEM_ORDER,
                 batch_size=args.batch,
+                io_workers=args.num_workers,
+                prefetch_tracks=2 * args.num_workers,
             )
 
             if main_proc:
