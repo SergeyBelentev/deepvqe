@@ -17,6 +17,7 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -145,6 +146,64 @@ class MultiResolutionSTFTLoss(nn.Module):
 # Loss pack
 # -------------------------
 
+def _stereo_stft(
+    wav: torch.Tensor,              # (B,2,N)
+    *,
+    n_fft: int,
+    hop: int,
+    center: bool,
+    normalized: bool,
+) -> torch.Tensor:
+    """
+    returns: (B,2,T,F) complex64
+    """
+    B, C, N = wav.shape
+    assert C == 2
+    device = wav.device
+    win = torch.hann_window(n_fft, periodic=True, device=device, dtype=torch.float32)
+
+    x = wav.reshape(B * 2, N)  # (B*2, N)
+    with torch.autocast(device_type=device.type, enabled=False):
+        X = torch.stft(
+            x.float(),
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=win,
+            center=center,
+            normalized=normalized,
+            onesided=True,
+            return_complex=True,
+        )  # (B*2, F, T)
+    X = X.transpose(-2, -1).contiguous()  # (B*2, T, F)
+    T = X.shape[1]
+    F = X.shape[2]
+    return X.reshape(B, 2, T, F).to(torch.complex64)
+
+
+def _l1_ri_norm(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    pred,tgt: (B,2,T,F) complex
+    return scalar
+    """
+    # per-sample scale по магнитуде target, чтобы вес был похож на твой mix_scale
+    scale = tgt.abs().mean(dim=(1, 2, 3)).clamp_min(eps)  # (B,)
+    dr = (pred.real - tgt.real).abs().mean(dim=(1, 2, 3))
+    di = (pred.imag - tgt.imag).abs().mean(dim=(1, 2, 3))
+    return ((dr + di) / scale).mean()
+
+
+def _l1_logmag_norm(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    pred,tgt: (B,2,T,F) complex
+    """
+    scale = tgt.abs().mean(dim=(1, 2, 3)).clamp_min(eps)  # (B,)
+    lp_map = torch.log(pred.abs() + eps)
+    lt_map = torch.log(tgt.abs() + eps)
+    d = (lp_map - lt_map).abs().mean(dim=(1, 2, 3))
+    return (d / torch.log(scale + eps)).mean()
+
+
 def rms(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     return torch.sqrt(x.pow(2).mean(dim=(1, 2)).clamp_min(eps))
 
@@ -167,6 +226,9 @@ class LossComputer(nn.Module):
     def __init__(
         self,
         sr: int,
+        hop: int,
+        center: bool = True,
+        normalized: bool = False,
         mr_w_sc: float = 1.0,
         mr_w_lm: float = 1.0,
         silence_rms_thr: float = 1e-3,
@@ -175,6 +237,10 @@ class LossComputer(nn.Module):
         super().__init__()
         self.eps = float(eps)
         self.silence_rms_thr = float(silence_rms_thr)
+
+        self.hop = int(hop)
+        self.center = bool(center)
+        self.normalized = bool(normalized)
 
         self.mr = MultiResolutionSTFTLoss(
             n_ffts=(1024, 2048, 4096),
@@ -194,6 +260,7 @@ class LossComputer(nn.Module):
         present_mask: torch.Tensor,   # (B,4) float 0/1
         mix_target: torch.Tensor,     # (B,2,T)
         weights: Dict[str, float],
+        tf_pack: Dict[str, torch.Tensor] | None = None,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         B, H, C, T = pred_stems.shape
         assert H == 4 and C == 2
@@ -205,10 +272,76 @@ class LossComputer(nn.Module):
         l1_per_norm = l1_per / mix_scale.squeeze(-1)  # (B,4)
         l1_head = (l1_per_norm * present_mask).sum() / (present_mask.sum() + self.eps)
 
-        mix_pred = pred_stems.sum(dim=1)  # (B,2,T)
-        l1_mix = (mix_pred - mix_target).abs().mean(dim=(1, 2)) / mix_scale.squeeze(-1).squeeze(-1)
-        l1_mix = l1_mix.mean()
-        mr_mix, mr_mix_stat = self.mr(mix_pred, mix_target)
+        # mix TF loss
+        tf_ri_mix = pred_stems.sum() * 0.0
+        tf_lm_mix = pred_stems.sum() * 0.0
+        tf_ri_4096 = pred_stems.sum() * 0.0
+        tf_lm_4096 = pred_stems.sum() * 0.0
+        tf_ri_2048 = pred_stems.sum() * 0.0
+        tf_lm_2048 = pred_stems.sum() * 0.0
+
+        if tf_pack is not None:
+            # pred spectra sums
+            # S*: (B,H,2,T,F) complex
+            S4096_g = tf_pack["S4096_g"]
+            S2048_g = tf_pack["S2048_g"]
+            g4096 = tf_pack["g4096"]  # (B,H,1,T,2049) float
+            g2048 = tf_pack["g2048"]  # (B,H,1,T,1025) float
+
+            B, H, _, Ttf, F4096 = S4096_g.shape
+            N = tgt_stems.shape[-1]
+            hop = self.hop
+
+            # --- pad targets exactly like model to match Ttf ---
+            T0 = (N // hop) + 1
+            if Ttf > T0:
+                N_pad = (Ttf - 1) * hop
+            else:
+                N_pad = N
+
+            if N_pad > N:
+                tgt_pad = F.pad(tgt_stems, (0, N_pad - N))
+            else:
+                tgt_pad = tgt_stems
+
+            # STFT all heads in one shot: (B*H,2,N_pad) -> (B,H,2,T,F)
+            tgt_flat = tgt_pad.reshape(B * H, 2, N_pad)
+
+            X4096_h = _stereo_stft(
+                tgt_flat,
+                n_fft=4096,
+                hop=hop,
+                center=self.center,
+                normalized=self.normalized,
+            ).reshape(B, H, 2, -1, 2049)
+
+            X2048_h = _stereo_stft(
+                tgt_flat,
+                n_fft=2048,
+                hop=hop,
+                center=self.center,
+                normalized=self.normalized,
+            ).reshape(B, H, 2, -1, 1025)
+
+            # build targets with detached router gains (head-wise)
+            X4096_tgt = (X4096_h * g4096.detach()).sum(dim=1)  # (B,2,T,2049)
+            X2048_tgt = (X2048_h * g2048.detach()).sum(dim=1)  # (B,2,T,1025)
+
+            # predicted sums over heads
+            S4096_sum = S4096_g.sum(dim=1)  # (B,2,T,2049)
+            S2048_sum = S2048_g.sum(dim=1)  # (B,2,T,1025)
+
+            # TF mix losses
+            tf_ri_4096 = _l1_ri_norm(S4096_sum, X4096_tgt, self.eps)
+            tf_lm_4096 = _l1_logmag_norm(S4096_sum, X4096_tgt, self.eps)
+
+            tf_ri_2048 = _l1_ri_norm(S2048_sum, X2048_tgt, self.eps)
+            tf_lm_2048 = _l1_logmag_norm(S2048_sum, X2048_tgt, self.eps)
+
+            tf_ri_mix = tf_ri_4096 + tf_ri_2048
+            tf_lm_mix = tf_lm_4096 + tf_lm_2048
+
+        # mix tf loss end
 
         tgt_rms = torch.stack([rms(tgt_stems[:, i]) for i in range(4)], dim=1)  # (B,4)
         silence_mask = (present_mask <= 0.0) | (tgt_rms < self.silence_rms_thr)  # (B,4) bool
@@ -256,8 +389,8 @@ class LossComputer(nn.Module):
         total = (
             weights["w_l1_head"] * l1_head +
             weights["w_mr_head"] * mr_head +
-            weights["w_l1_mix"] * l1_mix +
-            weights["w_mr_mix"] * mr_mix +
+            weights.get("w_tf_mix_ri", 0.0) * tf_ri_mix +
+            weights.get("w_tf_mix_lm", 0.0) * tf_lm_mix +
             weights["w_silence"] * silence_loss +
             weights["w_leak"] * leak_loss
         )
@@ -268,10 +401,12 @@ class LossComputer(nn.Module):
             "mr_head": mr_head.detach(),
             "mr_sc_head": mr_sc.detach(),
             "mr_lm_head": mr_lm.detach(),
-            "l1_mix": l1_mix.detach(),
-            "mr_mix": mr_mix.detach(),
-            "mr_sc_mix": mr_mix_stat["mr_sc"].detach(),
-            "mr_lm_mix": mr_mix_stat["mr_logmag"].detach(),
+            "tf_ri_mix": tf_ri_mix.detach(),
+            "tf_lm_mix": tf_lm_mix.detach(),
+            "tf_ri_4096": tf_ri_4096.detach(),
+            "tf_lm_4096": tf_lm_4096.detach(),
+            "tf_ri_2048": tf_ri_2048.detach(),
+            "tf_lm_2048": tf_lm_2048.detach(),
             "silence": silence_loss.detach(),
             "leak": leak_loss.detach(),
         }
@@ -555,7 +690,8 @@ def run_validation(
         flags = batch[6] if len(batch) > 6 else None
 
         with autocast_ctx:
-            out = model(mix, return_debug=False)  # dict head -> (B,2,T)
+            out = model(mix, return_debug=False, return_tf=True)  # dict head -> (B,2,T)
+            tf_pack = out.pop("_tf")
             pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
             loss, stats = loss_comp(
                 pred_stems=pred,
@@ -563,6 +699,7 @@ def run_validation(
                 present_mask=pm,
                 mix_target=mix_target,
                 weights=weights,
+                tf_pack=tf_pack,
             )
 
         # accumulate means
@@ -712,13 +849,16 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=50)
     p.add_argument("--resume", type=str, default="")
 
-    # loss weights
+    # loss weights head
     p.add_argument("--w-l1-head", type=float, default=1.0)
     p.add_argument("--w-mr-head", type=float, default=1.0)
-    p.add_argument("--w-l1-mix", type=float, default=0.5)
-    p.add_argument("--w-mr-mix", type=float, default=0.5)
-    p.add_argument("--w-silence", type=float, default=0.2)
+    # loss tf mix
+    p.add_argument("--w-tf-mix-ri", type=float, default=0.5)
+    p.add_argument("--w-tf-mix-lm", type=float, default=0.5)
+    # loss leak
     p.add_argument("--w-leak", type=float, default=0.2)
+    # loss silence
+    p.add_argument("--w-silence", type=float, default=0.2)
     p.add_argument("--silence-rms", type=float, default=1e-3)
 
     # --- validation split by songs (items)
@@ -950,13 +1090,16 @@ def main():
         mr_w_sc=1.0,
         mr_w_lm=1.0,
         silence_rms_thr=float(args.silence_rms),
+        hop=cfg.hop,
+        center=cfg.center,
+        normalized=cfg.normalized,
     ).to(device)
 
     weights = {
         "w_l1_head": float(args.w_l1_head),
         "w_mr_head": float(args.w_mr_head),
-        "w_l1_mix": float(args.w_l1_mix),
-        "w_mr_mix": float(args.w_mr_mix),
+        "w_tf_mix_ri": float(args.w_tf_mix_ri),
+        "w_tf_mix_lm": float(args.w_tf_mix_lm),
         "w_silence": float(args.w_silence),
         "w_leak": float(args.w_leak),
     }
@@ -1031,7 +1174,8 @@ def main():
             mix_target = batch[5].to(device, non_blocking=True)  # (B,2,T)
 
             with autocast_ctx:
-                out = model(mix, return_debug=False)
+                out = model(mix, return_debug=False, return_tf=True)
+                tf_pack = out.pop("_tf")
                 pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
 
             with torch.autocast(device_type="cuda", enabled=False):
@@ -1041,6 +1185,7 @@ def main():
                     present_mask=pm.float(),
                     mix_target=mix_target.float(),
                     weights=weights,
+                    tf_pack=tf_pack,
                 )
                 loss_scaled = loss / float(accum)
 
@@ -1082,9 +1227,14 @@ def main():
                         "loss": f"{ema.get('loss_total', stats_f['loss_total']):.4f}",
                         "l1h": f"{ema.get('l1_head', stats_f['l1_head']):.3f}",
                         "mrh": f"{ema.get('mr_head', stats_f['mr_head']):.3f}",
-                        "mix": f"{ema.get('l1_mix', stats_f['l1_mix']):.3f}",
                         "sil": f"{ema.get('silence', stats_f['silence']):.3f}",
                         "leak": f"{ema.get('leak', stats_f['leak']):.3f}",
+                        "tf_ri_mix": f"{ema.get('tf_ri_mix', stats_f['tf_ri_mix']):.3f}",
+                        "tf_lm_mix": f"{ema.get('tf_lm_mix', stats_f['tf_lm_mix']):.3f}",
+                        "tf_ri_4096": f"{ema.get('tf_ri_4096', stats_f['tf_ri_4096']):.3f}",
+                        "tf_lm_4096": f"{ema.get('tf_lm_4096', stats_f['tf_lm_4096']):.3f}",
+                        "tf_ri_2048": f"{ema.get('tf_ri_2048', stats_f['tf_ri_2048']):.3f}",
+                        "tf_lm_2048": f"{ema.get('tf_lm_2048', stats_f['tf_lm_2048']):.3f}",
                     })
 
                 # step ckpt

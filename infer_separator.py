@@ -158,7 +158,12 @@ def separate_ola(
         chunk_w = chunk * win
 
         with autocast_ctx:
-            pred = model(chunk_w, return_debug=False)  # dict stem -> (1,2,seg)
+            pred = model(chunk_w, return_debug=True)  # dict stem -> (1,2,seg)
+
+        if '_debug' in pred:
+            debug = pred['_debug']
+
+
 
         # synthesis window + accumulate
         # Use window^2 for denom so reconstruction is stable.
@@ -249,6 +254,20 @@ def main():
         amp=args.amp,
         window=args.window,
     )
+
+    def tr(x):
+        x = x.float()
+        return {
+            "finite": bool(torch.isfinite(x).all().item()),
+            "maxabs": float(x.abs().max().item()),
+            "rms": float((x.pow(2).mean().sqrt()).item()),
+        }
+
+    for s in STEM_ORDER:
+        print("[dbg]", s, tr(stems[s]))
+
+    stem_sum = sum((stems[s] for s in STEM_ORDER), start=torch.zeros_like(stems[STEM_ORDER[0]]))
+    print("[dbg] stem_sum", tr(stem_sum))
 
     # Save
     for name, y in stems.items():

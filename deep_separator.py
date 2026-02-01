@@ -1116,7 +1116,7 @@ class StemSeparator(nn.Module):
                 out.append(x.float())
         return torch.stack(out, dim=1)
 
-    def forward(self, wav: torch.Tensor, return_debug: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, wav: torch.Tensor, return_debug: bool = False, return_tf: bool = False) -> Dict[str, torch.Tensor] | Dict[str, Dict[str, torch.Tensor]]:
         """
         wav: (B,2,N)
         returns dict: head_name -> stem waveform (B,2,N)
@@ -1177,10 +1177,15 @@ class StemSeparator(nn.Module):
         # We compute router per head (as you described: router takes tokens after D1),
         # but it's shared weights. We will run it after each head's D1.
 
-        out: Dict[str, torch.Tensor] = {}
+        out: Dict[str, torch.Tensor] | Dict[str, Dict[str, torch.Tensor]]= {}
         debug: Dict[str, Dict[str, torch.Tensor]] = {} if return_debug else None
 
         skips = self._precompute_skips(enc_stages)
+
+        tf_S4096 = []
+        tf_S2048 = []
+        tf_g4096 = []
+        tf_g2048 = []
 
         for h in self.cfg.heads:
             # 4.1) per-head decoder
@@ -1199,6 +1204,12 @@ class StemSeparator(nn.Module):
 
             S4096_g = S4096 * g4096
             S2048_g = S2048 * g2048
+
+            if return_tf:
+                tf_S4096.append(S4096_g)
+                tf_S2048.append(S2048_g)
+                tf_g4096.append(g4096)
+                tf_g2048.append(g2048)
 
             # 4.4) ISTFT per resolution and sum in time domain
             s4096 = self._istft(S4096_g, n_fft=self.cfg.n_fft_main, length=wav.shape[-1])  # N_pad
@@ -1220,6 +1231,15 @@ class StemSeparator(nn.Module):
 
         if return_debug:
             out["_debug"] = debug  # type: ignore[assignment]
+
+        if return_tf:
+            # (B,H,2,T,F) complex, (B,H,1,T,F) float
+            out["_tf"] = {
+                "S4096_g": torch.stack(tf_S4096, dim=1),
+                "S2048_g": torch.stack(tf_S2048, dim=1),
+                "g4096": torch.stack(tf_g4096, dim=1),
+                "g2048": torch.stack(tf_g2048, dim=1),
+            }  # type: ignore[assignment]
 
         return out
 
