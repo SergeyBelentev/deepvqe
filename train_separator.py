@@ -848,8 +848,8 @@ def parse_args():
     p.add_argument("--w-l1-head", type=float, default=1.0)
     p.add_argument("--w-mr-head", type=float, default=1.0)
     # loss tf mix
-    p.add_argument("--w-tf-mix-ri", type=float, default=0.5)
-    p.add_argument("--w-tf-mix-lm", type=float, default=0.5)
+    p.add_argument("--w-tf-mix-ri", type=float, default=0.0)
+    p.add_argument("--w-tf-mix-lm", type=float, default=0.0)
     # loss leak
     p.add_argument("--w-leak", type=float, default=0.2)
     # loss silence
@@ -1132,9 +1132,12 @@ def main():
             pm  = batch[4].to(device, non_blocking=True)         # (B,4)
             mix_target = batch[5].to(device, non_blocking=True)  # (B,2,T)
 
+            tf_pack = None
             with autocast_ctx:
-                out = model(mix, return_debug=False, return_tf=True)
-                tf_pack = out.pop("_tf")
+                return_tf = float(args.w_tf_mix_ri) > 0 or float(args.w_tf_mix_lm) > 0
+                out = model(mix, return_debug=False, return_tf=return_tf)
+                if return_tf:
+                    tf_pack = out.pop("_tf")
                 pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
 
             with torch.autocast(device_type="cuda", enabled=False):
