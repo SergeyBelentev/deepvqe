@@ -847,6 +847,8 @@ def parse_args():
     # loss weights head
     p.add_argument("--w-l1-head", type=float, default=1.0)
     p.add_argument("--w-mr-head", type=float, default=1.0)
+    p.add_argument("--w-mr-sc", type=float, default=1.0)
+    p.add_argument("--w-mr-lm", type=float, default=1.0)
     # loss tf mix
     p.add_argument("--w-tf-mix-ri", type=float, default=0.0)
     p.add_argument("--w-tf-mix-lm", type=float, default=0.0)
@@ -1053,8 +1055,8 @@ def main():
 
     loss_comp = LossComputer(
         sr=cfg.sample_rate,
-        mr_w_sc=1.0,
-        mr_w_lm=1.0,
+        mr_w_sc=args.w_mr_sc,
+        mr_w_lm=args.w_mr_lm,
         silence_rms_thr=float(args.silence_rms),
         hop=cfg.hop,
         center=cfg.center,
