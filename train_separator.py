@@ -861,6 +861,7 @@ def parse_args():
     p.add_argument("--val-count", type=int, default=0, help="override val size by number of songs (0 = use val-frac)")
     p.add_argument("--val-seed", type=int, default=12345, help="seed for train/val song split")
     p.add_argument("--val-save-dir", type=str, default="val", help="subdir under --out to store val artifacts")
+    p.add_argument("--val-batch-scale", type=int, default=1)
 
     # --- S3 for checkpoints / validation artifacts
     p.add_argument("--s3-bucket", type=str, default="")
@@ -1282,7 +1283,7 @@ def main():
                 rank=rank,
                 world_size=world_size,
                 STEM_ORDER=STEM_ORDER,
-                batch_size=args.batch,
+                batch_size=args.batch * args.val_batch_scale,
                 io_workers=args.num_workers,
                 prefetch_tracks=2 * args.num_workers,
             )
