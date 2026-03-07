@@ -774,9 +774,10 @@ class DubSeparator(nn.Module):
 
     def _build_masks(self, x: Tensor) -> Dict[str, Tensor]:
         # x: [B,96,T,F]
-        crm_raw = self.head_crm(x)
-        mp_raw = self.head_mp(x)
-        gate_logits = self.head_gate(x)
+        # bf16 autocast-friendly: complex masks are assembled in fp32
+        crm_raw = self.head_crm(x).float()
+        mp_raw = self.head_mp(x).float()
+        gate_logits = self.head_gate(x).float()
         gate = torch.sigmoid(gate_logits)
 
         crm_raw = crm_raw.permute(0, 2, 3, 1).contiguous()  # [B,T,F,4]
@@ -784,18 +785,17 @@ class DubSeparator(nn.Module):
         gate = gate.permute(0, 2, 3, 1).contiguous()  # [B,T,F,1]
 
         crm = self._scale_crm(crm_raw, self.cfg.crm_scale)
+
         crm_complex = torch.complex(
             torch.stack([crm[..., 0], crm[..., 2]], dim=1),
             torch.stack([crm[..., 1], crm[..., 3]], dim=1),
         )  # [B,2,T,F]
 
-        mag_logits = torch.stack([mp_raw[..., 0], mp_raw[..., 2]], dim=1)
-        phi_logits = torch.stack([mp_raw[..., 1], mp_raw[..., 3]], dim=1)
-        mag = torch.sigmoid(mag_logits)
-        dphi = torch.tanh(phi_logits) * math.pi
-        mp_complex = torch.polar(mag, dphi)  # [B,2,T,F]
+        mag = torch.sigmoid(torch.stack([mp_raw[..., 0], mp_raw[..., 2]], dim=1))
+        dphi = torch.tanh(torch.stack([mp_raw[..., 1], mp_raw[..., 3]], dim=1)) * math.pi
+        mp_complex = mag * torch.complex(torch.cos(dphi), torch.sin(dphi))
 
-        gate_btfs = gate.permute(0, 3, 1, 2)  # [B,1,T,F]
+        gate_btfs = gate.permute(0, 3, 1, 2).contiguous()  # [B,1,T,F]
         final_mask = gate_btfs * crm_complex + (1.0 - gate_btfs) * mp_complex
 
         return {
