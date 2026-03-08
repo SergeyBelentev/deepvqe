@@ -51,6 +51,8 @@ class DubSeparatorConfig:
     stage_tokenizer_heads: int = 4
     band_tokenizer_heads: int = 4
     token_mlp_mult: float = 2.0
+    pretrunk_num_heads: int = 4
+    pretrunk_ff_mult: float = 2.0
 
     crm_scale: float = 3.0
     refine_kernel_t: int = 5
@@ -512,6 +514,21 @@ class TrunkSelfCrossBlock(nn.Module):
         return mix
 
 
+class PerBandPreTrunkBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, ff_mult: float, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.block = TrunkSelfCrossBlock(dim=dim, num_heads=num_heads, ff_mult=ff_mult, dropout=dropout)
+
+    def forward(self, mix: Tensor, ref: Tensor) -> Tensor:
+        # mix/ref: [B,C,T,Kb]
+        b, c, t, k = mix.shape
+        mix_seq = mix.permute(0, 2, 3, 1).reshape(b * t, k, c)
+        ref_seq = ref.permute(0, 2, 3, 1).reshape(b * t, k, c)
+        out = self.block(mix_seq, ref_seq)
+        out = out.reshape(b, t, k, c).permute(0, 3, 1, 2).contiguous()
+        return out
+
+
 class StageSkipTokenizer(nn.Module):
     def __init__(self, dim: int, num_tokens: int, num_heads: int, mlp_mult: float) -> None:
         super().__init__()
@@ -650,6 +667,12 @@ class DubSeparator(nn.Module):
             QueryBandTokenizer(dim=self.cfg.trunk_dim, num_tokens=band.num_tokens, num_heads=self.cfg.band_tokenizer_heads, mlp_mult=self.cfg.token_mlp_mult)
             for band in self.cfg.bands
         ])
+        self.per_band_pretrunk = PerBandPreTrunkBlock(
+            dim=self.cfg.trunk_dim,
+            num_heads=self.cfg.pretrunk_num_heads,
+            ff_mult=self.cfg.pretrunk_ff_mult,
+            dropout=self.cfg.attn_dropout,
+        )
 
         # mix/ref stream identity + band identity in token space.
         self.mix_stream_emb = nn.Parameter(torch.randn(self.cfg.trunk_dim) * 0.02)
@@ -733,6 +756,25 @@ class DubSeparator(nn.Module):
             tok = self.band_tokenizers[bidx](x, pos_emb=pos, stream_emb=stream_emb.to(device=x.device, dtype=x.dtype), band_emb=band_emb)
             toks.append(tok)
         return torch.cat(toks, dim=-1)
+
+    def _tokenize_branch_bands(self, encoded_bands: List[Tensor], *, stream: Literal["mix", "ref"]) -> List[Tensor]:
+        stream_emb = self.mix_stream_emb if stream == "mix" else self.ref_stream_emb
+        toks: List[Tensor] = []
+        for bidx, x in enumerate(encoded_bands):
+            pos = self.band_pos_embs[bidx](x.size(-1), x.device)
+            band_emb = self.band_id_emb.weight[bidx].to(device=x.device, dtype=x.dtype)
+            tok = self.band_tokenizers[bidx](x, pos_emb=pos, stream_emb=stream_emb.to(device=x.device, dtype=x.dtype), band_emb=band_emb)
+            toks.append(tok)
+        return toks
+
+    def _run_per_band_pretrunk(self, mix_bands: List[Tensor], ref_bands: List[Tensor]) -> Tuple[List[Tensor], Tensor, Tensor]:
+        mix_out: List[Tensor] = []
+        ref_out: List[Tensor] = []
+        for mix_tok, ref_tok in zip(mix_bands, ref_bands):
+            mix_tok = self.per_band_pretrunk(mix_tok, ref_tok)
+            mix_out.append(mix_tok)
+            ref_out.append(ref_tok)
+        return mix_out, torch.cat(mix_out, dim=-1), torch.cat(ref_out, dim=-1)
 
     def _add_trunk_positions(self, x: Tensor) -> Tensor:
         # x: [B,C,T,K]
@@ -832,8 +874,9 @@ class DubSeparator(nn.Module):
         mix_encoded, mix_stages = self._encode_branch(mix_feats, self.mix_input_stems)
         ref_encoded, _ = self._encode_branch(ref_feats, self.ref_input_stems)
 
-        z_mix = self._tokenize_branch(mix_encoded, stream="mix")
-        z_ref = self._tokenize_branch(ref_encoded, stream="ref")
+        mix_band_tokens = self._tokenize_branch_bands(mix_encoded, stream="mix")
+        ref_band_tokens = self._tokenize_branch_bands(ref_encoded, stream="ref")
+        pretrunk_mix_bands, z_mix, z_ref = self._run_per_band_pretrunk(mix_band_tokens, ref_band_tokens)
 
         z_mix = self._add_trunk_positions(z_mix)
         z_ref = self._add_trunk_positions(z_ref)
@@ -878,6 +921,7 @@ class DubSeparator(nn.Module):
             "crm_gate_logits": mask_dict["gate_logits"],
             "z_mix": z_mix,
             "z_ref": z_ref,
+            "pretrunk_mix_bands": pretrunk_mix_bands,
             "decoder_tokens": x,
             "decoder_tf": x_tf,
         }
