@@ -1,1009 +1,890 @@
 from __future__ import annotations
 
-import argparse
-import json
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Literal, Tuple
+
 import math
-import os
-import random
-import signal
-import time
-from dataclasses import asdict
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-import numpy as np
-import soundfile as sf
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
-
-from dub_separator import DubSeparator, DubSeparatorConfig
+import torch.nn.functional as F
 
 
 # ============================================================
-# Indexing
+# Configs
 # ============================================================
 
 
-class SegmentIndexError(RuntimeError):
-    pass
+@dataclass(slots=True)
+class BandSpec:
+    name: str
+    f_min_hz: float
+    f_max_hz: float
+    num_tokens: int
+    overlap_ratio: float = 0.20
+    encoder_profile: Literal["band0", "band1", "band2", "band3", "band4plus"] = "band4plus"
 
 
-class StopTraining(Exception):
-    pass
+@dataclass(slots=True)
+class DubSeparatorConfig:
+    sample_rate: int = 48_000
+    n_fft: int = 2048
+    hop_length: int = 1024
+    win_length: int = 2048
+    center: bool = True
+    normalized: bool = False
+    window_fn: str = "hann"
+    eps: float = 1e-8
 
+    encoder_channels: Tuple[int, int, int, int, int] = (32, 96, 160, 192, 192)
+    trunk_dim: int = 192
+    head_dim: int = 96
 
-def _relpath_str(path: Path, root: Path) -> str:
-    try:
-        return str(path.relative_to(root))
-    except Exception:
-        return str(path)
+    num_trunk_layers: int = 6
+    trunk_num_heads: int = 8
+    trunk_ff_mult: float = 4.0
+    axial_num_heads: int = 4
+    axial_dropout: float = 0.0
+    attn_dropout: float = 0.0
+    proj_dropout: float = 0.0
 
+    detok_num_heads: int = 8
+    stage_tokenizer_heads: int = 4
+    band_tokenizer_heads: int = 4
+    token_mlp_mult: float = 2.0
 
+    crm_scale: float = 3.0
+    refine_kernel_t: int = 5
+    refine_kernel_f: int = 3
 
-def _info_frames_and_sr(path: Path) -> Tuple[int, int, int]:
-    info = sf.info(str(path))
-    return int(info.frames), int(info.samplerate), int(info.channels)
+    # 10 single-resolution overlapped bands.
+    bands: Tuple[BandSpec, ...] = (
+        BandSpec("band0", 0.0, 500.0, 6, encoder_profile="band0"),
+        BandSpec("band1", 500.0, 1250.0, 8, encoder_profile="band1"),
+        BandSpec("band2", 1250.0, 2500.0, 8, encoder_profile="band2"),
+        BandSpec("band3", 2500.0, 5000.0, 10, encoder_profile="band3"),
+        BandSpec("band4", 5000.0, 8000.0, 12, encoder_profile="band4plus"),
+        BandSpec("band5", 8000.0, 12000.0, 12, encoder_profile="band4plus"),
+        BandSpec("band6", 12000.0, 16000.0, 12, encoder_profile="band4plus"),
+        BandSpec("band7", 16000.0, 20000.0, 12, encoder_profile="band4plus"),
+        BandSpec("band8", 20000.0, 22000.0, 10, encoder_profile="band4plus"),
+        BandSpec("band9", 22000.0, 24000.0, 10, encoder_profile="band4plus"),
+    )
 
+    @property
+    def num_bands(self) -> int:
+        return len(self.bands)
 
+    @property
+    def total_tokens(self) -> int:
+        return sum(b.num_tokens for b in self.bands)
 
-def _scan_mix_files(root: Path) -> List[Path]:
-    return sorted(p for p in root.rglob("*_mix.wav") if p.is_file())
-
-
-
-def index_speech_segments(root: Path, expected_sr: int) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    mix_files = _scan_mix_files(root)
-    if not mix_files:
-        raise SegmentIndexError(f"No *_mix.wav files found under speech root: {root}")
-
-    for mix_path in mix_files:
-        stem = mix_path.name[:-len("_mix.wav")]
-        ref_path = mix_path.with_name(f"{stem}_ref.wav")
-        target_path = mix_path.with_name(f"{stem}_target.wav")
-        if not ref_path.exists() or not target_path.exists():
-            raise SegmentIndexError(
-                f"Speech triplet incomplete for {mix_path}: expected {ref_path.name} and {target_path.name}"
-            )
-
-        mix_frames, mix_sr, mix_ch = _info_frames_and_sr(mix_path)
-        ref_frames, ref_sr, ref_ch = _info_frames_and_sr(ref_path)
-        tgt_frames, tgt_sr, tgt_ch = _info_frames_and_sr(target_path)
-
-        if mix_sr != expected_sr or ref_sr != expected_sr or tgt_sr != expected_sr:
-            raise SegmentIndexError(
-                f"Sample-rate mismatch for speech segment {mix_path}: mix/ref/target sr = "
-                f"{mix_sr}/{ref_sr}/{tgt_sr}, expected {expected_sr}"
-            )
-        if mix_ch < 1 or ref_ch < 1 or tgt_ch < 1:
-            raise SegmentIndexError(f"Invalid channel count for speech segment {mix_path}")
-
-        min_frames = min(mix_frames, ref_frames, tgt_frames)
-        entries.append(
-            {
-                "kind": "speech",
-                "id": stem,
-                "mix_path": str(mix_path),
-                "ref_path": str(ref_path),
-                "target_path": str(target_path),
-                "mix_frames": mix_frames,
-                "ref_frames": ref_frames,
-                "target_frames": tgt_frames,
-                "trimmed_frames": min_frames,
-                "relpath": _relpath_str(mix_path.parent, root),
-            }
-        )
-    return entries
-
-
-
-def index_nospeech_segments(root: Path, expected_sr: int) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    mix_files = _scan_mix_files(root)
-    if not mix_files:
-        raise SegmentIndexError(f"No *_mix.wav files found under nospeech root: {root}")
-
-    for mix_path in mix_files:
-        stem = mix_path.name[:-len("_mix.wav")]
-        ref_path = mix_path.with_name(f"{stem}_ref.wav")
-        if not ref_path.exists():
-            raise SegmentIndexError(
-                f"Nospeech pair incomplete for {mix_path}: expected {ref_path.name}"
-            )
-
-        mix_frames, mix_sr, mix_ch = _info_frames_and_sr(mix_path)
-        ref_frames, ref_sr, ref_ch = _info_frames_and_sr(ref_path)
-
-        if mix_sr != expected_sr or ref_sr != expected_sr:
-            raise SegmentIndexError(
-                f"Sample-rate mismatch for nospeech segment {mix_path}: mix/ref sr = "
-                f"{mix_sr}/{ref_sr}, expected {expected_sr}"
-            )
-        if mix_ch < 1 or ref_ch < 1:
-            raise SegmentIndexError(f"Invalid channel count for nospeech segment {mix_path}")
-
-        min_frames = min(mix_frames, ref_frames)
-        entries.append(
-            {
-                "kind": "nospeech",
-                "id": stem,
-                "mix_path": str(mix_path),
-                "ref_path": str(ref_path),
-                "target_path": None,
-                "mix_frames": mix_frames,
-                "ref_frames": ref_frames,
-                "target_frames": 0,
-                "trimmed_frames": min_frames,
-                "relpath": _relpath_str(mix_path.parent, root),
-            }
-        )
-    return entries
-
-
-
-def summarize_index(entries: Sequence[Dict[str, Any]], sample_rate: int) -> Dict[str, Any]:
-    total_frames = sum(int(e["trimmed_frames"]) for e in entries)
-    hours = total_frames / float(sample_rate) / 3600.0
-    return {
-        "count": len(entries),
-        "hours": hours,
-        "min_sec": (min(int(e["trimmed_frames"]) for e in entries) / sample_rate) if entries else 0.0,
-        "max_sec": (max(int(e["trimmed_frames"]) for e in entries) / sample_rate) if entries else 0.0,
-        "mean_sec": (total_frames / max(len(entries), 1) / sample_rate) if entries else 0.0,
-    }
-
-
-def save_full_index_json(
-    path: Path,
-    *,
-    speech_entries: Sequence[Dict[str, Any]],
-    nospeech_entries: Sequence[Dict[str, Any]],
-    sample_rate: int,
-    speech_root: Optional[Path],
-    nospeech_root: Optional[Path],
-) -> None:
-    payload = {
-        "version": 1,
-        "sample_rate": int(sample_rate),
-        "speech_root": str(speech_root) if speech_root is not None else None,
-        "nospeech_root": str(nospeech_root) if nospeech_root is not None else None,
-        "speech_entries": list(speech_entries),
-        "nospeech_entries": list(nospeech_entries),
-        "speech_summary": summarize_index(speech_entries, sample_rate),
-        "nospeech_summary": summarize_index(nospeech_entries, sample_rate),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _normalize_loaded_entry(entry: Dict[str, Any], *, kind: str) -> Dict[str, Any]:
-    required = ["id", "mix_path", "ref_path", "trimmed_frames"]
-    for key in required:
-        if key not in entry:
-            raise SegmentIndexError(f"Loaded {kind} index entry is missing key: {key}")
-
-    norm = {
-        "kind": kind,
-        "id": str(entry["id"]),
-        "mix_path": str(entry["mix_path"]),
-        "ref_path": str(entry["ref_path"]),
-        "target_path": str(entry["target_path"]) if entry.get("target_path") is not None else None,
-        "mix_frames": int(entry.get("mix_frames", entry["trimmed_frames"])),
-        "ref_frames": int(entry.get("ref_frames", entry["trimmed_frames"])),
-        "target_frames": int(entry.get("target_frames", 0)),
-        "trimmed_frames": int(entry["trimmed_frames"]),
-        "relpath": str(entry.get("relpath", "")),
-    }
-    return norm
-
-
-def load_full_index_json(path: Path, *, expected_sr: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    sr = int(payload.get("sample_rate", -1))
-    if sr != int(expected_sr):
-        raise SegmentIndexError(f"Index JSON sample_rate={sr} does not match expected sample_rate={expected_sr}: {path}")
-
-    speech_entries = [_normalize_loaded_entry(e, kind="speech") for e in payload.get("speech_entries", [])]
-    nospeech_entries = [_normalize_loaded_entry(e, kind="nospeech") for e in payload.get("nospeech_entries", [])]
-
-    if not speech_entries and not nospeech_entries:
-        raise SegmentIndexError(f"Loaded index JSON contains no entries: {path}")
-
-    meta = {
-        "version": int(payload.get("version", 1)),
-        "sample_rate": sr,
-        "speech_root": payload.get("speech_root"),
-        "nospeech_root": payload.get("nospeech_root"),
-        "speech_summary": payload.get("speech_summary"),
-        "nospeech_summary": payload.get("nospeech_summary"),
-    }
-    return speech_entries, nospeech_entries, meta
+    @property
+    def onesided_bins(self) -> int:
+        return self.n_fft // 2 + 1
 
 
 # ============================================================
-# Audio loading and dataset
+# Utility ops
 # ============================================================
 
 
-
-def _ensure_stereo(x: np.ndarray, path: str) -> np.ndarray:
-    if x.ndim == 1:
-        x = np.stack([x, x], axis=-1)
-    if x.ndim != 2:
-        raise SegmentIndexError(f"Expected 1D/2D audio from {path}, got shape {x.shape}")
-    if x.shape[1] == 1:
-        x = np.repeat(x, 2, axis=1)
-    elif x.shape[1] >= 2:
-        x = x[:, :2]
-    return x.astype(np.float32, copy=False)
+def _make_window(name: str, win_length: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    if name == "hann":
+        return torch.hann_window(win_length, periodic=True, device=device, dtype=dtype)
+    raise ValueError(f"Unsupported window_fn={name!r}")
 
 
-
-def _read_audio(path: str) -> Tuple[np.ndarray, int]:
-    wav, sr = sf.read(path, dtype="float32", always_2d=True)
-    wav = _ensure_stereo(wav, path)
-    return wav, sr
-
-
-
-def _trim_triplet_to_min(mix: np.ndarray, ref: np.ndarray, target: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    arrays = [mix, ref]
-    if target is not None:
-        arrays.append(target)
-    min_len = min(x.shape[0] for x in arrays)
-    mix = mix[:min_len]
-    ref = ref[:min_len]
-    if target is None:
-        target = np.zeros((min_len, 2), dtype=np.float32)
-    else:
-        target = target[:min_len]
-    return mix, ref, target
-
-
-class MixedSegmentDataset(Dataset[Dict[str, Tensor]]):
-    def __init__(
-        self,
-        *,
-        speech_entries: Sequence[Dict[str, Any]],
-        nospeech_entries: Sequence[Dict[str, Any]],
-        sample_rate: int,
-        segment_sec: float,
-        epoch_steps: int,
-        batch_size: int,
-        speech_prob: float,
-        nospeech_prob: float,
-        seed: int = 42,
-    ) -> None:
+class STFTFrontend(nn.Module):
+    def __init__(self, cfg: DubSeparatorConfig) -> None:
         super().__init__()
-        self.speech_entries = list(speech_entries)
-        self.nospeech_entries = list(nospeech_entries)
-        self.sample_rate = int(sample_rate)
-        self.segment_samples = int(round(segment_sec * sample_rate))
-        self.epoch_steps = int(epoch_steps)
-        self.batch_size = int(batch_size)
-        self.virtual_length = self.epoch_steps * self.batch_size
-        self.seed = int(seed)
+        self.cfg = cfg
+        window = _make_window(cfg.window_fn, cfg.win_length, device=torch.device("cpu"), dtype=torch.float32)
+        self.register_buffer("window", window, persistent=False)
 
-        if self.segment_samples <= 0:
-            raise ValueError("segment_sec must produce at least 1 sample")
-        if not self.speech_entries and not self.nospeech_entries:
-            raise ValueError("Both speech and nospeech indexes are empty")
-        if speech_prob < 0 or nospeech_prob < 0:
-            raise ValueError("speech_prob and nospeech_prob must be >= 0")
-        total_prob = speech_prob + nospeech_prob
-        if total_prob <= 0:
-            raise ValueError("speech_prob + nospeech_prob must be > 0")
-        self.speech_prob = speech_prob / total_prob
-        self.nospeech_prob = nospeech_prob / total_prob
+    def stft(self, waveform: Tensor) -> Tensor:
+        """
+        Args:
+            waveform: [B, 2, S]
+        Returns:
+            complex STFT: [B, 2, T, F]
+        """
+        if waveform.ndim != 3 or waveform.size(1) != 2:
+            raise ValueError(f"Expected waveform [B,2,S], got {tuple(waveform.shape)}")
 
-    def __len__(self) -> int:
-        return self.virtual_length
-
-    def _rng(self, index: int) -> random.Random:
-        worker_info = torch.utils.data.get_worker_info()
-        worker_seed = worker_info.seed if worker_info is not None else self.seed
-        return random.Random(worker_seed + index * 9973)
-
-    def _pick_entry(self, rng: random.Random) -> Dict[str, Any]:
-        want_speech = rng.random() < self.speech_prob
-        if want_speech and self.speech_entries:
-            return self.speech_entries[rng.randrange(len(self.speech_entries))]
-        if (not want_speech) and self.nospeech_entries:
-            return self.nospeech_entries[rng.randrange(len(self.nospeech_entries))]
-        if self.speech_entries:
-            return self.speech_entries[rng.randrange(len(self.speech_entries))]
-        return self.nospeech_entries[rng.randrange(len(self.nospeech_entries))]
-
-    def _load_triplet(self, entry: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        mix, mix_sr = _read_audio(entry["mix_path"])
-        ref, ref_sr = _read_audio(entry["ref_path"])
-        if mix_sr != self.sample_rate or ref_sr != self.sample_rate:
-            raise SegmentIndexError(
-                f"Runtime sample-rate mismatch for {entry['id']}: mix/ref = {mix_sr}/{ref_sr}, expected {self.sample_rate}"
-            )
-
-        target_path = entry.get("target_path")
-        if target_path:
-            target, tgt_sr = _read_audio(target_path)
-            if tgt_sr != self.sample_rate:
-                raise SegmentIndexError(
-                    f"Runtime sample-rate mismatch for {entry['id']}: target={tgt_sr}, expected {self.sample_rate}"
-                )
-        else:
-            target = None
-
-        mix, ref, target = _trim_triplet_to_min(mix, ref, target)
-        return mix, ref, target
-
-    def _crop_or_pad(
-        self,
-        mix: np.ndarray,
-        ref: np.ndarray,
-        target: np.ndarray,
-        rng: random.Random,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-        length = mix.shape[0]
-        seg = self.segment_samples
-        valid = np.zeros((seg,), dtype=np.float32)
-
-        if length >= seg:
-            start = rng.randint(0, length - seg)
-            end = start + seg
-            mix_out = mix[start:end]
-            ref_out = ref[start:end]
-            tgt_out = target[start:end]
-            valid[:] = 1.0
-            valid_len = seg
-            return mix_out, ref_out, tgt_out, valid, valid_len
-
-        offset = rng.randint(0, seg - length)
-        mix_out = np.zeros((seg, 2), dtype=np.float32)
-        ref_out = np.zeros((seg, 2), dtype=np.float32)
-        tgt_out = np.zeros((seg, 2), dtype=np.float32)
-        mix_out[offset:offset + length] = mix
-        ref_out[offset:offset + length] = ref
-        tgt_out[offset:offset + length] = target
-        valid[offset:offset + length] = 1.0
-        return mix_out, ref_out, tgt_out, valid, int(length)
-
-    def __getitem__(self, index: int) -> Dict[str, Tensor]:
-        rng = self._rng(index)
-        entry = self._pick_entry(rng)
-        mix, ref, target = self._load_triplet(entry)
-        mix, ref, target, valid, valid_len = self._crop_or_pad(mix, ref, target, rng)
-
-        mix_t = torch.from_numpy(mix.T.copy())
-        ref_t = torch.from_numpy(ref.T.copy())
-        tgt_t = torch.from_numpy(target.T.copy())
-        valid_t = torch.from_numpy(valid.copy())
-        is_speech = 1 if entry["kind"] == "speech" else 0
-
-        return {
-            "mix": mix_t,
-            "ref": ref_t,
-            "target": tgt_t,
-            "valid_mask": valid_t,
-            "valid_samples": torch.tensor(valid_len, dtype=torch.long),
-            "is_speech": torch.tensor(is_speech, dtype=torch.bool),
-        }
-
-
-
-def collate_segments(batch: Sequence[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-    return {
-        "mix": torch.stack([x["mix"] for x in batch], dim=0),
-        "ref": torch.stack([x["ref"] for x in batch], dim=0),
-        "target": torch.stack([x["target"] for x in batch], dim=0),
-        "valid_mask": torch.stack([x["valid_mask"] for x in batch], dim=0),
-        "valid_samples": torch.stack([x["valid_samples"] for x in batch], dim=0),
-        "is_speech": torch.stack([x["is_speech"] for x in batch], dim=0),
-    }
-
-
-# ============================================================
-# Losses
-# ============================================================
-
-
-class MultiResolutionSTFTLoss(nn.Module):
-    def __init__(
-        self,
-        *,
-        resolutions: Sequence[Tuple[int, int, int]] | None = None,
-        eps: float = 1e-8,
-    ) -> None:
-        super().__init__()
-        self.eps = float(eps)
-        self.resolutions = list(resolutions or [
-            (512, 128, 512),
-            (1024, 256, 1024),
-            (2048, 512, 2048),
-        ])
-        for n_fft, _, win_length in self.resolutions:
-            win = torch.hann_window(win_length, periodic=True)
-            self.register_buffer(f"window_{n_fft}_{win_length}", win, persistent=False)
-
-    def _window(self, n_fft: int, win_length: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        win = getattr(self, f"window_{n_fft}_{win_length}")
-        return win.to(device=device, dtype=dtype)
-
-    def _mag(self, x: Tensor, n_fft: int, hop: int, win_length: int) -> Tensor:
-        # x: [B, C, S] -> [B*C, F, T]
-        b, c, s = x.shape
-        z = x.reshape(b * c, s)
-        win = self._window(n_fft, win_length, x.device, x.dtype)
+        b, c, s = waveform.shape
+        x = waveform.reshape(b * c, s)
+        window = self.window.to(device=waveform.device, dtype=waveform.dtype)
         spec = torch.stft(
-            z,
-            n_fft=n_fft,
-            hop_length=hop,
-            win_length=win_length,
-            window=win,
-            center=True,
-            normalized=False,
+            x,
+            n_fft=self.cfg.n_fft,
+            hop_length=self.cfg.hop_length,
+            win_length=self.cfg.win_length,
+            window=window,
+            center=self.cfg.center,
+            normalized=self.cfg.normalized,
             onesided=True,
             return_complex=True,
         )
-        return spec.abs().clamp_min(self.eps)
+        spec = spec.reshape(b, c, spec.size(-2), spec.size(-1))
+        spec = spec.permute(0, 1, 3, 2).contiguous()  # [B,2,T,F]
+        return spec
 
-    def forward(self, estimate: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
-        sc_losses: List[Tensor] = []
-        logmag_losses: List[Tensor] = []
-        for n_fft, hop, win_length in self.resolutions:
-            est_mag = self._mag(estimate, n_fft, hop, win_length)
-            tgt_mag = self._mag(target, n_fft, hop, win_length)
+    def istft(self, spec: Tensor, *, length: int | None = None) -> Tensor:
+        """
+        Args:
+            spec: complex [B, 2, T, F]
+        Returns:
+            waveform [B, 2, S]
+        """
+        if spec.ndim != 4 or spec.size(1) != 2:
+            raise ValueError(f"Expected spec [B,2,T,F], got {tuple(spec.shape)}")
 
-            diff = est_mag - tgt_mag
-            num = torch.linalg.vector_norm(diff, ord=2, dim=(1, 2))
-            den = torch.linalg.vector_norm(tgt_mag, ord=2, dim=(1, 2)).clamp_min(self.eps)
-            sc = (num / den).mean()
-            logmag = (torch.log(est_mag) - torch.log(tgt_mag)).abs().mean()
-
-            sc_losses.append(sc)
-            logmag_losses.append(logmag)
-
-        return torch.stack(sc_losses).mean(), torch.stack(logmag_losses).mean()
-
-
-
-def masked_l1_loss(estimate: Tensor, target: Tensor, valid_mask: Tensor) -> Tensor:
-    # estimate/target: [B,2,S], valid_mask: [B,S]
-    w = valid_mask.unsqueeze(1)
-    denom = w.sum().clamp_min(1.0) * estimate.size(1)
-    return ((estimate - target).abs() * w).sum() / denom
-
-
-
-def apply_valid_mask(x: Tensor, valid_mask: Tensor) -> Tensor:
-    return x * valid_mask.unsqueeze(1)
-
-
-# ============================================================
-# Checkpointing
-# ============================================================
-
-
-
-def save_checkpoint(
-    path: Path,
-    *,
-    model: DubSeparator,
-    optimizer: torch.optim.Optimizer,
-    scaler: Optional[GradScaler],
-    epoch: int,
-    global_step: int,
-    args: argparse.Namespace,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
-        "epoch": epoch,
-        "global_step": global_step,
-        "args": vars(args),
-        "model_cfg": asdict(model.cfg),
-    }
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
-
-
-
-def load_checkpoint(
-    path: Path,
-    *,
-    model: DubSeparator,
-    optimizer: torch.optim.Optimizer,
-    scaler: Optional[GradScaler],
-    device: torch.device,
-) -> Tuple[int, int]:
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"], strict=True)
-    optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
-    epoch = int(ckpt.get("epoch", 0))
-    global_step = int(ckpt.get("global_step", 0))
-    return epoch, global_step
-
-
-# ============================================================
-# Utils
-# ============================================================
-
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-
-def seed_worker(worker_id: int) -> None:
-    worker_seed = torch.initial_seed() % 2**32
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-
-
-
-def human_hours(hours: float) -> str:
-    return f"{hours:.2f} h"
-
-
-
-def count_parameters(module: nn.Module) -> int:
-    return sum(p.numel() for p in module.parameters() if p.requires_grad)
-
-
-def grad_norm_l2(module: nn.Module) -> float:
-    total_sq = 0.0
-    for p in module.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad.detach()
-        total_sq += float(g.float().pow(2).sum().item())
-    return math.sqrt(max(total_sq, 0.0))
-
-
-def safe_output_stats(outputs: Dict[str, Tensor]) -> Dict[str, float]:
-    stats: Dict[str, float] = {}
-    crm_gate = outputs.get("crm_gate")
-    if crm_gate is not None:
-        stats["crm_gate_mean"] = float(crm_gate.detach().mean().item())
-    mask = outputs.get("mask")
-    if mask is not None:
-        stats["mask_abs_mean"] = float(mask.detach().abs().mean().item())
-    est = outputs.get("estimate_waveform")
-    if est is not None:
-        stats["est_abs_mean"] = float(est.detach().abs().mean().item())
-    return stats
-
-
-def update_ema_dict(ema: Dict[str, float], current: Dict[str, float], decay: float) -> Dict[str, float]:
-    for k, v in current.items():
-        if not math.isfinite(v):
-            continue
-        if k not in ema:
-            ema[k] = float(v)
-        else:
-            ema[k] = decay * ema[k] + (1.0 - decay) * float(v)
-    return ema
-
-
-
-def build_amp_dtype(amp_mode: str) -> torch.dtype | None:
-    amp_mode = amp_mode.lower()
-    if amp_mode == "none":
-        return None
-    if amp_mode == "bf16":
-        return torch.bfloat16
-    if amp_mode == "fp16":
-        return torch.float16
-    raise ValueError(f"Unsupported amp mode: {amp_mode}")
-
-
-
-def make_autocast(device: torch.device, amp_mode: str):
-    dtype = build_amp_dtype(amp_mode)
-    enabled = dtype is not None and device.type == "cuda"
-    return autocast(device_type=device.type if device.type in {"cuda", "cpu"} else "cuda", dtype=dtype, enabled=enabled)
-
-
-
-def compute_losses(
-    *,
-    outputs: Dict[str, Tensor],
-    batch: Dict[str, Tensor],
-    mrstft: MultiResolutionSTFTLoss,
-    lambda_l1: float,
-    lambda_sc: float,
-    lambda_logmag: float,
-) -> Tuple[Tensor, Dict[str, float]]:
-    # Losses are always computed in fp32, outside autocast.
-    estimate = outputs["estimate_waveform"].float()
-    target = batch["target"].float()
-    valid_mask = batch["valid_mask"].float()
-    is_speech = batch["is_speech"].bool()
-
-    total_loss = estimate.new_zeros((), dtype=torch.float32)
-    logs: Dict[str, float] = {
-        "loss_total": 0.0,
-        "loss_speech": 0.0,
-        "loss_nospeech": 0.0,
-        "l1_speech": 0.0,
-        "sc_speech": 0.0,
-        "logmag_speech": 0.0,
-        "l1_nospeech": 0.0,
-        "logmag_nospeech": 0.0,
-        "num_speech": float(is_speech.sum().item()),
-        "num_nospeech": float((~is_speech).sum().item()),
-    }
-
-    if is_speech.any():
-        idx = is_speech
-        est_s = apply_valid_mask(estimate[idx], valid_mask[idx])
-        tgt_s = apply_valid_mask(target[idx], valid_mask[idx])
-        l1_s = masked_l1_loss(estimate[idx], target[idx], valid_mask[idx])
-        sc_s, logmag_s = mrstft(est_s, tgt_s)
-        speech_loss = lambda_l1 * l1_s + lambda_sc * sc_s + lambda_logmag * logmag_s
-        total_loss = total_loss + speech_loss
-        logs.update(
-            {
-                "loss_speech": float(speech_loss.detach().item()),
-                "l1_speech": float(l1_s.detach().item()),
-                "sc_speech": float(sc_s.detach().item()),
-                "logmag_speech": float(logmag_s.detach().item()),
-            }
+        b, c, t, f = spec.shape
+        x = spec.permute(0, 1, 3, 2).contiguous().reshape(b * c, f, t)
+        window = self.window.to(device=spec.device, dtype=spec.real.dtype)
+        wav = torch.istft(
+            x,
+            n_fft=self.cfg.n_fft,
+            hop_length=self.cfg.hop_length,
+            win_length=self.cfg.win_length,
+            window=window,
+            center=self.cfg.center,
+            normalized=self.cfg.normalized,
+            onesided=True,
+            length=length,
         )
-
-    if (~is_speech).any():
-        idx = ~is_speech
-        est_n = apply_valid_mask(estimate[idx], valid_mask[idx])
-        tgt_n = apply_valid_mask(target[idx], valid_mask[idx])
-        l1_n = masked_l1_loss(estimate[idx], target[idx], valid_mask[idx])
-        _, logmag_n = mrstft(est_n, tgt_n)
-        nospeech_loss = lambda_l1 * l1_n + lambda_logmag * logmag_n
-        total_loss = total_loss + nospeech_loss
-        logs.update(
-            {
-                "loss_nospeech": float(nospeech_loss.detach().item()),
-                "l1_nospeech": float(l1_n.detach().item()),
-                "logmag_nospeech": float(logmag_n.detach().item()),
-            }
-        )
-
-    logs["loss_total"] = float(total_loss.detach().item())
-    return total_loss, logs
+        wav = wav.reshape(b, c, wav.size(-1))
+        return wav
 
 
-# ============================================================
-# Training loop
-# ============================================================
+class BandLayout(nn.Module):
+    def __init__(self, cfg: DubSeparatorConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        freq_hz = torch.linspace(0.0, cfg.sample_rate / 2.0, cfg.onesided_bins)
+        self.register_buffer("freq_hz", freq_hz, persistent=False)
 
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Train DubSeparator on speech + nospeech segments")
-    p.add_argument("--speech-root", type=Path, required=True, help="Path to segs_voice root")
-    p.add_argument("--nospeech-root", type=Path, required=True, help="Path to segs root")
-    p.add_argument("--out-dir", type=Path, required=True, help="Directory for checkpoints and logs")
-    p.add_argument("--index-json", type=Path, default=None, help="Load full speech/nospeech index from JSON instead of re-indexing WAV files")
-    p.add_argument("--save-index-json", type=Path, default=None, help="Where to save full speech/nospeech index JSON after fresh indexing (default: <out-dir>/index_full.json)")
-
-    p.add_argument("--segment-sec", type=float, default=4.0, help="Fixed model input segment length in seconds")
-    p.add_argument("--batch", type=int, default=2, help="Batch size")
-    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    p.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16", "fp16"], help="AMP mode")
-    p.add_argument("--tf32", action="store_true", help="Enable TF32 on CUDA")
-    p.add_argument("--save-every-epoch", type=int, default=1, help="Save numbered checkpoint every N epochs")
-    p.add_argument("--resume", type=Path, default=None, help="Checkpoint path to resume from")
-
-    p.add_argument("--loss-l1", type=float, default=1.0, help="Waveform L1 coefficient")
-    p.add_argument("--loss-mr-sc", type=float, default=1.0, help="MR spectral convergence coefficient (speech only)")
-    p.add_argument("--loss-mr-logmag", type=float, default=1.0, help="MR log-magnitude coefficient")
-
-    p.add_argument("--epoch-size", type=int, default=1000, help="Number of optimizer steps per epoch")
-    p.add_argument("--speech-prob", type=float, default=0.8, help="Sampling probability weight for speech examples")
-    p.add_argument("--nospeech-prob", type=float, default=0.2, help="Sampling probability weight for nospeech examples")
-
-    p.add_argument("--device", type=str, default="cuda", help="cuda / cpu")
-    p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
-    p.add_argument("--seed", type=int, default=42, help="Global random seed")
-    p.add_argument("--log-every", type=int, default=10, help="Log every N steps")
-    p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
-    return p
-
-
-
-def main() -> None:
-    args = build_argparser().parse_args()
-    set_seed(args.seed)
-
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but not available")
-
-    if args.tf32 and device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-
-    cfg = DubSeparatorConfig()
-    sample_rate = cfg.sample_rate
-
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    print("=== indexing ===")
-    if args.index_json is not None:
-        speech_entries, nospeech_entries, loaded_meta = load_full_index_json(args.index_json, expected_sr=sample_rate)
-        speech_stats = summarize_index(speech_entries, sample_rate)
-        nospeech_stats = summarize_index(nospeech_entries, sample_rate)
-        print(f"loaded index json: {args.index_json}")
-    else:
-        speech_entries = index_speech_segments(args.speech_root, sample_rate)
-        nospeech_entries = index_nospeech_segments(args.nospeech_root, sample_rate)
-        speech_stats = summarize_index(speech_entries, sample_rate)
-        nospeech_stats = summarize_index(nospeech_entries, sample_rate)
-
-        index_json_path = args.save_index_json if args.save_index_json is not None else (args.out_dir / "index_full.json")
-        save_full_index_json(
-            index_json_path,
-            speech_entries=speech_entries,
-            nospeech_entries=nospeech_entries,
-            sample_rate=sample_rate,
-            speech_root=args.speech_root,
-            nospeech_root=args.nospeech_root,
-        )
-        print(f"saved full index json: {index_json_path}")
-
-    print(f"speech   : {speech_stats['count']} items, {human_hours(speech_stats['hours'])}, "
-          f"min/mean/max = {speech_stats['min_sec']:.2f}/{speech_stats['mean_sec']:.2f}/{speech_stats['max_sec']:.2f} sec")
-    print(f"nospeech : {nospeech_stats['count']} items, {human_hours(nospeech_stats['hours'])}, "
-          f"min/mean/max = {nospeech_stats['min_sec']:.2f}/{nospeech_stats['mean_sec']:.2f}/{nospeech_stats['max_sec']:.2f} sec")
-
-    index_dump = {
-        "speech": speech_stats,
-        "nospeech": nospeech_stats,
-        "sample_rate": sample_rate,
-        "segment_sec": args.segment_sec,
-        "speech_root": str(args.speech_root),
-        "nospeech_root": str(args.nospeech_root),
-        "index_json": str(args.index_json) if args.index_json is not None else None,
-    }
-    (args.out_dir / "index_summary.json").write_text(json.dumps(index_dump, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    dataset = MixedSegmentDataset(
-        speech_entries=speech_entries,
-        nospeech_entries=nospeech_entries,
-        sample_rate=sample_rate,
-        segment_sec=args.segment_sec,
-        epoch_steps=args.epoch_size,
-        batch_size=args.batch,
-        speech_prob=args.speech_prob,
-        nospeech_prob=args.nospeech_prob,
-        seed=args.seed,
-    )
-
-    generator = torch.Generator()
-    generator.manual_seed(args.seed)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-        collate_fn=collate_segments,
-        worker_init_fn=seed_worker,
-        generator=generator,
-        persistent_workers=args.num_workers > 0,
-    )
-
-    model = DubSeparator(cfg).to(device)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    mrstft = MultiResolutionSTFTLoss().to(device)
-
-    use_scaler = args.amp.lower() == "fp16" and device.type == "cuda"
-    scaler = GradScaler("cuda", enabled=use_scaler) if device.type == "cuda" else None
-
-    start_epoch = 0
-    global_step = 0
-    if args.resume is not None:
-        start_epoch, global_step = load_checkpoint(
-            args.resume,
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-        )
-        print(f"Resumed from {args.resume} at epoch={start_epoch}, global_step={global_step}")
-
-    print("=== training ===")
-    print(f"device            : {device}")
-    print(f"params trainable  : {count_parameters(model):,}")
-    print(f"segment_sec       : {args.segment_sec}")
-    print(f"batch             : {args.batch}")
-    print(f"epoch_size steps  : {args.epoch_size}")
-    print(f"amp               : {args.amp}")
-    print(f"tf32              : {bool(args.tf32)}")
-    print(f"loss coeffs       : l1={args.loss_l1} mr_sc={args.loss_mr_sc} mr_logmag={args.loss_mr_logmag}")
-    print(f"speech/nospeech   : {args.speech_prob} / {args.nospeech_prob}")
-
-    stop_requested = {"flag": False}
-
-    def _handle_signal(signum, frame):  # type: ignore[no-untyped-def]
-        stop_requested["flag"] = True
-        print(f"\nSignal {signum} received. Will stop after current step and save checkpoint.")
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handle_signal)
-
-    epoch = start_epoch
-    try:
-        while True:
-            epoch += 1
-            model.train()
-            epoch_start = time.time()
-            running: Dict[str, float] = {
-                "loss_total": 0.0,
-                "loss_speech": 0.0,
-                "loss_nospeech": 0.0,
-                "l1_speech": 0.0,
-                "sc_speech": 0.0,
-                "logmag_speech": 0.0,
-                "l1_nospeech": 0.0,
-                "logmag_nospeech": 0.0,
-                "num_speech": 0.0,
-                "num_nospeech": 0.0,
-            }
-
-            ema: Dict[str, float] = {}
-            progress = tqdm(loader, total=args.epoch_size, desc=f"epoch {epoch:05d}", dynamic_ncols=True, leave=True)
-            for step_idx, batch in enumerate(progress, start=1):
-                if stop_requested["flag"]:
-                    raise StopTraining
-
-                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-                optimizer.zero_grad(set_to_none=True)
-
-                with make_autocast(device, args.amp):
-                    outputs = model(batch["mix"], batch["ref"])
-
-                with autocast(device_type=device.type if device.type in {"cuda", "cpu"} else "cuda", enabled=False):
-                    loss, logs = compute_losses(
-                        outputs=outputs,
-                        batch=batch,
-                        mrstft=mrstft,
-                        lambda_l1=args.loss_l1,
-                        lambda_sc=args.loss_mr_sc,
-                        lambda_logmag=args.loss_mr_logmag,
-                    )
-
-                if use_scaler:
-                    assert scaler is not None
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    grad_norm = grad_norm_l2(model)
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    grad_norm = grad_norm_l2(model)
-                    optimizer.step()
-
-                global_step += 1
-                for k in running:
-                    running[k] += logs.get(k, 0.0)
-
-                extra_stats = safe_output_stats(outputs)
-                step_stats = {**logs, **extra_stats}
-                step_stats["grad_norm"] = float(grad_norm)
-                step_stats["lr"] = float(optimizer.param_groups[0]["lr"])
-                total_in_batch = logs.get("num_speech", 0.0) + logs.get("num_nospeech", 0.0)
-                step_stats["speech_frac"] = float(logs.get("num_speech", 0.0) / total_in_batch) if total_in_batch > 0 else 0.0
-                ema = update_ema_dict(ema, step_stats, decay=0.95)
-
-                progress.set_postfix({
-                    "loss": f"{logs['loss_total']:.4f}",
-                    "ema": f"{ema.get('loss_total', logs['loss_total']):.4f}",
-                    "sp": f"{logs.get('loss_speech', 0.0):.3f}",
-                    "ns": f"{logs.get('loss_nospeech', 0.0):.3f}",
-                    "l1": f"{(logs.get('l1_speech', 0.0) + logs.get('l1_nospeech', 0.0)):.3f}",
-                    "sc": f"{logs.get('sc_speech', 0.0):.3f}",
-                    "logm": f"{(logs.get('logmag_speech', 0.0) + logs.get('logmag_nospeech', 0.0)):.3f}",
-                    "gate": f"{extra_stats.get('crm_gate_mean', float('nan')):.3f}",
-                    "|M|": f"{extra_stats.get('mask_abs_mean', float('nan')):.3f}",
-                    "gn": f"{grad_norm:.2f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                    "sf": f"{step_stats['speech_frac']:.2f}",
-                })
-
-                if step_idx % args.log_every == 0 or step_idx == 1 or step_idx == args.epoch_size:
-                    avg_loss = running["loss_total"] / step_idx
-                    print(
-                        f"epoch={epoch:05d} step={step_idx:05d}/{args.epoch_size:05d} global_step={global_step:08d} "
-                        f"loss={logs['loss_total']:.6f} avg={avg_loss:.6f} "
-                        f"speech={int(logs['num_speech'])} nospeech={int(logs['num_nospeech'])} "
-                        f"grad_norm={grad_norm:.4f} lr={optimizer.param_groups[0]['lr']:.3e} "
-                        f"crm_gate={extra_stats.get('crm_gate_mean', float('nan')):.4f} mask_abs={extra_stats.get('mask_abs_mean', float('nan')):.4f}"
-                    )
-            progress.close()
-
-            elapsed = time.time() - epoch_start
-            denom = float(args.epoch_size)
-            print(
-                f"[epoch {epoch:05d}] "
-                f"loss={running['loss_total']/denom:.6f} "
-                f"speech_loss={running['loss_speech']/denom:.6f} "
-                f"nospeech_loss={running['loss_nospeech']/denom:.6f} "
-                f"l1_speech={running['l1_speech']/denom:.6f} "
-                f"sc_speech={running['sc_speech']/denom:.6f} "
-                f"logmag_speech={running['logmag_speech']/denom:.6f} "
-                f"l1_nospeech={running['l1_nospeech']/denom:.6f} "
-                f"logmag_nospeech={running['logmag_nospeech']/denom:.6f} "
-                f"speech_count/step={running['num_speech']/denom:.3f} "
-                f"nospeech_count/step={running['num_nospeech']/denom:.3f} "
-                f"ema_loss={ema.get('loss_total', 0.0):.6f} "
-                f"ema_gate={ema.get('crm_gate_mean', float('nan')):.6f} "
-                f"ema_mask_abs={ema.get('mask_abs_mean', float('nan')):.6f} "
-                f"ema_grad_norm={ema.get('grad_norm', float('nan')):.6f} "
-                f"time={elapsed:.1f}s"
+        band_meta: List[Dict[str, Any]] = []
+        for band in cfg.bands:
+            weights = self._build_band_weights(freq_hz, band)
+            nz = torch.nonzero(weights > 0, as_tuple=False).flatten()
+            if nz.numel() == 0:
+                raise ValueError(f"Band {band.name} produced empty support")
+            start = int(nz[0].item())
+            stop = int(nz[-1].item()) + 1
+            crop = weights[start:stop]
+            band_meta.append(
+                {
+                    "name": band.name,
+                    "start": start,
+                    "stop": stop,
+                    "weights": crop,
+                    "num_tokens": band.num_tokens,
+                    "f_min_hz": band.f_min_hz,
+                    "f_max_hz": band.f_max_hz,
+                    "profile": band.encoder_profile,
+                }
             )
+        self.band_meta = band_meta
 
-            last_ckpt = args.out_dir / "last.pt"
-            save_checkpoint(
-                last_ckpt,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                global_step=global_step,
-                args=args,
+    @staticmethod
+    def _build_band_weights(freq_hz: Tensor, band: BandSpec) -> Tensor:
+        f0 = band.f_min_hz
+        f1 = band.f_max_hz
+        width = max(f1 - f0, 1.0)
+        ext = 0.5 * band.overlap_ratio * width  # +/- 10% => total 20% overlap.
+        sup0 = max(0.0, f0 - ext)
+        sup1 = min(float(freq_hz[-1].item()), f1 + ext)
+
+        w = torch.zeros_like(freq_hz)
+        core = (freq_hz >= f0) & (freq_hz <= f1)
+        w = torch.where(core, torch.ones_like(w), w)
+
+        if sup0 < f0:
+            left = (freq_hz >= sup0) & (freq_hz < f0)
+            if left.any():
+                alpha = (freq_hz[left] - sup0) / max(f0 - sup0, 1e-6)
+                w[left] = 0.5 - 0.5 * torch.cos(math.pi * alpha)
+
+        if f1 < sup1:
+            right = (freq_hz > f1) & (freq_hz <= sup1)
+            if right.any():
+                alpha = 1.0 - (freq_hz[right] - f1) / max(sup1 - f1, 1e-6)
+                w[right] = 0.5 - 0.5 * torch.cos(math.pi * alpha)
+
+        return w.clamp(0.0, 1.0)
+
+    def slice_band(self, spec: Tensor, band_idx: int) -> Tuple[Tensor, Tensor]:
+        meta = self.band_meta[band_idx]
+        start, stop = meta["start"], meta["stop"]
+        w = meta["weights"].to(device=spec.device, dtype=spec.real.dtype)
+        band_spec = spec[..., start:stop] * w.view(1, 1, 1, -1)
+        return band_spec, w
+
+
+# ============================================================
+# Feature extraction
+# ============================================================
+
+
+class StereoPairFeatureExtractor(nn.Module):
+    """
+    Builds 11-channel features for a band from mix/ref complex STFTs.
+    Output for each branch has identical channel layout; only stereo spatial
+    channels are branch-specific, while pairwise log channels are shared.
+    """
+
+    def __init__(self, cfg: DubSeparatorConfig) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self.band_layout = BandLayout(cfg)
+
+    def _spatial_features(self, spec: Tensor) -> Tensor:
+        """
+        spec: complex [B,2,T,Fb]
+        returns [B,7,T,Fb]
+        """
+        l = spec[:, 0]
+        r = spec[:, 1]
+
+        re_l = l.real
+        im_l = l.imag
+        re_r = r.real
+        im_r = r.imag
+
+        mag_l = l.abs().clamp_min(self.cfg.eps)
+        mag_r = r.abs().clamp_min(self.cfg.eps)
+
+        ild = torch.log(mag_l) - torch.log(mag_r)
+        ipd = torch.angle(l) - torch.angle(r)
+        sin_ipd = torch.sin(ipd)
+        cos_ipd = torch.cos(ipd)
+
+        return torch.stack([re_l, im_l, re_r, im_r, ild, sin_ipd, cos_ipd], dim=1)
+
+    def _pairwise_log_features(self, mix_spec: Tensor, ref_spec: Tensor) -> Tensor:
+        """
+        mix/ref: complex [B,2,T,Fb]
+        returns [B,4,T,Fb]
+        """
+        mix_mag = mix_spec.abs().mean(dim=1).clamp_min(self.cfg.eps)
+        ref_mag = ref_spec.abs().mean(dim=1).clamp_min(self.cfg.eps)
+
+        log_mix = torch.log(mix_mag)
+        log_ref = torch.log(ref_mag)
+        d = log_mix - log_ref
+        ad = d.abs()
+        return torch.stack([log_mix, log_ref, d, ad], dim=1)
+
+    def forward(self, mix_spec: Tensor, ref_spec: Tensor) -> Tuple[List[Tensor], List[Tensor], List[Dict[str, Any]]]:
+        """
+        Args:
+            mix_spec/ref_spec: complex [B,2,T,F]
+        Returns:
+            mix_band_features: list[[B,11,T,Fb]]
+            ref_band_features: list[[B,11,T,Fb]]
+            band_meta list
+        """
+        mix_bands: List[Tensor] = []
+        ref_bands: List[Tensor] = []
+        for bidx in range(self.cfg.num_bands):
+            mix_band, _ = self.band_layout.slice_band(mix_spec, bidx)
+            ref_band, _ = self.band_layout.slice_band(ref_spec, bidx)
+
+            pair = self._pairwise_log_features(mix_band, ref_band)
+            mix_sp = self._spatial_features(mix_band)
+            ref_sp = self._spatial_features(ref_band)
+
+            mix_bands.append(torch.cat([mix_sp, pair], dim=1))
+            ref_bands.append(torch.cat([ref_sp, pair], dim=1))
+
+        return mix_bands, ref_bands, self.band_layout.band_meta
+
+
+# ============================================================
+# Core layers
+# ============================================================
+
+
+class ConvNormAct(nn.Module):
+    def __init__(self, c_in: int, c_out: int, stride_t: int, stride_f: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv2d(
+            c_in,
+            c_out,
+            kernel_size=3,
+            stride=(stride_t, stride_f),
+            padding=1,
+            bias=False,
+        )
+        self.norm = nn.GroupNorm(num_groups=min(8, c_out), num_channels=c_out)
+        self.act = nn.SiLU()
+        self.refine = nn.Conv2d(c_out, c_out, kernel_size=3, padding=1, groups=1, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.conv(x)
+        x = self.norm(x)
+        x = self.act(x)
+        x = self.refine(x)
+        return x
+
+
+class LearnablePositionalBias(nn.Module):
+    def __init__(self, max_len: int, dim: int) -> None:
+        super().__init__()
+        self.emb = nn.Embedding(max_len, dim)
+
+    def forward(self, length: int, device: torch.device) -> Tensor:
+        idx = torch.arange(length, device=device)
+        return self.emb(idx)
+
+
+class AxialAttention1D(nn.Module):
+    def __init__(self, dim: int, num_heads: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [N, L, C]
+        y = self.norm(x)
+        y, _ = self.attn(y, y, y, need_weights=False)
+        return x + y
+
+
+class AxialAttention2D(nn.Module):
+    def __init__(self, dim: int, num_heads: int, along_time: bool, along_freq: bool, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.along_time = along_time
+        self.along_freq = along_freq
+        self.time_attn = AxialAttention1D(dim, num_heads, dropout) if along_time else None
+        self.freq_attn = AxialAttention1D(dim, num_heads, dropout) if along_freq else None
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B,C,T,F]
+        b, c, t, f = x.shape
+        if self.along_freq and self.freq_attn is not None:
+            y = x.permute(0, 2, 3, 1).reshape(b * t, f, c)
+            y = self.freq_attn(y)
+            x = y.reshape(b, t, f, c).permute(0, 3, 1, 2).contiguous()
+        if self.along_time and self.time_attn is not None:
+            y = x.permute(0, 3, 2, 1).reshape(b * f, t, c)
+            y = self.time_attn(y)
+            x = y.reshape(b, f, t, c).permute(0, 3, 2, 1).contiguous()
+        return x
+
+
+class EncoderStage(nn.Module):
+    def __init__(self, c_in: int, c_out: int, stride_t: int, stride_f: int, *, axial_t: bool, axial_f: bool, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.block = ConvNormAct(c_in, c_out, stride_t, stride_f)
+        self.axial = AxialAttention2D(c_out, num_heads=num_heads, along_time=axial_t, along_freq=axial_f, dropout=dropout)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.block(x)
+        x = self.axial(x)
+        return x
+
+
+class BranchInputStem(nn.Module):
+    def __init__(self, c_in: int, c_out: int) -> None:
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups=1, num_channels=c_in)
+        self.proj = nn.Conv2d(c_in, c_out, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(self.norm(x))
+
+
+class BandEncoderCore(nn.Module):
+    PROFILE_STRIDES: Dict[str, Tuple[Tuple[int, int], ...]] = {
+        "band0": ((1, 1), (2, 1), (2, 1), (1, 1), (1, 1)),
+        "band1": ((1, 2), (2, 1), (2, 1), (1, 1), (1, 1)),
+        "band2": ((1, 2), (2, 2), (2, 1), (1, 1), (1, 1)),
+        "band3": ((1, 2), (2, 2), (2, 2), (1, 1), (1, 1)),
+        "band4plus": ((1, 2), (2, 2), (2, 2), (1, 2), (1, 1)),
+    }
+
+    def __init__(self, cfg: DubSeparatorConfig, profile: str) -> None:
+        super().__init__()
+        c1, c2, c3, c4, c5 = cfg.encoder_channels
+        strides = self.PROFILE_STRIDES[profile]
+        self.stages = nn.ModuleList(
+            [
+                EncoderStage(c1, c1, *strides[0], axial_t=False, axial_f=True, num_heads=cfg.axial_num_heads, dropout=cfg.axial_dropout),
+                EncoderStage(c1, c2, *strides[1], axial_t=False, axial_f=True, num_heads=cfg.axial_num_heads, dropout=cfg.axial_dropout),
+                EncoderStage(c2, c3, *strides[2], axial_t=True, axial_f=True, num_heads=cfg.axial_num_heads, dropout=cfg.axial_dropout),
+                EncoderStage(c3, c4, *strides[3], axial_t=True, axial_f=True, num_heads=cfg.axial_num_heads, dropout=cfg.axial_dropout),
+                EncoderStage(c4, c5, *strides[4], axial_t=True, axial_f=True, num_heads=cfg.axial_num_heads, dropout=cfg.axial_dropout),
+            ]
+        )
+
+    def forward(self, x: Tensor) -> Tuple[Tensor, List[Tensor]]:
+        stages: List[Tensor] = []
+        for stage in self.stages:
+            x = stage(x)
+            stages.append(x)
+        return x, stages
+
+
+class QueryBandTokenizer(nn.Module):
+    def __init__(self, dim: int, num_tokens: int, num_heads: int, mlp_mult: float) -> None:
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.dim = dim
+        self.norm = nn.LayerNorm(dim)
+        self.query = nn.Parameter(torch.randn(num_tokens, dim) * 0.02)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        hidden = int(dim * mlp_mult)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden * 2),
+            SwiGLU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, x: Tensor, pos_emb: Tensor, stream_emb: Tensor, band_emb: Tensor) -> Tensor:
+        # x: [B,C,T,F]
+        b, c, t, f = x.shape
+        mem = x.permute(0, 2, 3, 1).reshape(b * t, f, c)
+        mem = mem + pos_emb[:f].to(device=x.device, dtype=x.dtype).unsqueeze(0)
+        mem = mem + stream_emb.view(1, 1, c) + band_emb.view(1, 1, c)
+        mem = self.norm(mem)
+
+        q = self.query.to(device=x.device, dtype=x.dtype).unsqueeze(0).expand(b * t, -1, -1)
+        q = q + stream_emb.view(1, 1, c) + band_emb.view(1, 1, c)
+        tok, _ = self.attn(q, mem, mem, need_weights=False)
+        tok = tok + self.mlp(tok)
+        tok = tok.reshape(b, t, self.num_tokens, c).permute(0, 3, 1, 2).contiguous()
+        return tok
+
+
+class SwiGLU(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        a, b = x.chunk(2, dim=-1)
+        return F.silu(a) * b
+
+
+class FactorizedTokenPosition(nn.Module):
+    def __init__(self, total_tokens: int, num_bands: int, dim: int) -> None:
+        super().__init__()
+        self.band_emb = nn.Embedding(num_bands, dim)
+        self.slot_emb = nn.Embedding(total_tokens, dim)
+        self.time_emb = nn.Embedding(4096, dim)
+
+    def forward(self, *, band_ids: Tensor, slot_ids: Tensor, time_steps: int, device: torch.device) -> Tuple[Tensor, Tensor]:
+        token_pos = self.band_emb(band_ids.to(device)) + self.slot_emb(slot_ids.to(device))
+        time_pos = self.time_emb(torch.arange(time_steps, device=device))
+        return token_pos, time_pos
+
+
+class TrunkSelfCrossBlock(nn.Module):
+    def __init__(self, dim: int, num_heads: int, ff_mult: float, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.self_norm = nn.LayerNorm(dim)
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+
+        self.cross_norm_q = nn.LayerNorm(dim)
+        self.cross_norm_kv = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.cross_gate = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, dim), nn.Sigmoid())
+
+        hidden = int(dim * ff_mult)
+        self.ffn = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden * 2),
+            SwiGLU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, mix: Tensor, ref: Tensor) -> Tensor:
+        sm = self.self_norm(mix)
+        y, _ = self.self_attn(sm, sm, sm, need_weights=False)
+        mix = mix + y
+
+        q = self.cross_norm_q(mix)
+        kv = self.cross_norm_kv(ref)
+        c, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        g = self.cross_gate(mix)
+        mix = mix + g * c
+
+        mix = mix + self.ffn(mix)
+        return mix
+
+
+class StageSkipTokenizer(nn.Module):
+    def __init__(self, dim: int, num_tokens: int, num_heads: int, mlp_mult: float) -> None:
+        super().__init__()
+        self.tokenizer = QueryBandTokenizer(dim=dim, num_tokens=num_tokens, num_heads=num_heads, mlp_mult=mlp_mult)
+
+    def forward(self, x: Tensor, pos_emb: Tensor, band_emb: Tensor) -> Tensor:
+        stream_zero = torch.zeros_like(band_emb)
+        return self.tokenizer(x, pos_emb=pos_emb, stream_emb=stream_zero, band_emb=band_emb)
+
+
+class DecoderBlock(nn.Module):
+    def __init__(self, c_in: int, c_skip: int, c_out: int, *, upsample_time: bool, axial_time: bool, axial_freq: bool, num_heads: int) -> None:
+        super().__init__()
+        self.upsample_time = upsample_time
+        self.fuse = nn.Conv2d(c_in + c_skip, c_out, kernel_size=1)
+        self.conv = nn.Sequential(
+            nn.Conv2d(c_out, c_out, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(num_groups=min(8, c_out), num_channels=c_out),
+            nn.SiLU(),
+            nn.Conv2d(c_out, c_out, kernel_size=3, padding=1, bias=False),
+        )
+        self.axial = AxialAttention2D(c_out, num_heads=num_heads, along_time=axial_time, along_freq=axial_freq, dropout=0.0)
+
+    def forward(self, x: Tensor, skip: Tensor) -> Tensor:
+        if self.upsample_time:
+            x = F.interpolate(x, size=(skip.size(2), x.size(3)), mode="bilinear", align_corners=False)
+        elif x.size(2) != skip.size(2):
+            x = F.interpolate(x, size=(skip.size(2), x.size(3)), mode="bilinear", align_corners=False)
+        if x.size(3) != skip.size(3):
+            raise ValueError(f"Pseudo-frequency mismatch: {x.shape} vs {skip.shape}")
+        x = self.fuse(torch.cat([x, skip], dim=1))
+        x = x + self.conv(x)
+        x = self.axial(x)
+        return x
+
+
+class ReversePerceiverDetokenizer(nn.Module):
+    def __init__(self, dim: int, out_bins: int, num_heads: int) -> None:
+        super().__init__()
+        self.out_bins = out_bins
+        self.query = nn.Parameter(torch.randn(out_bins, dim) * 0.02)
+        self.freq_emb = nn.Embedding(out_bins, dim)
+        self.norm = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B,C,T,K]
+        b, c, t, k = x.shape
+        mem = x.permute(0, 2, 3, 1).reshape(b * t, k, c)
+        mem = self.norm(mem)
+
+        q = self.query.to(device=x.device, dtype=x.dtype)
+        q = q + self.freq_emb.weight.to(device=x.device, dtype=x.dtype)
+        q = q.unsqueeze(0).expand(b * t, -1, -1)
+        y, _ = self.attn(q, mem, mem, need_weights=False)
+        y = y + self.mlp(y)
+        y = y.reshape(b, t, self.out_bins, c).permute(0, 3, 1, 2).contiguous()
+        return y
+
+
+class SqueezeExcite2d(nn.Module):
+    def __init__(self, channels: int, reduction: int = 8) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 4)
+        self.fc1 = nn.Conv2d(channels, hidden, kernel_size=1)
+        self.fc2 = nn.Conv2d(hidden, channels, kernel_size=1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        s = x.mean(dim=(2, 3), keepdim=True)
+        s = F.silu(self.fc1(s))
+        s = torch.sigmoid(self.fc2(s))
+        return x * s
+
+
+class RefineBlock(nn.Module):
+    def __init__(self, channels: int, k_t: int, k_f: int) -> None:
+        super().__init__()
+        pad_t = k_t // 2
+        pad_f = k_f // 2
+        self.dw = nn.Conv2d(channels, channels, kernel_size=(k_t, k_f), padding=(pad_t, pad_f), groups=channels)
+        self.norm = nn.GroupNorm(num_groups=min(8, channels), num_channels=channels)
+        self.ff = nn.Sequential(
+            nn.Conv2d(channels, channels * 2, kernel_size=1),
+            ChannelSwiGLU2d(),
+            nn.Conv2d(channels, channels, kernel_size=1),
+        )
+        self.se = SqueezeExcite2d(channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = self.dw(x)
+        y = self.norm(y)
+        y = F.silu(y)
+        x = x + y
+        x = x + self.ff(x)
+        x = self.se(x)
+        return x
+
+
+class ChannelSwiGLU2d(nn.Module):
+    def forward(self, x: Tensor) -> Tensor:
+        a, b = x.chunk(2, dim=1)
+        return F.silu(a) * b
+
+
+# ============================================================
+# Full model
+# ============================================================
+
+
+class DubSeparator(nn.Module):
+    def __init__(self, cfg: DubSeparatorConfig | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg or DubSeparatorConfig()
+        c1, c2, c3, c4, c5 = self.cfg.encoder_channels
+        self.frontend = STFTFrontend(self.cfg)
+        self.features = StereoPairFeatureExtractor(self.cfg)
+
+        # branch-specific input stems, shared band cores.
+        self.mix_input_stems = nn.ModuleList([BranchInputStem(11, c1) for _ in self.cfg.bands])
+        self.ref_input_stems = nn.ModuleList([BranchInputStem(11, c1) for _ in self.cfg.bands])
+        self.band_cores = nn.ModuleList([
+            BandEncoderCore(self.cfg, band.encoder_profile) for band in self.cfg.bands
+        ])
+
+        # shared band tokenizers between mix/ref, one per band.
+        self.band_pos_embs = nn.ModuleList([
+            LearnablePositionalBias(max_len=self.cfg.onesided_bins, dim=self.cfg.trunk_dim) for _ in self.cfg.bands
+        ])
+        self.band_tokenizers = nn.ModuleList([
+            QueryBandTokenizer(dim=self.cfg.trunk_dim, num_tokens=band.num_tokens, num_heads=self.cfg.band_tokenizer_heads, mlp_mult=self.cfg.token_mlp_mult)
+            for band in self.cfg.bands
+        ])
+
+        # mix/ref stream identity + band identity in token space.
+        self.mix_stream_emb = nn.Parameter(torch.randn(self.cfg.trunk_dim) * 0.02)
+        self.ref_stream_emb = nn.Parameter(torch.randn(self.cfg.trunk_dim) * 0.02)
+        self.band_id_emb = nn.Embedding(self.cfg.num_bands, self.cfg.trunk_dim)
+
+        # Trunk positional embeddings.
+        band_ids: List[int] = []
+        slot_ids: List[int] = []
+        slot_cursor = 0
+        for bidx, band in enumerate(self.cfg.bands):
+            band_ids.extend([bidx] * band.num_tokens)
+            slot_ids.extend(list(range(slot_cursor, slot_cursor + band.num_tokens)))
+            slot_cursor += band.num_tokens
+        self.register_buffer("trunk_band_ids", torch.tensor(band_ids, dtype=torch.long), persistent=False)
+        self.register_buffer("trunk_slot_ids", torch.tensor(slot_ids, dtype=torch.long), persistent=False)
+        self.trunk_pos = FactorizedTokenPosition(self.cfg.total_tokens, self.cfg.num_bands, self.cfg.trunk_dim)
+
+        self.trunk_blocks = nn.ModuleList([
+            TrunkSelfCrossBlock(
+                dim=self.cfg.trunk_dim,
+                num_heads=self.cfg.trunk_num_heads,
+                ff_mult=self.cfg.trunk_ff_mult,
+                dropout=self.cfg.attn_dropout,
             )
-            if args.save_every_epoch > 0 and epoch % args.save_every_epoch == 0:
-                numbered = args.out_dir / f"epoch_{epoch:05d}.pt"
-                save_checkpoint(
-                    numbered,
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    args=args,
-                )
+            for _ in range(self.cfg.num_trunk_layers)
+        ])
 
-    except StopTraining:
-        print("Stopping requested. Saving interrupt checkpoint...")
-        save_checkpoint(
-            args.out_dir / "interrupt.pt",
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            global_step=global_step,
-            args=args,
+        # Skip tokenizers from mix encoder stages only.
+        stage_channels = [c1, c2, c3, c4, c5]
+        self.stage_pos_embs = nn.ModuleList([
+            nn.ModuleList([
+                LearnablePositionalBias(max_len=self.cfg.onesided_bins, dim=ch) for _ in self.cfg.bands
+            ])
+            for ch in stage_channels
+        ])
+        self.stage_band_embs = nn.ModuleList([nn.Embedding(self.cfg.num_bands, ch) for ch in stage_channels])
+        self.stage_skip_tokenizers = nn.ModuleList([
+            nn.ModuleList([
+                StageSkipTokenizer(dim=ch, num_tokens=band.num_tokens, num_heads=self.cfg.stage_tokenizer_heads, mlp_mult=self.cfg.token_mlp_mult)
+                for band in self.cfg.bands
+            ])
+            for ch in stage_channels
+        ])
+
+        # Decoder chain, one target only.
+        self.dec5 = DecoderBlock(c_in=c5, c_skip=c5, c_out=c5, upsample_time=False, axial_time=True, axial_freq=True, num_heads=self.cfg.axial_num_heads)
+        self.dec4 = DecoderBlock(c_in=c5, c_skip=c4, c_out=c3, upsample_time=False, axial_time=True, axial_freq=True, num_heads=self.cfg.axial_num_heads)
+        self.dec3 = DecoderBlock(c_in=c3, c_skip=c3, c_out=c2, upsample_time=True, axial_time=False, axial_freq=True, num_heads=self.cfg.axial_num_heads)
+        self.dec2 = DecoderBlock(c_in=c2, c_skip=c2, c_out=c1, upsample_time=True, axial_time=False, axial_freq=True, num_heads=self.cfg.axial_num_heads)
+        self.dec1 = DecoderBlock(c_in=c1, c_skip=c1, c_out=self.cfg.head_dim, upsample_time=False, axial_time=False, axial_freq=True, num_heads=self.cfg.axial_num_heads)
+
+        self.detokenizer = ReversePerceiverDetokenizer(dim=self.cfg.head_dim, out_bins=self.cfg.onesided_bins, num_heads=self.cfg.detok_num_heads)
+        self.refine = RefineBlock(self.cfg.head_dim, self.cfg.refine_kernel_t, self.cfg.refine_kernel_f)
+
+        # Single target micro-heads.
+        self.head_crm = nn.Conv2d(self.cfg.head_dim, 4, kernel_size=1)
+        self.head_mp = nn.Conv2d(self.cfg.head_dim, 4, kernel_size=1)
+        self.head_gate = nn.Conv2d(self.cfg.head_dim, 1, kernel_size=1)
+
+    # --------------------------------------------------------
+    # Helpers
+    # --------------------------------------------------------
+
+    def _encode_branch(self, band_feats: List[Tensor], input_stems: nn.ModuleList) -> Tuple[List[Tensor], List[List[Tensor]]]:
+        encoded: List[Tensor] = []
+        stage_feats: List[List[Tensor]] = []
+        for bidx, feat in enumerate(band_feats):
+            x = input_stems[bidx](feat)
+            x, stages = self.band_cores[bidx](x)
+            encoded.append(x)
+            stage_feats.append(stages)
+        return encoded, stage_feats
+
+    def _tokenize_branch(self, encoded_bands: List[Tensor], *, stream: Literal["mix", "ref"]) -> Tensor:
+        stream_emb = self.mix_stream_emb if stream == "mix" else self.ref_stream_emb
+        toks: List[Tensor] = []
+        for bidx, x in enumerate(encoded_bands):
+            pos = self.band_pos_embs[bidx](x.size(-1), x.device)
+            band_emb = self.band_id_emb.weight[bidx].to(device=x.device, dtype=x.dtype)
+            tok = self.band_tokenizers[bidx](x, pos_emb=pos, stream_emb=stream_emb.to(device=x.device, dtype=x.dtype), band_emb=band_emb)
+            toks.append(tok)
+        return torch.cat(toks, dim=-1)
+
+    def _add_trunk_positions(self, x: Tensor) -> Tensor:
+        # x: [B,C,T,K]
+        b, c, t, k = x.shape
+        tok_pos, time_pos = self.trunk_pos(
+            band_ids=self.trunk_band_ids,
+            slot_ids=self.trunk_slot_ids,
+            time_steps=t,
+            device=x.device,
         )
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt. Saving interrupt checkpoint...")
-        save_checkpoint(
-            args.out_dir / "interrupt.pt",
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            global_step=global_step,
-            args=args,
-        )
-        raise
+        x = x + tok_pos.to(dtype=x.dtype).T.unsqueeze(0).unsqueeze(2)
+        x = x + time_pos.to(dtype=x.dtype).T.unsqueeze(0).unsqueeze(-1)
+        return x
+
+    def _flatten_tokens(self, x: Tensor) -> Tensor:
+        # [B,C,T,K] -> [B,T*K,C]
+        b, c, t, k = x.shape
+        return x.permute(0, 2, 3, 1).reshape(b, t * k, c)
+
+    def _unflatten_tokens(self, x: Tensor, t: int, k: int) -> Tensor:
+        # [B,T*K,C] -> [B,C,T,K]
+        b, s, c = x.shape
+        return x.reshape(b, t, k, c).permute(0, 3, 1, 2).contiguous()
+
+    def _build_stage_skip(self, stage_idx: int, mix_stage_bands: List[List[Tensor]]) -> Tensor:
+        # mix_stage_bands: list over bands -> list over 5 stages
+        pieces: List[Tensor] = []
+        for bidx in range(self.cfg.num_bands):
+            x = mix_stage_bands[bidx][stage_idx]
+            pos = self.stage_pos_embs[stage_idx][bidx](x.size(-1), x.device)
+            band_emb = self.stage_band_embs[stage_idx].weight[bidx].to(device=x.device, dtype=x.dtype)
+            q = self.stage_skip_tokenizers[stage_idx][bidx](x, pos_emb=pos, band_emb=band_emb)
+            pieces.append(q)
+        return torch.cat(pieces, dim=-1)
+
+    @staticmethod
+    def _scale_crm(raw: Tensor, scale: float) -> Tensor:
+        return scale * torch.tanh(raw / max(scale, 1e-6))
+
+    def _build_masks(self, x: Tensor) -> Dict[str, Tensor]:
+        # x: [B,96,T,F]
+        # bf16 autocast-friendly: complex masks are assembled in fp32
+        crm_raw = self.head_crm(x).float()
+        mp_raw = self.head_mp(x).float()
+        gate_logits = self.head_gate(x).float()
+        gate = torch.sigmoid(gate_logits)
+
+        crm_raw = crm_raw.permute(0, 2, 3, 1).contiguous()  # [B,T,F,4]
+        mp_raw = mp_raw.permute(0, 2, 3, 1).contiguous()
+        gate = gate.permute(0, 2, 3, 1).contiguous()  # [B,T,F,1]
+
+        crm = self._scale_crm(crm_raw, self.cfg.crm_scale)
+
+        crm_complex = torch.complex(
+            torch.stack([crm[..., 0], crm[..., 2]], dim=1),
+            torch.stack([crm[..., 1], crm[..., 3]], dim=1),
+        )  # [B,2,T,F]
+
+        mag = torch.sigmoid(torch.stack([mp_raw[..., 0], mp_raw[..., 2]], dim=1))
+        dphi = torch.tanh(torch.stack([mp_raw[..., 1], mp_raw[..., 3]], dim=1)) * math.pi
+        mp_complex = mag * torch.complex(torch.cos(dphi), torch.sin(dphi))
+
+        gate_btfs = gate.permute(0, 3, 1, 2).contiguous()  # [B,1,T,F]
+        final_mask = gate_btfs * crm_complex + (1.0 - gate_btfs) * mp_complex
+
+        return {
+            "crm_raw": crm_raw,
+            "mp_raw": mp_raw,
+            "gate_logits": gate_logits,
+            "gate": gate_btfs,
+            "crm_mask": crm_complex,
+            "mp_mask": mp_complex,
+            "mask": final_mask,
+        }
+
+    # --------------------------------------------------------
+    # Forward
+    # --------------------------------------------------------
+
+    def forward(self, mix_waveform: Tensor, ref_waveform: Tensor) -> Dict[str, Tensor | List[Tensor]]:
+        """
+        Args:
+            mix_waveform: [B,2,S]
+            ref_waveform: [B,2,S]
+        Returns:
+            dict with estimate waveform, masks and intermediate tensors.
+        """
+        if mix_waveform.shape != ref_waveform.shape:
+            raise ValueError(f"mix/ref shape mismatch: {tuple(mix_waveform.shape)} vs {tuple(ref_waveform.shape)}")
+
+        length = mix_waveform.size(-1)
+        mix_spec = self.frontend.stft(mix_waveform)  # [B,2,T,F]
+        ref_spec = self.frontend.stft(ref_waveform)  # [B,2,T,F]
+
+        mix_feats, ref_feats, band_meta = self.features(mix_spec, ref_spec)
+
+        mix_encoded, mix_stages = self._encode_branch(mix_feats, self.mix_input_stems)
+        ref_encoded, _ = self._encode_branch(ref_feats, self.ref_input_stems)
+
+        z_mix = self._tokenize_branch(mix_encoded, stream="mix")
+        z_ref = self._tokenize_branch(ref_encoded, stream="ref")
+
+        z_mix = self._add_trunk_positions(z_mix)
+        z_ref = self._add_trunk_positions(z_ref)
+
+        b, c, t4, k = z_mix.shape
+        mix_seq = self._flatten_tokens(z_mix)
+        ref_seq = self._flatten_tokens(z_ref)
+
+        for block in self.trunk_blocks:
+            mix_seq = block(mix_seq, ref_seq)
+
+        x = self._unflatten_tokens(mix_seq, t4, k)
+
+        skip1 = self._build_stage_skip(0, mix_stages)
+        skip2 = self._build_stage_skip(1, mix_stages)
+        skip3 = self._build_stage_skip(2, mix_stages)
+        skip4 = self._build_stage_skip(3, mix_stages)
+        skip5 = self._build_stage_skip(4, mix_stages)
+
+        x = self.dec5(x, skip5)
+        x = self.dec4(x, skip4)
+        x = self.dec3(x, skip3)
+        x = self.dec2(x, skip2)
+        x = self.dec1(x, skip1)
+
+        x_tf = self.detokenizer(x)
+        x_tf = self.refine(x_tf)
+
+        mask_dict = self._build_masks(x_tf)
+        estimated_spec = mix_spec * mask_dict["mask"]
+        estimated_wave = self.frontend.istft(estimated_spec, length=length)
+
+        return {
+            "estimate_waveform": estimated_wave,
+            "estimate_stft": estimated_spec,
+            "mix_stft": mix_spec,
+            "ref_stft": ref_spec,
+            "mask": mask_dict["mask"],
+            "crm_mask": mask_dict["crm_mask"],
+            "mp_mask": mask_dict["mp_mask"],
+            "crm_gate": mask_dict["gate"],
+            "crm_gate_logits": mask_dict["gate_logits"],
+            "z_mix": z_mix,
+            "z_ref": z_ref,
+            "decoder_tokens": x,
+            "decoder_tf": x_tf,
+        }
 
 
-if __name__ == "__main__":
-    main()
+__all__ = [
+    "BandSpec",
+    "DubSeparatorConfig",
+    "DubSeparator",
+]
