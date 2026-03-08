@@ -528,15 +528,82 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: Optional[GradScaler],
     device: torch.device,
-) -> Tuple[int, int]:
+    strict_model: bool = True,
+    reset_optimizer: bool = False,
+    reset_scaler: bool = False,
+    reset_global_step: bool = False,
+    reset_epoch: bool = False,
+) -> Tuple[int, int, Dict[str, Any]]:
+    """
+    Load checkpoint with graceful fallback for weights-only resumes.
+
+    Behavior:
+    - model weights are always loaded (strict by default)
+    - optimizer/scaler are loaded only if present and not explicitly reset
+    - if optimizer/scaler are absent, training continues with freshly initialized ones
+    """
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model"], strict=True)
-    optimizer.load_state_dict(ckpt["optimizer"])
-    if scaler is not None and ckpt.get("scaler") is not None:
-        scaler.load_state_dict(ckpt["scaler"])
+
+    model.load_state_dict(ckpt["model"], strict=strict_model)
+
+    resume_info: Dict[str, Any] = {
+        "optimizer_loaded": False,
+        "scaler_loaded": False,
+        "optimizer_reset": False,
+        "scaler_reset": False,
+        "epoch_reset": False,
+        "global_step_reset": False,
+        "messages": [],
+    }
+
+    if reset_optimizer:
+        resume_info["optimizer_reset"] = True
+        resume_info["messages"].append("optimizer reset requested by flag")
+    else:
+        opt_state = ckpt.get("optimizer")
+        if opt_state is None:
+            resume_info["optimizer_reset"] = True
+            resume_info["messages"].append("checkpoint has no optimizer state; using fresh optimizer")
+        else:
+            try:
+                optimizer.load_state_dict(opt_state)
+                resume_info["optimizer_loaded"] = True
+                resume_info["messages"].append("optimizer state loaded")
+            except Exception as exc:
+                resume_info["optimizer_reset"] = True
+                resume_info["messages"].append(f"optimizer state load failed; using fresh optimizer ({exc})")
+
+    if scaler is not None:
+        if reset_scaler:
+            resume_info["scaler_reset"] = True
+            resume_info["messages"].append("GradScaler reset requested by flag")
+        else:
+            scaler_state = ckpt.get("scaler")
+            if scaler_state is None:
+                resume_info["scaler_reset"] = True
+                resume_info["messages"].append("checkpoint has no GradScaler state; using fresh scaler")
+            else:
+                try:
+                    scaler.load_state_dict(scaler_state)
+                    resume_info["scaler_loaded"] = True
+                    resume_info["messages"].append("GradScaler state loaded")
+                except Exception as exc:
+                    resume_info["scaler_reset"] = True
+                    resume_info["messages"].append(f"GradScaler state load failed; using fresh scaler ({exc})")
+
     epoch = int(ckpt.get("epoch", 0))
     global_step = int(ckpt.get("global_step", 0))
-    return epoch, global_step
+
+    if reset_epoch:
+        epoch = 0
+        resume_info["epoch_reset"] = True
+        resume_info["messages"].append("epoch reset to 0")
+    if reset_global_step:
+        global_step = 0
+        resume_info["global_step_reset"] = True
+        resume_info["messages"].append("global_step reset to 0")
+
+    return epoch, global_step, resume_info
 
 
 # ============================================================
@@ -726,6 +793,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--log-every", type=int, default=10, help="Log every N steps")
     p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
     p.add_argument("--grad-checkpoint", action="store_true", help="Enable activation checkpointing in the optimized model")
+    p.add_argument("--reset-optimizer", action="store_true", help="Do not load optimizer state from checkpoint (or tolerate missing optimizer state)")
+    p.add_argument("--reset-scaler", action="store_true", help="Do not load GradScaler state from checkpoint")
+    p.add_argument("--reset-global-step", action="store_true", help="Reset global_step to 0 after loading checkpoint")
+    p.add_argument("--reset-epoch", action="store_true", help="Reset epoch counter to 0 after loading checkpoint")
+    p.add_argument("--non-strict-resume", action="store_true", help="Load model weights with strict=False")
     return p
 
 
@@ -833,14 +905,21 @@ def main() -> None:
     start_epoch = 0
     global_step = 0
     if args.resume is not None:
-        start_epoch, global_step = load_checkpoint(
+        start_epoch, global_step, resume_info = load_checkpoint(
             args.resume,
             model=model,
             optimizer=optimizer,
             scaler=scaler,
             device=device,
+            strict_model=not args.non_strict_resume,
+            reset_optimizer=bool(args.reset_optimizer),
+            reset_scaler=bool(args.reset_scaler),
+            reset_global_step=bool(args.reset_global_step),
+            reset_epoch=bool(args.reset_epoch),
         )
         print(f"Resumed from {args.resume} at epoch={start_epoch}, global_step={global_step}")
+        for msg in resume_info.get("messages", []):
+            print(f"[resume] {msg}")
 
     print("=== training ===")
     print(f"device            : {device}")
@@ -853,6 +932,11 @@ def main() -> None:
     print(f"loss coeffs       : l1={args.loss_l1} mr_sc={args.loss_mr_sc} mr_logmag={args.loss_mr_logmag}")
     print(f"speech/nospeech   : {args.speech_prob} / {args.nospeech_prob}")
     print(f"grad checkpoint   : {bool(args.grad_checkpoint)}")
+    print(f"reset optimizer   : {bool(args.reset_optimizer)}")
+    print(f"reset scaler      : {bool(args.reset_scaler)}")
+    print(f"reset global_step : {bool(args.reset_global_step)}")
+    print(f"reset epoch       : {bool(args.reset_epoch)}")
+    print(f"strict resume     : {not bool(args.non_strict_resume)}")
 
     stop_requested = {"flag": False}
 
