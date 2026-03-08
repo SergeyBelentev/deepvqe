@@ -1,1009 +1,1327 @@
+# train_separator.py
 from __future__ import annotations
 
 import argparse
 import json
 import math
-import os
 import random
-import signal
+import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Tuple, Optional, Any, List
+import os
+import datetime
+from contextlib import nullcontext
 
 import numpy as np
-import soundfile as sf
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import Tensor, nn
-from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
-from tqdm.auto import tqdm
+from torch.amp import autocast, GradScaler
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
-from dub_separator import DubSeparator, DubSeparatorConfig
+from deep_separator import StemSeparator, SeparatorConfig
 
+from train_phase_a import (
+    scan_root_to_items,
+    load_manifest_csv,
+    RecipeBook,
+    FlexibleMixDataset,
+    collate,
+    STEM_ORDER,
+)
+from validation import (
+    run_validation_full_tracks,
+)
 
-# ============================================================
-# Indexing
-# ============================================================
+# -------------------------
+# Precision / TF32 helpers
+# -------------------------
 
-
-class SegmentIndexError(RuntimeError):
-    pass
-
-
-class StopTraining(Exception):
-    pass
-
-
-def _relpath_str(path: Path, root: Path) -> str:
+def set_tf32(enabled: bool) -> None:
+    torch.backends.cuda.matmul.allow_tf32 = bool(enabled)
+    torch.backends.cudnn.allow_tf32 = bool(enabled)
     try:
-        return str(path.relative_to(root))
+        torch.set_float32_matmul_precision("high" if enabled else "highest")
     except Exception:
-        return str(path)
+        pass
 
 
+def make_autocast(amp: str, device: torch.device):
+    amp = amp.lower().strip()
+    if device.type != "cuda":
+        return autocast("cpu", enabled=False), None, False
 
-def _info_frames_and_sr(path: Path) -> Tuple[int, int, int]:
-    info = sf.info(str(path))
-    return int(info.frames), int(info.samplerate), int(info.channels)
+    if amp in ("off", "none", "0"):
+        return autocast("cuda", enabled=False), None, False
+    if amp == "fp16":
+        return autocast("cuda", dtype=torch.float16), torch.float16, True
+    if amp == "bf16":
+        return autocast("cuda", dtype=torch.bfloat16), torch.bfloat16, False
+    raise ValueError(f"Unknown --amp={amp!r}. Use off|fp16|bf16.")
 
 
-
-def _scan_mix_files(root: Path) -> List[Path]:
-    return sorted(p for p in root.rglob("*_mix.wav") if p.is_file())
-
-
-
-def index_speech_segments(root: Path, expected_sr: int) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    mix_files = _scan_mix_files(root)
-    if not mix_files:
-        raise SegmentIndexError(f"No *_mix.wav files found under speech root: {root}")
-
-    for mix_path in mix_files:
-        stem = mix_path.name[:-len("_mix.wav")]
-        ref_path = mix_path.with_name(f"{stem}_ref.wav")
-        target_path = mix_path.with_name(f"{stem}_target.wav")
-        if not ref_path.exists() or not target_path.exists():
-            raise SegmentIndexError(
-                f"Speech triplet incomplete for {mix_path}: expected {ref_path.name} and {target_path.name}"
-            )
-
-        mix_frames, mix_sr, mix_ch = _info_frames_and_sr(mix_path)
-        ref_frames, ref_sr, ref_ch = _info_frames_and_sr(ref_path)
-        tgt_frames, tgt_sr, tgt_ch = _info_frames_and_sr(target_path)
-
-        if mix_sr != expected_sr or ref_sr != expected_sr or tgt_sr != expected_sr:
-            raise SegmentIndexError(
-                f"Sample-rate mismatch for speech segment {mix_path}: mix/ref/target sr = "
-                f"{mix_sr}/{ref_sr}/{tgt_sr}, expected {expected_sr}"
-            )
-        if mix_ch < 1 or ref_ch < 1 or tgt_ch < 1:
-            raise SegmentIndexError(f"Invalid channel count for speech segment {mix_path}")
-
-        min_frames = min(mix_frames, ref_frames, tgt_frames)
-        entries.append(
-            {
-                "kind": "speech",
-                "id": stem,
-                "mix_path": str(mix_path),
-                "ref_path": str(ref_path),
-                "target_path": str(target_path),
-                "mix_frames": mix_frames,
-                "ref_frames": ref_frames,
-                "target_frames": tgt_frames,
-                "trimmed_frames": min_frames,
-                "relpath": _relpath_str(mix_path.parent, root),
-            }
-        )
-    return entries
-
-
-
-def index_nospeech_segments(root: Path, expected_sr: int) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    mix_files = _scan_mix_files(root)
-    if not mix_files:
-        raise SegmentIndexError(f"No *_mix.wav files found under nospeech root: {root}")
-
-    for mix_path in mix_files:
-        stem = mix_path.name[:-len("_mix.wav")]
-        ref_path = mix_path.with_name(f"{stem}_ref.wav")
-        if not ref_path.exists():
-            raise SegmentIndexError(
-                f"Nospeech pair incomplete for {mix_path}: expected {ref_path.name}"
-            )
-
-        mix_frames, mix_sr, mix_ch = _info_frames_and_sr(mix_path)
-        ref_frames, ref_sr, ref_ch = _info_frames_and_sr(ref_path)
-
-        if mix_sr != expected_sr or ref_sr != expected_sr:
-            raise SegmentIndexError(
-                f"Sample-rate mismatch for nospeech segment {mix_path}: mix/ref sr = "
-                f"{mix_sr}/{ref_sr}, expected {expected_sr}"
-            )
-        if mix_ch < 1 or ref_ch < 1:
-            raise SegmentIndexError(f"Invalid channel count for nospeech segment {mix_path}")
-
-        min_frames = min(mix_frames, ref_frames)
-        entries.append(
-            {
-                "kind": "nospeech",
-                "id": stem,
-                "mix_path": str(mix_path),
-                "ref_path": str(ref_path),
-                "target_path": None,
-                "mix_frames": mix_frames,
-                "ref_frames": ref_frames,
-                "target_frames": 0,
-                "trimmed_frames": min_frames,
-                "relpath": _relpath_str(mix_path.parent, root),
-            }
-        )
-    return entries
-
-
-
-def summarize_index(entries: Sequence[Dict[str, Any]], sample_rate: int) -> Dict[str, Any]:
-    total_frames = sum(int(e["trimmed_frames"]) for e in entries)
-    hours = total_frames / float(sample_rate) / 3600.0
-    return {
-        "count": len(entries),
-        "hours": hours,
-        "min_sec": (min(int(e["trimmed_frames"]) for e in entries) / sample_rate) if entries else 0.0,
-        "max_sec": (max(int(e["trimmed_frames"]) for e in entries) / sample_rate) if entries else 0.0,
-        "mean_sec": (total_frames / max(len(entries), 1) / sample_rate) if entries else 0.0,
-    }
-
-
-def save_full_index_json(
-    path: Path,
-    *,
-    speech_entries: Sequence[Dict[str, Any]],
-    nospeech_entries: Sequence[Dict[str, Any]],
-    sample_rate: int,
-    speech_root: Optional[Path],
-    nospeech_root: Optional[Path],
-) -> None:
-    payload = {
-        "version": 1,
-        "sample_rate": int(sample_rate),
-        "speech_root": str(speech_root) if speech_root is not None else None,
-        "nospeech_root": str(nospeech_root) if nospeech_root is not None else None,
-        "speech_entries": list(speech_entries),
-        "nospeech_entries": list(nospeech_entries),
-        "speech_summary": summarize_index(speech_entries, sample_rate),
-        "nospeech_summary": summarize_index(nospeech_entries, sample_rate),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def _normalize_loaded_entry(entry: Dict[str, Any], *, kind: str) -> Dict[str, Any]:
-    required = ["id", "mix_path", "ref_path", "trimmed_frames"]
-    for key in required:
-        if key not in entry:
-            raise SegmentIndexError(f"Loaded {kind} index entry is missing key: {key}")
-
-    norm = {
-        "kind": kind,
-        "id": str(entry["id"]),
-        "mix_path": str(entry["mix_path"]),
-        "ref_path": str(entry["ref_path"]),
-        "target_path": str(entry["target_path"]) if entry.get("target_path") is not None else None,
-        "mix_frames": int(entry.get("mix_frames", entry["trimmed_frames"])),
-        "ref_frames": int(entry.get("ref_frames", entry["trimmed_frames"])),
-        "target_frames": int(entry.get("target_frames", 0)),
-        "trimmed_frames": int(entry["trimmed_frames"]),
-        "relpath": str(entry.get("relpath", "")),
-    }
-    return norm
-
-
-def load_full_index_json(path: Path, *, expected_sr: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    sr = int(payload.get("sample_rate", -1))
-    if sr != int(expected_sr):
-        raise SegmentIndexError(f"Index JSON sample_rate={sr} does not match expected sample_rate={expected_sr}: {path}")
-
-    speech_entries = [_normalize_loaded_entry(e, kind="speech") for e in payload.get("speech_entries", [])]
-    nospeech_entries = [_normalize_loaded_entry(e, kind="nospeech") for e in payload.get("nospeech_entries", [])]
-
-    if not speech_entries and not nospeech_entries:
-        raise SegmentIndexError(f"Loaded index JSON contains no entries: {path}")
-
-    meta = {
-        "version": int(payload.get("version", 1)),
-        "sample_rate": sr,
-        "speech_root": payload.get("speech_root"),
-        "nospeech_root": payload.get("nospeech_root"),
-        "speech_summary": payload.get("speech_summary"),
-        "nospeech_summary": payload.get("nospeech_summary"),
-    }
-    return speech_entries, nospeech_entries, meta
-
-
-# ============================================================
-# Audio loading and dataset
-# ============================================================
-
-
-
-def _ensure_stereo(x: np.ndarray, path: str) -> np.ndarray:
-    if x.ndim == 1:
-        x = np.stack([x, x], axis=-1)
-    if x.ndim != 2:
-        raise SegmentIndexError(f"Expected 1D/2D audio from {path}, got shape {x.shape}")
-    if x.shape[1] == 1:
-        x = np.repeat(x, 2, axis=1)
-    elif x.shape[1] >= 2:
-        x = x[:, :2]
-    return x.astype(np.float32, copy=False)
-
-
-
-def _read_audio(path: str) -> Tuple[np.ndarray, int]:
-    wav, sr = sf.read(path, dtype="float32", always_2d=True)
-    wav = _ensure_stereo(wav, path)
-    return wav, sr
-
-
-
-def _trim_triplet_to_min(mix: np.ndarray, ref: np.ndarray, target: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    arrays = [mix, ref]
-    if target is not None:
-        arrays.append(target)
-    min_len = min(x.shape[0] for x in arrays)
-    mix = mix[:min_len]
-    ref = ref[:min_len]
-    if target is None:
-        target = np.zeros((min_len, 2), dtype=np.float32)
-    else:
-        target = target[:min_len]
-    return mix, ref, target
-
-
-class MixedSegmentDataset(Dataset[Dict[str, Tensor]]):
-    def __init__(
-        self,
-        *,
-        speech_entries: Sequence[Dict[str, Any]],
-        nospeech_entries: Sequence[Dict[str, Any]],
-        sample_rate: int,
-        segment_sec: float,
-        epoch_steps: int,
-        batch_size: int,
-        speech_prob: float,
-        nospeech_prob: float,
-        seed: int = 42,
-    ) -> None:
-        super().__init__()
-        self.speech_entries = list(speech_entries)
-        self.nospeech_entries = list(nospeech_entries)
-        self.sample_rate = int(sample_rate)
-        self.segment_samples = int(round(segment_sec * sample_rate))
-        self.epoch_steps = int(epoch_steps)
-        self.batch_size = int(batch_size)
-        self.virtual_length = self.epoch_steps * self.batch_size
-        self.seed = int(seed)
-
-        if self.segment_samples <= 0:
-            raise ValueError("segment_sec must produce at least 1 sample")
-        if not self.speech_entries and not self.nospeech_entries:
-            raise ValueError("Both speech and nospeech indexes are empty")
-        if speech_prob < 0 or nospeech_prob < 0:
-            raise ValueError("speech_prob and nospeech_prob must be >= 0")
-        total_prob = speech_prob + nospeech_prob
-        if total_prob <= 0:
-            raise ValueError("speech_prob + nospeech_prob must be > 0")
-        self.speech_prob = speech_prob / total_prob
-        self.nospeech_prob = nospeech_prob / total_prob
-
-    def __len__(self) -> int:
-        return self.virtual_length
-
-    def _rng(self, index: int) -> random.Random:
-        worker_info = torch.utils.data.get_worker_info()
-        worker_seed = worker_info.seed if worker_info is not None else self.seed
-        return random.Random(worker_seed + index * 9973)
-
-    def _pick_entry(self, rng: random.Random) -> Dict[str, Any]:
-        want_speech = rng.random() < self.speech_prob
-        if want_speech and self.speech_entries:
-            return self.speech_entries[rng.randrange(len(self.speech_entries))]
-        if (not want_speech) and self.nospeech_entries:
-            return self.nospeech_entries[rng.randrange(len(self.nospeech_entries))]
-        if self.speech_entries:
-            return self.speech_entries[rng.randrange(len(self.speech_entries))]
-        return self.nospeech_entries[rng.randrange(len(self.nospeech_entries))]
-
-    def _load_triplet(self, entry: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        mix, mix_sr = _read_audio(entry["mix_path"])
-        ref, ref_sr = _read_audio(entry["ref_path"])
-        if mix_sr != self.sample_rate or ref_sr != self.sample_rate:
-            raise SegmentIndexError(
-                f"Runtime sample-rate mismatch for {entry['id']}: mix/ref = {mix_sr}/{ref_sr}, expected {self.sample_rate}"
-            )
-
-        target_path = entry.get("target_path")
-        if target_path:
-            target, tgt_sr = _read_audio(target_path)
-            if tgt_sr != self.sample_rate:
-                raise SegmentIndexError(
-                    f"Runtime sample-rate mismatch for {entry['id']}: target={tgt_sr}, expected {self.sample_rate}"
-                )
-        else:
-            target = None
-
-        mix, ref, target = _trim_triplet_to_min(mix, ref, target)
-        return mix, ref, target
-
-    def _crop_or_pad(
-        self,
-        mix: np.ndarray,
-        ref: np.ndarray,
-        target: np.ndarray,
-        rng: random.Random,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
-        length = mix.shape[0]
-        seg = self.segment_samples
-        valid = np.zeros((seg,), dtype=np.float32)
-
-        if length >= seg:
-            start = rng.randint(0, length - seg)
-            end = start + seg
-            mix_out = mix[start:end]
-            ref_out = ref[start:end]
-            tgt_out = target[start:end]
-            valid[:] = 1.0
-            valid_len = seg
-            return mix_out, ref_out, tgt_out, valid, valid_len
-
-        offset = rng.randint(0, seg - length)
-        mix_out = np.zeros((seg, 2), dtype=np.float32)
-        ref_out = np.zeros((seg, 2), dtype=np.float32)
-        tgt_out = np.zeros((seg, 2), dtype=np.float32)
-        mix_out[offset:offset + length] = mix
-        ref_out[offset:offset + length] = ref
-        tgt_out[offset:offset + length] = target
-        valid[offset:offset + length] = 1.0
-        return mix_out, ref_out, tgt_out, valid, int(length)
-
-    def __getitem__(self, index: int) -> Dict[str, Tensor]:
-        rng = self._rng(index)
-        entry = self._pick_entry(rng)
-        mix, ref, target = self._load_triplet(entry)
-        mix, ref, target, valid, valid_len = self._crop_or_pad(mix, ref, target, rng)
-
-        mix_t = torch.from_numpy(mix.T.copy())
-        ref_t = torch.from_numpy(ref.T.copy())
-        tgt_t = torch.from_numpy(target.T.copy())
-        valid_t = torch.from_numpy(valid.copy())
-        is_speech = 1 if entry["kind"] == "speech" else 0
-
-        return {
-            "mix": mix_t,
-            "ref": ref_t,
-            "target": tgt_t,
-            "valid_mask": valid_t,
-            "valid_samples": torch.tensor(valid_len, dtype=torch.long),
-            "is_speech": torch.tensor(is_speech, dtype=torch.bool),
-        }
-
-
-
-def collate_segments(batch: Sequence[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-    return {
-        "mix": torch.stack([x["mix"] for x in batch], dim=0),
-        "ref": torch.stack([x["ref"] for x in batch], dim=0),
-        "target": torch.stack([x["target"] for x in batch], dim=0),
-        "valid_mask": torch.stack([x["valid_mask"] for x in batch], dim=0),
-        "valid_samples": torch.stack([x["valid_samples"] for x in batch], dim=0),
-        "is_speech": torch.stack([x["is_speech"] for x in batch], dim=0),
-    }
-
-
-# ============================================================
-# Losses
-# ============================================================
-
+# -------------------------
+# Multi-Resolution STFT loss (SC + LogMag)
+# -------------------------
 
 class MultiResolutionSTFTLoss(nn.Module):
+    """
+    MR-STFT loss = mean over resolutions of:
+      SC = || |Sx|-|Sy| ||_F / (|| |Sy| ||_F + eps)
+      LogMag = mean | log(|Sx|+eps) - log(|Sy|+eps) |
+    Stereo is handled by flattening channel into batch.
+    """
     def __init__(
         self,
-        *,
-        resolutions: Sequence[Tuple[int, int, int]] | None = None,
-        eps: float = 1e-8,
-    ) -> None:
+        n_ffts=(1024, 2048, 4096),
+        hops=(256, 512, 1024),
+        win_lengths=None,
+        center=True,
+        normalized=False,
+        eps=1e-8,
+        w_sc=1.0,
+        w_lm=1.0,
+    ):
         super().__init__()
+        assert len(n_ffts) == len(hops)
+        self.n_ffts = tuple(map(int, n_ffts))
+        self.hops = tuple(map(int, hops))
+        self.win_lengths = tuple(map(int, (win_lengths or n_ffts)))
+        self.center = bool(center)
+        self.normalized = bool(normalized)
         self.eps = float(eps)
-        self.resolutions = list(resolutions or [
-            (512, 128, 512),
-            (1024, 256, 1024),
-            (2048, 512, 2048),
-        ])
-        for n_fft, _, win_length in self.resolutions:
-            win = torch.hann_window(win_length, periodic=True)
-            self.register_buffer(f"window_{n_fft}_{win_length}", win, persistent=False)
+        self.w_sc = float(w_sc)
+        self.w_lm = float(w_lm)
 
-    def _window(self, n_fft: int, win_length: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-        win = getattr(self, f"window_{n_fft}_{win_length}")
-        return win.to(device=device, dtype=dtype)
-
-    def _mag(self, x: Tensor, n_fft: int, hop: int, win_length: int) -> Tensor:
-        # x: [B, C, S] -> [B*C, F, T]
-        b, c, s = x.shape
-        z = x.reshape(b * c, s)
-        win = self._window(n_fft, win_length, x.device, x.dtype)
-        spec = torch.stft(
-            z,
+    def _stft_mag(self, x: torch.Tensor, n_fft: int, hop: int, win_length: int) -> torch.Tensor:
+        # x: (B,2,T)
+        B, C, T = x.shape
+        win = torch.hann_window(win_length, periodic=True, device=x.device, dtype=torch.float32)
+        x2 = x.reshape(B * C, T)
+        S = torch.stft(
+            x2,
             n_fft=n_fft,
             hop_length=hop,
             win_length=win_length,
             window=win,
-            center=True,
-            normalized=False,
+            center=self.center,
+            normalized=self.normalized,
             onesided=True,
             return_complex=True,
+        )  # (B*C, F, TT)
+        mag = S.abs().reshape(B, C, S.shape[-2], S.shape[-1])  # (B,C,F,TT)
+        return mag
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor):
+        # x,y: (B,2,T)
+        sc_all, lm_all = [], []
+        for n_fft, hop, wl in zip(self.n_ffts, self.hops, self.win_lengths):
+            mx = self._stft_mag(x, n_fft, hop, wl)  # (B,C,F,TT)
+            my = self._stft_mag(y, n_fft, hop, wl)
+
+            diff = mx - my  # (B,C,F,TT)
+
+            # SC per (B,C)
+            diff_fro = torch.linalg.vector_norm(diff.flatten(2), dim=2)  # (B,C)
+            my_fro   = torch.linalg.vector_norm(my.flatten(2), dim=2).clamp_min(self.eps)  # (B,C)
+            sc = (diff_fro / my_fro).mean()  # scalar
+
+            # LogMag per (B,C)
+            lmx = (mx + self.eps).log()
+            lmy = (my + self.eps).log()
+            lm = (lmx - lmy).abs().mean(dim=(2, 3)).mean()  # scalar
+
+            sc_all.append(sc)
+            lm_all.append(lm)
+
+        sc_m = torch.stack(sc_all).mean()
+        lm_m = torch.stack(lm_all).mean()
+        total = self.w_sc * sc_m + self.w_lm * lm_m
+        return total, {"mr_sc": sc_m.detach(), "mr_logmag": lm_m.detach()}
+
+
+# -------------------------
+# Loss pack
+# -------------------------
+
+def _stereo_stft(
+    wav: torch.Tensor,              # (B,2,N)
+    *,
+    n_fft: int,
+    hop: int,
+    center: bool,
+    normalized: bool,
+) -> torch.Tensor:
+    """
+    returns: (B,2,T,F) complex64
+    """
+    B, C, N = wav.shape
+    assert C == 2
+    device = wav.device
+    win = torch.hann_window(n_fft, periodic=True, device=device, dtype=torch.float32)
+
+    x = wav.reshape(B * 2, N)  # (B*2, N)
+    with torch.autocast(device_type=device.type, enabled=False):
+        X = torch.stft(
+            x.float(),
+            n_fft=n_fft,
+            hop_length=hop,
+            win_length=n_fft,
+            window=win,
+            center=center,
+            normalized=normalized,
+            onesided=True,
+            return_complex=True,
+        )  # (B*2, F, T)
+    X = X.transpose(-2, -1).contiguous()  # (B*2, T, F)
+    T = X.shape[1]
+    F = X.shape[2]
+    return X.reshape(B, 2, T, F).to(torch.complex64)
+
+
+def _l1_ri_norm(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    pred,tgt: (B,2,T,F) complex
+    return scalar
+    """
+    # per-sample scale по магнитуде target, чтобы вес был похож на твой mix_scale
+    scale = tgt.abs().mean(dim=(1, 2, 3)).clamp_min(eps)  # (B,)
+    dr = (pred.real - tgt.real).abs().mean(dim=(1, 2, 3))
+    di = (pred.imag - tgt.imag).abs().mean(dim=(1, 2, 3))
+    return ((dr + di) / scale).mean()
+
+
+def _l1_logmag(pred: torch.Tensor, tgt: torch.Tensor, eps: float) -> torch.Tensor:
+    return (torch.log(pred.abs() + eps) - torch.log(tgt.abs() + eps)).abs().mean()
+
+
+def rms(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    return torch.sqrt(x.pow(2).mean(dim=(1, 2)).clamp_min(eps))
+
+
+def cosine_abs(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    av = a.reshape(a.shape[0], -1)
+    bv = b.reshape(b.shape[0], -1)
+    num = (av * bv).sum(dim=1)
+    den = (av.norm(dim=1) * bv.norm(dim=1)).clamp_min(eps)
+    return (num / den).abs()
+
+
+@torch.no_grad()
+def _mean_where(x: torch.Tensor, m: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    mf = m.float()
+    return (x * mf).sum() / (mf.sum() + eps)
+
+
+class LossComputer(nn.Module):
+    def __init__(
+        self,
+        sr: int,
+        hop: int,
+        center: bool = True,
+        normalized: bool = False,
+        mr_w_sc: float = 1.0,
+        mr_w_lm: float = 1.0,
+        silence_rms_thr: float = 1e-3,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+        self.eps = float(eps)
+        self.silence_rms_thr = float(silence_rms_thr)
+
+        self.hop = int(hop)
+        self.center = bool(center)
+        self.normalized = bool(normalized)
+
+        self.mr = MultiResolutionSTFTLoss(
+            n_ffts=(1024, 2048, 4096),
+            hops=(256, 512, 1024),
+            win_lengths=(1024, 2048, 4096),
+            center=True,
+            normalized=False,
+            eps=eps,
+            w_sc=mr_w_sc,
+            w_lm=mr_w_lm,
         )
-        return spec.abs().clamp_min(self.eps)
 
-    def forward(self, estimate: Tensor, target: Tensor) -> Tuple[Tensor, Tensor]:
-        sc_losses: List[Tensor] = []
-        logmag_losses: List[Tensor] = []
-        for n_fft, hop, win_length in self.resolutions:
-            est_mag = self._mag(estimate, n_fft, hop, win_length)
-            tgt_mag = self._mag(target, n_fft, hop, win_length)
+    def forward(
+        self,
+        pred_stems: torch.Tensor,     # (B,4,2,T)
+        tgt_stems: torch.Tensor,      # (B,4,2,T)
+        present_mask: torch.Tensor,   # (B,4) float 0/1
+        mix_target: torch.Tensor,     # (B,2,T)
+        weights: Dict[str, float],
+        tf_pack: Dict[str, torch.Tensor] | None = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        B, H, C, T = pred_stems.shape
+        assert H == 4 and C == 2
 
-            diff = est_mag - tgt_mag
-            num = torch.linalg.vector_norm(diff, ord=2, dim=(1, 2))
-            den = torch.linalg.vector_norm(tgt_mag, ord=2, dim=(1, 2)).clamp_min(self.eps)
-            sc = (num / den).mean()
-            logmag = (torch.log(est_mag) - torch.log(tgt_mag)).abs().mean()
+        mix_scale = mix_target.abs().mean(dim=(1, 2), keepdim=True).clamp_min(self.eps)  # (B,1,1)
+        pm = present_mask.view(B, H, 1, 1)  # (B,4,1,1)
 
-            sc_losses.append(sc)
-            logmag_losses.append(logmag)
+        l1_per = (pred_stems - tgt_stems).abs().mean(dim=(2, 3))  # (B,4)
+        l1_per_norm = l1_per / mix_scale.squeeze(-1)  # (B,4)
+        l1_head = (l1_per_norm * present_mask).sum() / (present_mask.sum() + self.eps)
 
-        return torch.stack(sc_losses).mean(), torch.stack(logmag_losses).mean()
+        # mix TF loss
+        tf_ri_mix = pred_stems.sum() * 0.0
+        tf_lm_mix = pred_stems.sum() * 0.0
+        tf_ri_4096 = pred_stems.sum() * 0.0
+        tf_lm_4096 = pred_stems.sum() * 0.0
+        tf_ri_2048 = pred_stems.sum() * 0.0
+        tf_lm_2048 = pred_stems.sum() * 0.0
+
+        if tf_pack is not None:
+            # pred spectra sums
+            # S*: (B,H,2,T,F) complex
+            S4096_g = tf_pack["S4096_g"]
+            S2048_g = tf_pack["S2048_g"]
+            g4096 = tf_pack["g4096"]  # (B,H,1,T,2049) float
+            g2048 = tf_pack["g2048"]  # (B,H,1,T,1025) float
+
+            B, H, _, Ttf, F4096 = S4096_g.shape
+            N = tgt_stems.shape[-1]
+            hop = self.hop
+
+            # --- pad targets exactly like model to match Ttf ---
+            T0 = (N // hop) + 1
+            if Ttf > T0:
+                N_pad = (Ttf - 1) * hop
+            else:
+                N_pad = N
+
+            if N_pad > N:
+                tgt_pad = F.pad(tgt_stems, (0, N_pad - N))
+            else:
+                tgt_pad = tgt_stems
+
+            # STFT all heads in one shot: (B*H,2,N_pad) -> (B,H,2,T,F)
+            tgt_flat = tgt_pad.reshape(B * H, 2, N_pad)
+
+            X4096_h = _stereo_stft(
+                tgt_flat,
+                n_fft=4096,
+                hop=hop,
+                center=self.center,
+                normalized=self.normalized,
+            ).reshape(B, H, 2, -1, 2049)
+
+            X2048_h = _stereo_stft(
+                tgt_flat,
+                n_fft=2048,
+                hop=hop,
+                center=self.center,
+                normalized=self.normalized,
+            ).reshape(B, H, 2, -1, 1025)
+
+            # build targets with detached router gains (head-wise)
+            X4096_tgt = (X4096_h * g4096.detach()).sum(dim=1)  # (B,2,T,2049)
+            X2048_tgt = (X2048_h * g2048.detach()).sum(dim=1)  # (B,2,T,1025)
+
+            # predicted sums over heads
+            S4096_sum = S4096_g.sum(dim=1)  # (B,2,T,2049)
+            S2048_sum = S2048_g.sum(dim=1)  # (B,2,T,1025)
+
+            # TF mix losses
+            tf_ri_4096 = _l1_ri_norm(S4096_sum, X4096_tgt, self.eps)
+            tf_lm_4096 = _l1_logmag(S4096_sum, X4096_tgt, self.eps)
+
+            tf_ri_2048 = _l1_ri_norm(S2048_sum, X2048_tgt, self.eps)
+            tf_lm_2048 = _l1_logmag(S2048_sum, X2048_tgt, self.eps)
+
+            tf_ri_mix = tf_ri_4096 + tf_ri_2048
+            tf_lm_mix = tf_lm_4096 + tf_lm_2048
+
+        # mix tf loss end
+
+        tgt_rms = torch.stack([rms(tgt_stems[:, i]) for i in range(4)], dim=1)  # (B,4)
+        silence_mask = (present_mask <= 0.0) | (tgt_rms < self.silence_rms_thr)  # (B,4) bool
+        pred_abs = pred_stems.abs().mean(dim=(2, 3))  # (B,4)
+        silence_loss = _mean_where(pred_abs, silence_mask)
+
+        mix_tgt_present = (tgt_stems * pm).sum(dim=1)  # (B,2,T)
+
+        leak_terms = []
+        for i in range(4):
+            sel_i = present_mask[:, i] > 0.5
+            if not bool(sel_i.any()):
+                continue
+            other = mix_tgt_present - tgt_stems[:, i] * pm[:, i]
+            ok = sel_i & (rms(other) > self.silence_rms_thr) & (rms(tgt_stems[:, i]) > self.silence_rms_thr)
+            if bool(ok.any()):
+                leak_terms.append(cosine_abs(pred_stems[ok, i], other[ok]).mean())
+
+        leak_loss = torch.stack(leak_terms).mean() if leak_terms else pred_stems.sum() * 0.0
+
+        mr_head_vals = []
+        mr_sc_vals = []
+        mr_lm_vals = []
+
+        mr_mask = (present_mask > 0.5) & (tgt_rms >= self.silence_rms_thr)  # (B,4) bool
+
+        for i in range(4):
+            sel = mr_mask[:, i]
+            if not bool(sel.any()):
+                continue
+            li, stat = self.mr(pred_stems[sel, i], tgt_stems[sel, i])
+            mr_head_vals.append(li)
+            mr_sc_vals.append(stat["mr_sc"])
+            mr_lm_vals.append(stat["mr_logmag"])
+
+        if mr_head_vals:
+            mr_head = torch.stack(mr_head_vals).mean()
+            mr_sc = torch.stack(mr_sc_vals).mean()
+            mr_lm = torch.stack(mr_lm_vals).mean()
+        else:
+            mr_head = pred_stems.sum() * 0.0
+            mr_sc = pred_stems.sum() * 0.0
+            mr_lm = pred_stems.sum() * 0.0
+
+        total = (
+            weights["w_l1_head"] * l1_head +
+            weights["w_mr_head"] * mr_head +
+            weights.get("w_tf_mix_ri", 0.0) * tf_ri_mix +
+            weights.get("w_tf_mix_lm", 0.0) * tf_lm_mix +
+            weights["w_silence"] * silence_loss +
+            weights["w_leak"] * leak_loss
+        )
+
+        stats = {
+            "loss_total": total.detach(),
+            "l1_head": l1_head.detach(),
+            "mr_head": mr_head.detach(),
+            "mr_sc_head": mr_sc.detach(),
+            "mr_lm_head": mr_lm.detach(),
+            "tf_ri_mix": tf_ri_mix.detach(),
+            "tf_lm_mix": tf_lm_mix.detach(),
+            "tf_ri_4096": tf_ri_4096.detach(),
+            "tf_lm_4096": tf_lm_4096.detach(),
+            "tf_ri_2048": tf_ri_2048.detach(),
+            "tf_lm_2048": tf_lm_2048.detach(),
+            "silence": silence_loss.detach(),
+            "leak": leak_loss.detach(),
+        }
+        return total, stats
 
 
-
-def masked_l1_loss(estimate: Tensor, target: Tensor, valid_mask: Tensor) -> Tensor:
-    # estimate/target: [B,2,S], valid_mask: [B,S]
-    w = valid_mask.unsqueeze(1)
-    denom = w.sum().clamp_min(1.0) * estimate.size(1)
-    return ((estimate - target).abs() * w).sum() / denom
-
-
-
-def apply_valid_mask(x: Tensor, valid_mask: Tensor) -> Tensor:
-    return x * valid_mask.unsqueeze(1)
-
-
-# ============================================================
+# -------------------------
 # Checkpointing
-# ============================================================
+# -------------------------
 
-
-
-def save_checkpoint(
+def save_ckpt(
     path: Path,
-    *,
-    model: DubSeparator,
-    optimizer: torch.optim.Optimizer,
-    scaler: Optional[GradScaler],
+    model: nn.Module,
+    opt: torch.optim.Optimizer,
+    sched: Optional[torch.optim.lr_scheduler._LRScheduler],
+    scaler: Optional[torch.cuda.amp.GradScaler],
     epoch: int,
-    global_step: int,
-    args: argparse.Namespace,
-) -> None:
+    step: int,
+    cfg: SeparatorConfig,
+    extra: Optional[Dict[str, Any]] = None,
+):
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scaler": scaler.state_dict() if scaler is not None else None,
-        "epoch": epoch,
-        "global_step": global_step,
-        "args": vars(args),
-        "model_cfg": asdict(model.cfg),
+    obj = {
+        "epoch": int(epoch),
+        "step": int(step),
+        "cfg": asdict(cfg),
+        "model": (model.module.state_dict() if hasattr(model, "module") else model.state_dict()),
+        "opt": opt.state_dict(),
+        "sched": (sched.state_dict() if sched is not None else None),
+        "scaler": (scaler.state_dict() if scaler is not None else None),
+        "rng": {
+            "py": random.getstate(),
+            "np": np.random.get_state(),
+            "torch": torch.random.get_rng_state(),
+            "cuda": (torch.cuda.random.get_rng_state_all() if torch.cuda.is_available() else None),
+        },
+        "extra": extra or {},
     }
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, tmp_path)
-    os.replace(tmp_path, path)
+    torch.save(obj, str(path))
 
 
-
-def load_checkpoint(
+def load_ckpt(
     path: Path,
-    *,
-    model: DubSeparator,
-    optimizer: torch.optim.Optimizer,
-    scaler: Optional[GradScaler],
-    device: torch.device,
-) -> Tuple[int, int]:
-    ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"], strict=True)
-    optimizer.load_state_dict(ckpt["optimizer"])
+    model: nn.Module,
+    opt: Optional[torch.optim.Optimizer] = None,
+    sched: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    map_location: str = "cpu",
+) -> Tuple[int, int, Dict[str, Any]]:
+    ckpt = torch.load(str(path), map_location=map_location, weights_only=False)
+
+    sd = ckpt["model"]
+    (model.module if hasattr(model, "module") else model).load_state_dict(sd, strict=True)
+
+    if opt is not None and ckpt.get("opt") is not None:
+        opt.load_state_dict(ckpt["opt"])
+    if sched is not None and ckpt.get("sched") is not None:
+        sched.load_state_dict(ckpt["sched"])
     if scaler is not None and ckpt.get("scaler") is not None:
         scaler.load_state_dict(ckpt["scaler"])
-    epoch = int(ckpt.get("epoch", 0))
-    global_step = int(ckpt.get("global_step", 0))
-    return epoch, global_step
+
+    rng = ckpt.get("rng", None)
+    if rng is not None:
+        try:
+            random.setstate(rng["py"])
+            np.random.set_state(rng["np"])
+            torch.random.set_rng_state(rng["torch"])
+            if torch.cuda.is_available() and rng.get("cuda") is not None:
+                torch.cuda.random.set_rng_state_all(rng["cuda"])
+        except Exception:
+            pass
+
+    epoch = int(ckpt.get("epoch", 1))
+    step = int(ckpt.get("step", 0))
+    extra = ckpt.get("extra", {}) or {}
+    return epoch, step, extra
 
 
-# ============================================================
-# Utils
-# ============================================================
+# -------------------------
+# Scheduler
+# -------------------------
+
+def make_scheduler(opt, total_steps: int, warmup_steps: int):
+    def lr_lambda(s: int):
+        if s < warmup_steps:
+            return float(s) / float(max(1, warmup_steps))
+        t = (s - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * t))
+
+    return torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
 
+# -------------------------
+# Train/Val split by songs (items)
+# -------------------------
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-
-def seed_worker(worker_id: int) -> None:
-    worker_seed = torch.initial_seed() % 2**32
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)
-
-
-
-def human_hours(hours: float) -> str:
-    return f"{hours:.2f} h"
-
-
-
-def count_parameters(module: nn.Module) -> int:
-    return sum(p.numel() for p in module.parameters() if p.requires_grad)
-
-
-def grad_norm_l2(module: nn.Module) -> float:
-    total_sq = 0.0
-    for p in module.parameters():
-        if p.grad is None:
-            continue
-        g = p.grad.detach()
-        total_sq += float(g.float().pow(2).sum().item())
-    return math.sqrt(max(total_sq, 0.0))
-
-
-def safe_output_stats(outputs: Dict[str, Tensor]) -> Dict[str, float]:
-    stats: Dict[str, float] = {}
-    crm_gate = outputs.get("crm_gate")
-    if crm_gate is not None:
-        stats["crm_gate_mean"] = float(crm_gate.detach().mean().item())
-    mask = outputs.get("mask")
-    if mask is not None:
-        stats["mask_abs_mean"] = float(mask.detach().abs().mean().item())
-    est = outputs.get("estimate_waveform")
-    if est is not None:
-        stats["est_abs_mean"] = float(est.detach().abs().mean().item())
-    return stats
-
-
-def update_ema_dict(ema: Dict[str, float], current: Dict[str, float], decay: float) -> Dict[str, float]:
-    for k, v in current.items():
-        if not math.isfinite(v):
-            continue
-        if k not in ema:
-            ema[k] = float(v)
-        else:
-            ema[k] = decay * ema[k] + (1.0 - decay) * float(v)
-    return ema
-
-
-
-def build_amp_dtype(amp_mode: str) -> torch.dtype | None:
-    amp_mode = amp_mode.lower()
-    if amp_mode == "none":
-        return None
-    if amp_mode == "bf16":
-        return torch.bfloat16
-    if amp_mode == "fp16":
-        return torch.float16
-    raise ValueError(f"Unsupported amp mode: {amp_mode}")
-
-
-
-def make_autocast(device: torch.device, amp_mode: str):
-    dtype = build_amp_dtype(amp_mode)
-    enabled = dtype is not None and device.type == "cuda"
-    return autocast(device_type=device.type if device.type in {"cuda", "cpu"} else "cuda", dtype=dtype, enabled=enabled)
-
-
-
-def compute_losses(
+def split_items_train_val(
+    items: List[Any],
     *,
-    outputs: Dict[str, Tensor],
-    batch: Dict[str, Tensor],
-    mrstft: MultiResolutionSTFTLoss,
-    lambda_l1: float,
-    lambda_sc: float,
-    lambda_logmag: float,
-) -> Tuple[Tensor, Dict[str, float]]:
-    # Losses are always computed in fp32, outside autocast.
-    estimate = outputs["estimate_waveform"].float()
-    target = batch["target"].float()
-    valid_mask = batch["valid_mask"].float()
-    is_speech = batch["is_speech"].bool()
-
-    total_loss = estimate.new_zeros((), dtype=torch.float32)
-    logs: Dict[str, float] = {
-        "loss_total": 0.0,
-        "loss_speech": 0.0,
-        "loss_nospeech": 0.0,
-        "l1_speech": 0.0,
-        "sc_speech": 0.0,
-        "logmag_speech": 0.0,
-        "l1_nospeech": 0.0,
-        "logmag_nospeech": 0.0,
-        "num_speech": float(is_speech.sum().item()),
-        "num_nospeech": float((~is_speech).sum().item()),
-    }
-
-    if is_speech.any():
-        idx = is_speech
-        est_s = apply_valid_mask(estimate[idx], valid_mask[idx])
-        tgt_s = apply_valid_mask(target[idx], valid_mask[idx])
-        l1_s = masked_l1_loss(estimate[idx], target[idx], valid_mask[idx])
-        sc_s, logmag_s = mrstft(est_s, tgt_s)
-        speech_loss = lambda_l1 * l1_s + lambda_sc * sc_s + lambda_logmag * logmag_s
-        total_loss = total_loss + speech_loss
-        logs.update(
-            {
-                "loss_speech": float(speech_loss.detach().item()),
-                "l1_speech": float(l1_s.detach().item()),
-                "sc_speech": float(sc_s.detach().item()),
-                "logmag_speech": float(logmag_s.detach().item()),
-            }
-        )
-
-    if (~is_speech).any():
-        idx = ~is_speech
-        est_n = apply_valid_mask(estimate[idx], valid_mask[idx])
-        tgt_n = apply_valid_mask(target[idx], valid_mask[idx])
-        l1_n = masked_l1_loss(estimate[idx], target[idx], valid_mask[idx])
-        _, logmag_n = mrstft(est_n, tgt_n)
-        nospeech_loss = lambda_l1 * l1_n + lambda_logmag * logmag_n
-        total_loss = total_loss + nospeech_loss
-        logs.update(
-            {
-                "loss_nospeech": float(nospeech_loss.detach().item()),
-                "l1_nospeech": float(l1_n.detach().item()),
-                "logmag_nospeech": float(logmag_n.detach().item()),
-            }
-        )
-
-    logs["loss_total"] = float(total_loss.detach().item())
-    return total_loss, logs
-
-
-# ============================================================
-# Training loop
-# ============================================================
-
-
-
-def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Train DubSeparator on speech + nospeech segments")
-    p.add_argument("--speech-root", type=Path, required=True, help="Path to segs_voice root")
-    p.add_argument("--nospeech-root", type=Path, required=True, help="Path to segs root")
-    p.add_argument("--out-dir", type=Path, required=True, help="Directory for checkpoints and logs")
-    p.add_argument("--index-json", type=Path, default=None, help="Load full speech/nospeech index from JSON instead of re-indexing WAV files")
-    p.add_argument("--save-index-json", type=Path, default=None, help="Where to save full speech/nospeech index JSON after fresh indexing (default: <out-dir>/index_full.json)")
-
-    p.add_argument("--segment-sec", type=float, default=4.0, help="Fixed model input segment length in seconds")
-    p.add_argument("--batch", type=int, default=2, help="Batch size")
-    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
-    p.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16", "fp16"], help="AMP mode")
-    p.add_argument("--tf32", action="store_true", help="Enable TF32 on CUDA")
-    p.add_argument("--save-every-epoch", type=int, default=1, help="Save numbered checkpoint every N epochs")
-    p.add_argument("--resume", type=Path, default=None, help="Checkpoint path to resume from")
-
-    p.add_argument("--loss-l1", type=float, default=1.0, help="Waveform L1 coefficient")
-    p.add_argument("--loss-mr-sc", type=float, default=1.0, help="MR spectral convergence coefficient (speech only)")
-    p.add_argument("--loss-mr-logmag", type=float, default=1.0, help="MR log-magnitude coefficient")
-
-    p.add_argument("--epoch-size", type=int, default=1000, help="Number of optimizer steps per epoch")
-    p.add_argument("--speech-prob", type=float, default=0.8, help="Sampling probability weight for speech examples")
-    p.add_argument("--nospeech-prob", type=float, default=0.2, help="Sampling probability weight for nospeech examples")
-
-    p.add_argument("--device", type=str, default="cuda", help="cuda / cpu")
-    p.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
-    p.add_argument("--seed", type=int, default=42, help="Global random seed")
-    p.add_argument("--log-every", type=int, default=10, help="Log every N steps")
-    p.add_argument("--weight-decay", type=float, default=1e-4, help="AdamW weight decay")
-    return p
-
-
-
-def main() -> None:
-    args = build_argparser().parse_args()
-    set_seed(args.seed)
-
-    device = torch.device(args.device)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but not available")
-
-    if args.tf32 and device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-
-    cfg = DubSeparatorConfig()
-    sample_rate = cfg.sample_rate
-
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-
-    print("=== indexing ===")
-    if args.index_json is not None:
-        speech_entries, nospeech_entries, loaded_meta = load_full_index_json(args.index_json, expected_sr=sample_rate)
-        speech_stats = summarize_index(speech_entries, sample_rate)
-        nospeech_stats = summarize_index(nospeech_entries, sample_rate)
-        print(f"loaded index json: {args.index_json}")
+    val_frac: float,
+    val_count: int,
+    seed: int,
+) -> Tuple[List[Any], List[Any]]:
+    n = len(items)
+    if n == 0:
+        return [], []
+    if val_count > 0:
+        nv = int(val_count)
     else:
-        speech_entries = index_speech_segments(args.speech_root, sample_rate)
-        nospeech_entries = index_nospeech_segments(args.nospeech_root, sample_rate)
-        speech_stats = summarize_index(speech_entries, sample_rate)
-        nospeech_stats = summarize_index(nospeech_entries, sample_rate)
+        nv = int(round(float(val_frac) * n))
 
-        index_json_path = args.save_index_json if args.save_index_json is not None else (args.out_dir / "index_full.json")
-        save_full_index_json(
-            index_json_path,
-            speech_entries=speech_entries,
-            nospeech_entries=nospeech_entries,
-            sample_rate=sample_rate,
-            speech_root=args.speech_root,
-            nospeech_root=args.nospeech_root,
-        )
-        print(f"saved full index json: {index_json_path}")
+    # guarantee: val uses whole songs, and train has at least 1 song if possible
+    nv = max(0, nv)
+    if n >= 2:
+        nv = min(nv, n - 1)
+    else:
+        nv = min(nv, n)
 
-    print(f"speech   : {speech_stats['count']} items, {human_hours(speech_stats['hours'])}, "
-          f"min/mean/max = {speech_stats['min_sec']:.2f}/{speech_stats['mean_sec']:.2f}/{speech_stats['max_sec']:.2f} sec")
-    print(f"nospeech : {nospeech_stats['count']} items, {human_hours(nospeech_stats['hours'])}, "
-          f"min/mean/max = {nospeech_stats['min_sec']:.2f}/{nospeech_stats['mean_sec']:.2f}/{nospeech_stats['max_sec']:.2f} sec")
+    if nv == 0:
+        return list(items), []
 
-    index_dump = {
-        "speech": speech_stats,
-        "nospeech": nospeech_stats,
-        "sample_rate": sample_rate,
-        "segment_sec": args.segment_sec,
-        "speech_root": str(args.speech_root),
-        "nospeech_root": str(args.nospeech_root),
-        "index_json": str(args.index_json) if args.index_json is not None else None,
-    }
-    (args.out_dir / "index_summary.json").write_text(json.dumps(index_dump, indent=2, ensure_ascii=False), encoding="utf-8")
+    idx = list(range(n))
+    rng = random.Random(int(seed))
+    rng.shuffle(idx)
+    val_idx = set(idx[:nv])
 
-    dataset = MixedSegmentDataset(
-        speech_entries=speech_entries,
-        nospeech_entries=nospeech_entries,
-        sample_rate=sample_rate,
-        segment_sec=args.segment_sec,
-        epoch_steps=args.epoch_size,
-        batch_size=args.batch,
-        speech_prob=args.speech_prob,
-        nospeech_prob=args.nospeech_prob,
-        seed=args.seed,
-    )
+    train_items = [items[i] for i in range(n) if i not in val_idx]
+    val_items = [items[i] for i in range(n) if i in val_idx]
+    return train_items, val_items
 
-    generator = torch.Generator()
-    generator.manual_seed(args.seed)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        drop_last=True,
-        collate_fn=collate_segments,
-        worker_init_fn=seed_worker,
-        generator=generator,
-        persistent_workers=args.num_workers > 0,
-    )
 
-    model = DubSeparator(cfg).to(device)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    mrstft = MultiResolutionSTFTLoss().to(device)
+# -------------------------
+# S3 helpers (optional)
+# -------------------------
 
-    use_scaler = args.amp.lower() == "fp16" and device.type == "cuda"
-    scaler = GradScaler("cuda", enabled=use_scaler) if device.type == "cuda" else None
-
-    start_epoch = 0
-    global_step = 0
-    if args.resume is not None:
-        start_epoch, global_step = load_checkpoint(
-            args.resume,
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-        )
-        print(f"Resumed from {args.resume} at epoch={start_epoch}, global_step={global_step}")
-
-    print("=== training ===")
-    print(f"device            : {device}")
-    print(f"params trainable  : {count_parameters(model):,}")
-    print(f"segment_sec       : {args.segment_sec}")
-    print(f"batch             : {args.batch}")
-    print(f"epoch_size steps  : {args.epoch_size}")
-    print(f"amp               : {args.amp}")
-    print(f"tf32              : {bool(args.tf32)}")
-    print(f"loss coeffs       : l1={args.loss_l1} mr_sc={args.loss_mr_sc} mr_logmag={args.loss_mr_logmag}")
-    print(f"speech/nospeech   : {args.speech_prob} / {args.nospeech_prob}")
-
-    stop_requested = {"flag": False}
-
-    def _handle_signal(signum, frame):  # type: ignore[no-untyped-def]
-        stop_requested["flag"] = True
-        print(f"\nSignal {signum} received. Will stop after current step and save checkpoint.")
-
-    signal.signal(signal.SIGINT, _handle_signal)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, _handle_signal)
-
-    epoch = start_epoch
+def build_s3_client(
+    *,
+    region: str = "",
+    endpoint_url: str = "",
+    access_key_id: str = "",
+    secret_access_key: str = "",
+    session_token: str = "",
+    profile: str = "",
+):
     try:
-        while True:
-            epoch += 1
-            model.train()
-            epoch_start = time.time()
-            running: Dict[str, float] = {
-                "loss_total": 0.0,
-                "loss_speech": 0.0,
-                "loss_nospeech": 0.0,
-                "l1_speech": 0.0,
-                "sc_speech": 0.0,
-                "logmag_speech": 0.0,
-                "l1_nospeech": 0.0,
-                "logmag_nospeech": 0.0,
-                "num_speech": 0.0,
-                "num_nospeech": 0.0,
-            }
+        import boto3
+        from botocore.config import Config as BotocoreConfig
+    except Exception as e:
+        raise RuntimeError(f"S3 requested but boto3/botocore not available: {e}")
 
-            ema: Dict[str, float] = {}
-            progress = tqdm(loader, total=args.epoch_size, desc=f"epoch {epoch:05d}", dynamic_ncols=True, leave=True)
-            for step_idx, batch in enumerate(progress, start=1):
-                if stop_requested["flag"]:
-                    raise StopTraining
+    cfg = BotocoreConfig(
+        retries={"max_attempts": 10, "mode": "adaptive"},
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
+    )
+    endpoint = endpoint_url or None
 
-                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-                optimizer.zero_grad(set_to_none=True)
+    if profile:
+        sess = boto3.session.Session(profile_name=profile, region_name=(region or None))
+        return sess.client("s3", endpoint_url=endpoint, config=cfg)
 
-                with make_autocast(device, args.amp):
-                    outputs = model(batch["mix"], batch["ref"])
+    if access_key_id and secret_access_key:
+        sess = boto3.session.Session(
+            aws_access_key_id=access_key_id,
+            aws_secret_access_key=secret_access_key,
+            aws_session_token=(session_token or None),
+            region_name=(region or None),
+        )
+        return sess.client("s3", endpoint_url=endpoint, config=cfg)
 
-                with autocast(device_type=device.type if device.type in {"cuda", "cpu"} else "cuda", enabled=False):
-                    loss, logs = compute_losses(
-                        outputs=outputs,
-                        batch=batch,
-                        mrstft=mrstft,
-                        lambda_l1=args.loss_l1,
-                        lambda_sc=args.loss_mr_sc,
-                        lambda_logmag=args.loss_mr_logmag,
-                    )
+    sess = boto3.session.Session(region_name=(region or None))
+    return sess.client("s3", endpoint_url=endpoint, config=cfg)
+
+
+def s3_upload_file(s3, local_path: Path, bucket: str, key: str) -> None:
+    # не 1-в-1 с твоим кодом, но логика та же: multipart + concurrency
+    from boto3.s3.transfer import TransferConfig
+
+    local_path = Path(local_path)
+    cfg = TransferConfig(
+        multipart_threshold=64 * 1024 * 1024,
+        multipart_chunksize=64 * 1024 * 1024,
+        max_concurrency=8,
+        use_threads=True,
+    )
+    s3.upload_file(str(local_path), bucket, key, Config=cfg)
+
+
+def join_s3_key(prefix: str, name: str) -> str:
+    p = (prefix or "").strip("/")
+    return f"{p}/{name}" if p else name
+
+
+# -------------------------
+# Validation runner
+# -------------------------
+
+def _safe_item_name(flags: Any, fallback: str) -> str:
+    # batch[6] is "flags" in твоём collate; структура может отличаться.
+    # Пытаемся вытащить что-то стабильное для имени файла.
+    try:
+        if isinstance(flags, dict):
+            for k in ("uid", "id", "key", "name", "kind", "folder"):
+                if k in flags and flags[k]:
+                    return str(flags[k])
+        if isinstance(flags, (list, tuple)) and len(flags) > 0:
+            # часто flags = list[dict] по batch
+            f0 = flags[0]
+            if isinstance(f0, dict):
+                for k in ("uid", "id", "key", "name", "kind", "folder"):
+                    if k in f0 and f0[k]:
+                        return str(f0[k])
+    except Exception:
+        pass
+    return fallback
+
+
+def _save_audio_bundle(
+    out_dir: Path,
+    *,
+    sr: int,
+    mix: torch.Tensor,        # (2,T) cpu
+    mix_target: torch.Tensor, # (2,T) cpu
+    pred: torch.Tensor,       # (4,2,T) cpu
+    tgt: torch.Tensor,        # (4,2,T) cpu
+    pm: torch.Tensor,         # (4,) cpu
+):
+    try:
+        import soundfile as sf
+    except Exception as e:
+        raise RuntimeError(f"Saving validation audio requested but soundfile is missing: {e}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _w(name: str, x: torch.Tensor):
+        x_np = x.transpose(0, 1).contiguous().numpy()  # (T,2)
+        sf.write(str(out_dir / name), x_np, sr, subtype="FLOAT")
+
+    _w("mix_in.wav", mix)
+    _w("mix_target.wav", mix_target)
+
+    for i, stem in enumerate(STEM_ORDER):
+        present = int(pm[i].item() > 0.5)
+        _w(f"pred_{stem}_p{present}.wav", pred[i])
+        _w(f"gt_{stem}_p{present}.wav", tgt[i])
+
+
+@torch.no_grad()
+def run_validation(
+    *,
+    epoch: int,
+    model: nn.Module,
+    loss_comp: LossComputer,
+    dl_val: DataLoader,
+    device: torch.device,
+    autocast_ctx,
+    weights: Dict[str, float],
+    max_batches: int,
+    save_dir: Optional[Path],
+    save_n_audio: int,
+    save_audio: bool,
+    sr: int,
+) -> Dict[str, float]:
+    was_training = model.training
+    model.eval()
+
+    sums: Dict[str, float] = {}
+    n = 0
+
+    # audio save folder per epoch
+    epoch_dir = None
+    if save_dir is not None:
+        epoch_dir = Path(save_dir) / f"epoch_{epoch:04d}"
+        epoch_dir.mkdir(parents=True, exist_ok=True)
+
+    for bidx, batch in enumerate(tqdm(dl_val, desc=f"val epoch {epoch}", dynamic_ncols=True)):
+        mix = batch[0].to(device, non_blocking=True)         # (B,2,T)
+        tgt = batch[3].to(device, non_blocking=True)         # (B,4,2,T)
+        pm  = batch[4].to(device, non_blocking=True)         # (B,4)
+        mix_target = batch[5].to(device, non_blocking=True)  # (B,2,T)
+        flags = batch[6] if len(batch) > 6 else None
+
+        with autocast_ctx:
+            out = model(mix, return_debug=False, return_tf=True)  # dict head -> (B,2,T)
+            tf_pack = out.pop("_tf")
+            pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
+            loss, stats = loss_comp(
+                pred_stems=pred,
+                tgt_stems=tgt,
+                present_mask=pm,
+                mix_target=mix_target,
+                weights=weights,
+                tf_pack=tf_pack,
+            )
+
+        # accumulate means
+        for k, v in stats.items():
+            sums[k] = sums.get(k, 0.0) + float(v.item())
+        n += 1
+
+        # optional: save first N audio examples
+        if save_audio and epoch_dir is not None and bidx < int(save_n_audio):
+            name = _safe_item_name(flags, fallback=f"sample_{bidx:04d}")
+            sample_dir = epoch_dir / name
+            # only first sample in batch
+            _save_audio_bundle(
+                sample_dir,
+                sr=sr,
+                mix=mix[0].detach().cpu(),
+                mix_target=mix_target[0].detach().cpu(),
+                pred=pred[0].detach().cpu(),
+                tgt=tgt[0].detach().cpu(),
+                pm=pm[0].detach().cpu(),
+            )
+
+        if int(max_batches) > 0 and n >= int(max_batches):
+            break
+
+    means = {k: (v / max(1, n)) for k, v in sums.items()}
+
+    if was_training:
+        model.train()
+    return means
+
+# DDP Helpers
+def ddp_enabled_from_env() -> bool:
+    return int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+def ddp_setup(backend: str = "nccl", timeout_sec: int = 1800) -> Dict[str, int]:
+    """
+    Инициализация DDP через env:// (torchrun задаёт RANK/WORLD_SIZE/LOCAL_RANK).
+    """
+    import torch.distributed as dist
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+    if world_size > 1 and not dist.is_initialized():
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=datetime.timedelta(seconds=int(timeout_sec)),
+        )
+
+    return {"world_size": world_size, "rank": rank, "local_rank": local_rank}
+
+def ddp_cleanup() -> None:
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+def ddp_barrier() -> None:
+    import torch.distributed as dist
+    if dist.is_initialized():
+        dist.barrier()
+
+def ddp_broadcast_object(obj, src: int = 0):
+    """
+    Удобно для broadcast списков/словарей (python objects) через dist.broadcast_object_list.
+    """
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        return obj
+    box = [obj]
+    dist.broadcast_object_list(box, src=src)
+    return box[0]
+
+def ddp_reduce_stats(stats: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    """
+    Усредняет скаляры stats по всем ранкам (1 all_reduce на вектор).
+    Вызывай НЕ каждый итерационный шаг, а только когда реально логируешь.
+    """
+    import torch.distributed as dist
+    if not dist.is_initialized():
+        return {k: float(v.item()) for k, v in stats.items()}
+
+    keys = sorted(stats.keys())
+    vec = torch.stack([stats[k].detach().float() for k in keys], dim=0)
+    dist.all_reduce(vec, op=dist.ReduceOp.SUM)
+    vec /= dist.get_world_size()
+
+    return {k: float(vec[i].item()) for i, k in enumerate(keys)}
+
+def item_uid_for_split(it: Any) -> str:
+    """
+    Стабильный uid для split'а по песням.
+    """
+    try:
+        if isinstance(it, dict):
+            for k in ("uid", "id", "key", "folder", "name", "full"):
+                v = it.get(k, None)
+                if v:
+                    return str(v)
+        # на случай объектов
+        for k in ("uid", "id", "key", "folder", "name", "full"):
+            if hasattr(it, k):
+                v = getattr(it, k)
+                if v:
+                    return str(v)
+    except Exception:
+        pass
+    return repr(it)
+
+# -------------------------
+# CLI
+# -------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--root", type=str, help="dataset root to scan (folders with full.wav, stems)")
+    src.add_argument("--manifest", type=str, help="manifest.csv with columns kind/full/bass/drums/instruments/vocals/melody")
+
+    p.add_argument("--recipes", type=str, required=True, help="RecipeBook JSON path")
+    p.add_argument("--out", type=str, required=True, help="output dir for checkpoints")
+
+    p.add_argument("--epochs", type=int, default=10)
+    p.add_argument("--epoch-size", type=int, default=200_000)
+    p.add_argument("--segment-sec", type=float, default=8.0)
+
+    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--num-workers", type=int, default=0)
+
+    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--wd", type=float, default=1e-2)
+    p.add_argument("--warmup-steps", type=int, default=2_000)
+
+    p.add_argument("--amp", type=str, default="bf16", choices=["off", "fp16", "bf16"])
+    p.add_argument("--tf32", type=int, default=1, help="1 to enable TF32 on matmul/conv")
+
+    p.add_argument("--grad-accum", type=int, default=1)
+    p.add_argument("--clip-grad", type=float, default=1.0)
+
+    p.add_argument("--save-every-step", type=int, default=200_000)
+    p.add_argument("--save-every-epoch", type=int, default=1)
+    p.add_argument("--log-every", type=int, default=50)
+    p.add_argument("--resume", type=str, default="")
+
+    # loss weights head
+    p.add_argument("--w-l1-head", type=float, default=1.0)
+    p.add_argument("--w-mr-head", type=float, default=1.0)
+    p.add_argument("--w-mr-sc", type=float, default=1.0)
+    p.add_argument("--w-mr-lm", type=float, default=1.0)
+    # loss tf mix
+    p.add_argument("--w-tf-mix-ri", type=float, default=0.0)
+    p.add_argument("--w-tf-mix-lm", type=float, default=0.0)
+    # loss leak
+    p.add_argument("--w-leak", type=float, default=0.2)
+    # loss silence
+    p.add_argument("--w-silence", type=float, default=0.2)
+    p.add_argument("--silence-rms", type=float, default=1e-3)
+
+    # --- validation split by songs (items)
+    p.add_argument("--val-frac", type=float, default=0.02, help="fraction of songs(items) held out for validation")
+    p.add_argument("--val-count", type=int, default=0, help="override val size by number of songs (0 = use val-frac)")
+    p.add_argument("--val-seed", type=int, default=12345, help="seed for train/val song split")
+    p.add_argument("--val-save-dir", type=str, default="val", help="subdir under --out to store val artifacts")
+    p.add_argument("--val-batch-scale", type=int, default=1)
+
+    # --- S3 for checkpoints / validation artifacts
+    p.add_argument("--s3-bucket", type=str, default="")
+    p.add_argument("--s3-prefix", type=str, default="")
+    p.add_argument("--s3-region", type=str, default="")
+    p.add_argument("--s3-endpoint-url", type=str, default="")
+    p.add_argument("--s3-access-key-id", type=str, default="")
+    p.add_argument("--s3-secret-access-key", type=str, default="")
+    p.add_argument("--s3-session-token", type=str, default="")
+    p.add_argument("--s3-profile", type=str, default="")
+
+    p.add_argument("--upload-ckpt-s3", type=int, default=0, help="1 to upload checkpoints to S3")
+    p.add_argument("--upload-val-s3", type=int, default=0, help="1 to upload validation artifacts to S3 (tar.gz)")
+
+    # --- DDP
+    p.add_argument("--ddp", type=int, default=0, help="1 to force DDP (requires torchrun env vars)")
+    p.add_argument("--ddp-backend", type=str, default="nccl", choices=["nccl", "gloo"])
+    p.add_argument("--ddp-timeout-sec", type=int, default=1800)
+    p.add_argument("--ddp-broadcast-buffers", type=int, default=0)
+    p.add_argument("--ddp-gradient-as-bucket-view", type=int, default=1)
+
+    return p.parse_args()
+
+
+# -------------------------
+# Main
+# -------------------------
+
+def main():
+    args = parse_args()
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- DDP init (torchrun sets env)
+    force_ddp = bool(int(args.ddp))
+    env_ddp = ddp_enabled_from_env()
+    use_ddp = env_ddp or force_ddp
+
+    if force_ddp and not env_ddp:
+        raise RuntimeError("DDP forced (--ddp=1) but WORLD_SIZE=1. Run with torchrun.")
+
+    ddp_info = {"world_size": 1, "rank": 0, "local_rank": 0}
+    if use_ddp:
+        ddp_info = ddp_setup(backend=args.ddp_backend, timeout_sec=int(args.ddp_timeout_sec))
+
+    rank = int(ddp_info["rank"])
+    world_size = int(ddp_info["world_size"])
+    local_rank = int(ddp_info["local_rank"])
+    main_proc = is_main_process(rank)
+
+    # --- device: one process -> one GPU (LOCAL_RANK)
+    if torch.cuda.is_available():
+        if use_ddp:
+            torch.cuda.set_device(local_rank)
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    set_tf32(bool(args.tf32))
+
+    base_seed = 1234
+    seed = base_seed + (rank if use_ddp else 0)
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # dataset items (each item ~= song)
+    if args.root:
+        items = scan_root_to_items(args.root)
+    else:
+        items = load_manifest_csv(args.manifest)
+
+    # split by full songs
+    if use_ddp:
+        if main_proc:
+            train_items0, val_items0 = split_items_train_val(
+                items,
+                val_frac=float(args.val_frac),
+                val_count=int(args.val_count),
+                seed=int(args.val_seed),
+            )
+            val_ids = [item_uid_for_split(x) for x in val_items0]
+        else:
+            val_ids = None
+
+        val_ids = ddp_broadcast_object(val_ids, src=0)
+        val_id_set = set(val_ids or [])
+
+        train_items = [it for it in items if item_uid_for_split(it) not in val_id_set]
+        val_items = [it for it in items if item_uid_for_split(it) in val_id_set]
+    else:
+        train_items, val_items = split_items_train_val(
+            items,
+            val_frac=float(args.val_frac),
+            val_count=int(args.val_count),
+            seed=int(args.val_seed),
+        )
+
+    if len(train_items) == 0:
+        raise RuntimeError("Train set is empty after split. Reduce --val-frac/--val-count or check dataset.")
+    if len(val_items) == 0 and main_proc:
+        print("[warn] validation set is empty (val_frac/val_count resulted in 0). Validation will be skipped.")
+
+    book = RecipeBook.from_json_path(args.recipes)
+    cfg = SeparatorConfig()
+
+    # train dataset
+    ds = FlexibleMixDataset(
+        train_items,
+        sr=cfg.sample_rate,
+        segment_sec=float(args.segment_sec),
+        recipe_book=book,
+        epoch_size=int(args.epoch_size),
+    )
+
+    train_sampler = None
+    if use_ddp:
+        train_sampler = DistributedSampler(
+            ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=base_seed,
+            drop_last=True,
+        )
+
+    dl = DataLoader(
+        ds,
+        batch_size=int(args.batch),
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        num_workers=int(args.num_workers),
+        pin_memory=True,
+        persistent_workers=(int(args.num_workers) > 0),
+        collate_fn=collate,
+        drop_last=True,
+        prefetch_factor=2 if int(args.num_workers) > 0 else None,
+    )
+
+    # model
+    model = StemSeparator(cfg).to(device)
+    model.train()
+
+    if use_ddp:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(
+            model,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            broadcast_buffers=bool(int(args.ddp_broadcast_buffers)),
+            gradient_as_bucket_view=bool(int(args.ddp_gradient_as_bucket_view)),
+        )
+
+    # optimizer (fused if possible)
+    opt = None
+    try:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(args.lr),
+            betas=(0.9, 0.95),
+            weight_decay=float(args.wd),
+            fused=(device.type == "cuda"),
+        )
+    except TypeError:
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(args.lr),
+            betas=(0.9, 0.95),
+            weight_decay=float(args.wd),
+        )
+    except Exception:
+        # fallback hard
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(args.lr),
+            betas=(0.9, 0.95),
+            weight_decay=float(args.wd),
+        )
+
+    steps_per_epoch = max(1, (len(dl) // max(1, int(args.grad_accum))))
+    total_steps = int(args.epochs) * steps_per_epoch
+    sched = make_scheduler(opt, total_steps=total_steps, warmup_steps=int(args.warmup_steps))
+
+    autocast_ctx, amp_dtype, use_scaler = make_autocast(args.amp, device)
+    scaler = GradScaler("cuda", enabled=use_scaler)
+
+    loss_comp = LossComputer(
+        sr=cfg.sample_rate,
+        mr_w_sc=args.w_mr_sc,
+        mr_w_lm=args.w_mr_lm,
+        silence_rms_thr=float(args.silence_rms),
+        hop=cfg.hop,
+        center=cfg.center,
+        normalized=cfg.normalized,
+    ).to(device)
+
+    weights = {
+        "w_l1_head": float(args.w_l1_head),
+        "w_mr_head": float(args.w_mr_head),
+        "w_tf_mix_ri": float(args.w_tf_mix_ri),
+        "w_tf_mix_lm": float(args.w_tf_mix_lm),
+        "w_silence": float(args.w_silence),
+        "w_leak": float(args.w_leak),
+    }
+
+    # S3 init (optional)
+    s3 = None
+    s3_bucket = (args.s3_bucket or "").strip()
+    s3_prefix = (args.s3_prefix or "").strip()
+    upload_ckpt_s3 = bool(int(args.upload_ckpt_s3))
+    upload_val_s3 = bool(int(args.upload_val_s3))
+
+    if (upload_ckpt_s3 or upload_val_s3) and not s3_bucket:
+        raise RuntimeError("S3 upload enabled but --s3-bucket is empty.")
+
+    if main_proc and (upload_ckpt_s3 or upload_val_s3) and s3_bucket:
+        s3 = build_s3_client(
+            region=args.s3_region,
+            endpoint_url=args.s3_endpoint_url,
+            access_key_id=args.s3_access_key_id,
+            secret_access_key=args.s3_secret_access_key,
+            session_token=args.s3_session_token,
+            profile=args.s3_profile,
+        )
+
+    def maybe_upload(local_path: Path, key_name: str) -> None:
+        if not main_proc:
+            return
+        if s3 is None or not s3_bucket:
+            return
+        key = join_s3_key(s3_prefix, key_name)
+        s3_upload_file(s3, local_path, bucket=s3_bucket, key=key)
+
+    # resume
+    start_epoch = 1
+    global_step = 0
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if ckpt_path.is_file():
+            start_epoch, global_step, extra = load_ckpt(
+                ckpt_path, model, opt=opt, sched=sched, scaler=scaler, map_location="cpu"
+            )
+            print(f"[resume] from {ckpt_path} epoch={start_epoch} step={global_step} extra={extra}")
+            start_epoch += 1
+        else:
+            raise FileNotFoundError(f"--resume not found: {ckpt_path}")
+
+    # train loop
+    opt.zero_grad(set_to_none=True)
+    t0 = time.time()
+
+    val_root = out_dir / str(args.val_save_dir)
+
+    for epoch in range(start_epoch, int(args.epochs) + 1):
+        ds.set_epoch(epoch)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        pbar = tqdm(dl, desc=f"epoch {epoch}/{args.epochs}", dynamic_ncols=True) if main_proc else dl
+        ema: Dict[str, float] = {}
+
+        accum = int(args.grad_accum)
+        for it, batch in enumerate(pbar):
+            mix = batch[0].to(device, non_blocking=True)         # (B,2,T)
+            tgt = batch[3].to(device, non_blocking=True)         # (B,4,2,T)
+            pm  = batch[4].to(device, non_blocking=True)         # (B,4)
+            mix_target = batch[5].to(device, non_blocking=True)  # (B,2,T)
+
+            tf_pack = None
+            with autocast_ctx:
+                return_tf = float(args.w_tf_mix_ri) > 0 or float(args.w_tf_mix_lm) > 0
+                out = model(mix, return_debug=False, return_tf=return_tf)
+                if return_tf:
+                    tf_pack = out.pop("_tf")
+                pred = torch.stack([out[s] for s in STEM_ORDER], dim=1)  # (B,4,2,T)
+
+            with torch.autocast(device_type="cuda", enabled=False):
+                loss, stats = loss_comp(
+                    pred_stems=pred.float(),
+                    tgt_stems=tgt.float(),
+                    present_mask=pm.float(),
+                    mix_target=mix_target.float(),
+                    weights=weights,
+                    tf_pack=tf_pack,
+                )
+                loss_scaled = loss / float(accum)
+
+            do_step = ((it + 1) % accum == 0)
+            sync_ctx = nullcontext()
+            if use_ddp and not do_step:
+                sync_ctx = model.no_sync()  # type: ignore[union-attr]
+            with sync_ctx:
+                if use_scaler:
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
+
+            if do_step:
+                if use_scaler:
+                    scaler.unscale_(opt)
+                if float(args.clip_grad) > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(args.clip_grad))
 
                 if use_scaler:
-                    assert scaler is not None
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    grad_norm = grad_norm_l2(model)
-                    scaler.step(optimizer)
+                    scaler.step(opt)
                     scaler.update()
                 else:
-                    loss.backward()
-                    grad_norm = grad_norm_l2(model)
-                    optimizer.step()
+                    opt.step()
 
+                opt.zero_grad(set_to_none=True)
+                sched.step()
                 global_step += 1
-                for k in running:
-                    running[k] += logs.get(k, 0.0)
 
-                extra_stats = safe_output_stats(outputs)
-                step_stats = {**logs, **extra_stats}
-                step_stats["grad_norm"] = float(grad_norm)
-                step_stats["lr"] = float(optimizer.param_groups[0]["lr"])
-                total_in_batch = logs.get("num_speech", 0.0) + logs.get("num_nospeech", 0.0)
-                step_stats["speech_frac"] = float(logs.get("num_speech", 0.0) / total_in_batch) if total_in_batch > 0 else 0.0
-                ema = update_ema_dict(ema, step_stats, decay=0.95)
+                if main_proc and (global_step % int(args.log_every)) == 0:
+                    stats_f = ddp_reduce_stats(stats) if use_ddp else {k: float(v.item()) for k, v in stats.items()}
 
-                progress.set_postfix({
-                    "loss": f"{logs['loss_total']:.4f}",
-                    "ema": f"{ema.get('loss_total', logs['loss_total']):.4f}",
-                    "sp": f"{logs.get('loss_speech', 0.0):.3f}",
-                    "ns": f"{logs.get('loss_nospeech', 0.0):.3f}",
-                    "l1": f"{(logs.get('l1_speech', 0.0) + logs.get('l1_nospeech', 0.0)):.3f}",
-                    "sc": f"{logs.get('sc_speech', 0.0):.3f}",
-                    "logm": f"{(logs.get('logmag_speech', 0.0) + logs.get('logmag_nospeech', 0.0)):.3f}",
-                    "gate": f"{extra_stats.get('crm_gate_mean', float('nan')):.3f}",
-                    "|M|": f"{extra_stats.get('mask_abs_mean', float('nan')):.3f}",
-                    "gn": f"{grad_norm:.2f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                    "sf": f"{step_stats['speech_frac']:.2f}",
-                })
+                    for k, x in stats_f.items():
+                        ema[k] = x if k not in ema else (0.9 * ema[k] + 0.1 * x)
 
-                if step_idx % args.log_every == 0 or step_idx == 1 or step_idx == args.epoch_size:
-                    avg_loss = running["loss_total"] / step_idx
-                    print(
-                        f"epoch={epoch:05d} step={step_idx:05d}/{args.epoch_size:05d} global_step={global_step:08d} "
-                        f"loss={logs['loss_total']:.6f} avg={avg_loss:.6f} "
-                        f"speech={int(logs['num_speech'])} nospeech={int(logs['num_nospeech'])} "
-                        f"grad_norm={grad_norm:.4f} lr={optimizer.param_groups[0]['lr']:.3e} "
-                        f"crm_gate={extra_stats.get('crm_gate_mean', float('nan')):.4f} mask_abs={extra_stats.get('mask_abs_mean', float('nan')):.4f}"
+                    lr = opt.param_groups[0]["lr"]
+                    pbar.set_postfix({
+                        "lr": f"{lr:.2e}",
+                        "loss": f"{ema.get('loss_total', stats_f['loss_total']):.4f}",
+                        "l1h": f"{ema.get('l1_head', stats_f['l1_head']):.3f}",
+                        "mrh": f"{ema.get('mr_head', stats_f['mr_head']):.3f}",
+                        "sil": f"{ema.get('silence', stats_f['silence']):.3f}",
+                        "leak": f"{ema.get('leak', stats_f['leak']):.3f}",
+                        "tf_ri_mix": f"{ema.get('tf_ri_mix', stats_f['tf_ri_mix']):.3f}",
+                        "tf_lm_mix": f"{ema.get('tf_lm_mix', stats_f['tf_lm_mix']):.3f}",
+                        "tf_ri_4096": f"{ema.get('tf_ri_4096', stats_f['tf_ri_4096']):.3f}",
+                        "tf_lm_4096": f"{ema.get('tf_lm_4096', stats_f['tf_lm_4096']):.3f}",
+                        "tf_ri_2048": f"{ema.get('tf_ri_2048', stats_f['tf_ri_2048']):.3f}",
+                        "tf_lm_2048": f"{ema.get('tf_lm_2048', stats_f['tf_lm_2048']):.3f}",
+                    })
+
+                # step ckpt
+                if main_proc and int(args.save_every_step) > 0 and (global_step % int(args.save_every_step)) == 0:
+                    ckpt_step = out_dir / f"ckpt_step_{global_step:08d}.pt"
+                    save_ckpt(
+                        ckpt_step,
+                        model=model,
+                        opt=opt,
+                        sched=sched,
+                        scaler=scaler if use_scaler else None,
+                        epoch=epoch,
+                        step=global_step,
+                        cfg=cfg,
+                        extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
                     )
-            progress.close()
+                    save_ckpt(
+                        out_dir / "ckpt_last.pt",
+                        model=model,
+                        opt=opt,
+                        sched=sched,
+                        scaler=scaler if use_scaler else None,
+                        epoch=epoch,
+                        step=global_step,
+                        cfg=cfg,
+                        extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
+                    )
 
-            elapsed = time.time() - epoch_start
-            denom = float(args.epoch_size)
-            print(
-                f"[epoch {epoch:05d}] "
-                f"loss={running['loss_total']/denom:.6f} "
-                f"speech_loss={running['loss_speech']/denom:.6f} "
-                f"nospeech_loss={running['loss_nospeech']/denom:.6f} "
-                f"l1_speech={running['l1_speech']/denom:.6f} "
-                f"sc_speech={running['sc_speech']/denom:.6f} "
-                f"logmag_speech={running['logmag_speech']/denom:.6f} "
-                f"l1_nospeech={running['l1_nospeech']/denom:.6f} "
-                f"logmag_nospeech={running['logmag_nospeech']/denom:.6f} "
-                f"speech_count/step={running['num_speech']/denom:.3f} "
-                f"nospeech_count/step={running['num_nospeech']/denom:.3f} "
-                f"ema_loss={ema.get('loss_total', 0.0):.6f} "
-                f"ema_gate={ema.get('crm_gate_mean', float('nan')):.6f} "
-                f"ema_mask_abs={ema.get('mask_abs_mean', float('nan')):.6f} "
-                f"ema_grad_norm={ema.get('grad_norm', float('nan')):.6f} "
-                f"time={elapsed:.1f}s"
-            )
+                    if upload_ckpt_s3:
+                        maybe_upload(ckpt_step, key_name=f"ckpt/ckpt_step_{global_step:08d}.pt")
+                        maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
 
-            last_ckpt = args.out_dir / "last.pt"
-            save_checkpoint(
-                last_ckpt,
+        # end epoch: save epoch ckpt (by epoch counter, not by global_step)
+        if main_proc and int(args.save_every_epoch) > 0 and (epoch % int(args.save_every_epoch)) == 0:
+            ckpt_epoch = out_dir / f"ckpt_epoch_{epoch:04d}.pt"
+            save_ckpt(
+                ckpt_epoch,
                 model=model,
-                optimizer=optimizer,
-                scaler=scaler,
+                opt=opt,
+                sched=sched,
+                scaler=scaler if use_scaler else None,
                 epoch=epoch,
-                global_step=global_step,
-                args=args,
+                step=global_step,
+                cfg=cfg,
+                extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
             )
-            if args.save_every_epoch > 0 and epoch % args.save_every_epoch == 0:
-                numbered = args.out_dir / f"epoch_{epoch:05d}.pt"
-                save_checkpoint(
-                    numbered,
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    args=args,
-                )
+            if upload_ckpt_s3:
+                maybe_upload(ckpt_epoch, key_name=f"ckpt/ckpt_epoch_{epoch:04d}.pt")
 
-    except StopTraining:
-        print("Stopping requested. Saving interrupt checkpoint...")
-        save_checkpoint(
-            args.out_dir / "interrupt.pt",
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            global_step=global_step,
-            args=args,
-        )
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt. Saving interrupt checkpoint...")
-        save_checkpoint(
-            args.out_dir / "interrupt.pt",
-            model=model,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            global_step=global_step,
-            args=args,
-        )
-        raise
+        if main_proc:
+            # always update last
+            save_ckpt(
+                out_dir / "ckpt_last.pt",
+                model=model,
+                opt=opt,
+                sched=sched,
+                scaler=scaler if use_scaler else None,
+                epoch=epoch,
+                step=global_step,
+                cfg=cfg,
+                extra={"segment_sec": float(args.segment_sec), "amp": args.amp, "tf32": int(args.tf32)},
+            )
+            if upload_ckpt_s3:
+                maybe_upload(out_dir / "ckpt_last.pt", key_name="ckpt/ckpt_last.pt")
+
+        # --- validation after epoch
+        if use_ddp:
+            ddp_barrier()
+
+        if len(val_items) > 0:
+            val_means = run_validation_full_tracks(
+                epoch=epoch,
+                model=model,
+                loss_comp=loss_comp,
+                val_items=val_items,
+                device=device,
+                autocast_ctx=autocast_ctx,
+                weights=weights,
+                seg_len=int(round(float(args.segment_sec) * float(cfg.sample_rate))),  # 8s chunks
+                sr=int(cfg.sample_rate),
+                silence_rms_thr=float(args.silence_rms),
+                use_ddp=use_ddp,
+                rank=rank,
+                world_size=world_size,
+                STEM_ORDER=STEM_ORDER,
+                batch_size=args.batch * args.val_batch_scale,
+                io_workers=args.num_workers,
+                prefetch_tracks=2 * args.num_workers,
+            )
+
+            if main_proc:
+                print(f"Validation epoch {epoch}: {val_means}")
+                epoch_dir = val_root / f"epoch_{epoch:04d}"
+                epoch_dir.mkdir(parents=True, exist_ok=True)
+                metrics_path = epoch_dir / "metrics.json"
+                with metrics_path.open("w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "epoch": int(epoch),
+                            "global_step": int(global_step),
+                            "val_tracks": int(len(val_items)),
+                            "metrics": val_means,
+                        },
+                        f,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+
+                if upload_val_s3:
+                    base_name = str(epoch_dir)
+                    archive_path = Path(shutil.make_archive(base_name, "gztar", root_dir=str(epoch_dir)))
+                    maybe_upload(archive_path, key_name=f"val/epoch_{epoch:04d}.tar.gz")
+
+        if use_ddp:
+            ddp_barrier()
+
+    dt = time.time() - t0
+    print(f"[done] time={dt/3600:.2f}h, steps={global_step}, out={out_dir}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        ddp_cleanup()
