@@ -735,6 +735,9 @@ def main() -> None:
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
 
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
     cfg = DubSeparatorConfig()
     sample_rate = cfg.sample_rate
 
@@ -804,10 +807,16 @@ def main() -> None:
         worker_init_fn=seed_worker,
         generator=generator,
         persistent_workers=args.num_workers > 0,
+        prefetch_factor=args.num_workers*2 if args.num_workers else None,
     )
 
     model = DubSeparator(cfg).to(device)
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        fused=(device.type == "cuda"),
+    )
     mrstft = MultiResolutionSTFTLoss().to(device)
 
     use_scaler = args.amp.lower() == "fp16" and device.type == "cuda"
@@ -867,6 +876,9 @@ def main() -> None:
 
             ema: Dict[str, float] = {}
             progress = tqdm(loader, total=args.epoch_size, desc=f"epoch {epoch:05d}", dynamic_ncols=True, leave=True)
+            log_every = max(1, int(args.log_every))
+            last_grad_norm = float("nan")
+            last_extra_stats: Dict[str, float] = {}
             for step_idx, batch in enumerate(progress, start=1):
                 if stop_requested["flag"]:
                     raise StopTraining
@@ -890,51 +902,53 @@ def main() -> None:
                 if use_scaler:
                     assert scaler is not None
                     scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    grad_norm = grad_norm_l2(model)
+
+                    should_log = (step_idx % log_every == 0) or (step_idx == 1) or (step_idx == args.epoch_size)
+                    if should_log:
+                        scaler.unscale_(optimizer)
+                        last_grad_norm = grad_norm_l2(model)
+
                     scaler.step(optimizer)
                     scaler.update()
                 else:
                     loss.backward()
-                    grad_norm = grad_norm_l2(model)
+
+                    should_log = (step_idx % log_every == 0) or (step_idx == 1) or (step_idx == args.epoch_size)
+                    if should_log:
+                        last_grad_norm = grad_norm_l2(model)
+
                     optimizer.step()
 
                 global_step += 1
                 for k in running:
                     running[k] += logs.get(k, 0.0)
 
-                extra_stats = safe_output_stats(outputs)
-                step_stats = {**logs, **extra_stats}
-                step_stats["grad_norm"] = float(grad_norm)
-                step_stats["lr"] = float(optimizer.param_groups[0]["lr"])
-                total_in_batch = logs.get("num_speech", 0.0) + logs.get("num_nospeech", 0.0)
-                step_stats["speech_frac"] = float(logs.get("num_speech", 0.0) / total_in_batch) if total_in_batch > 0 else 0.0
-                ema = update_ema_dict(ema, step_stats, decay=0.95)
+                should_log = (step_idx % log_every == 0) or (step_idx == 1) or (step_idx == args.epoch_size)
+                if should_log:
+                    last_extra_stats = safe_output_stats(outputs)
 
-                progress.set_postfix({
-                    "loss": f"{logs['loss_total']:.4f}",
-                    "ema": f"{ema.get('loss_total', logs['loss_total']):.4f}",
-                    "sp": f"{logs.get('loss_speech', 0.0):.3f}",
-                    "ns": f"{logs.get('loss_nospeech', 0.0):.3f}",
-                    "l1": f"{(logs.get('l1_speech', 0.0) + logs.get('l1_nospeech', 0.0)):.3f}",
-                    "sc": f"{logs.get('sc_speech', 0.0):.3f}",
-                    "logm": f"{(logs.get('logmag_speech', 0.0) + logs.get('logmag_nospeech', 0.0)):.3f}",
-                    "gate": f"{extra_stats.get('crm_gate_mean', float('nan')):.3f}",
-                    "|M|": f"{extra_stats.get('mask_abs_mean', float('nan')):.3f}",
-                    "gn": f"{grad_norm:.2f}",
-                    "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
-                    "sf": f"{step_stats['speech_frac']:.2f}",
-                })
+                    step_stats = {**logs, **last_extra_stats}
+                    step_stats["grad_norm"] = float(last_grad_norm)
+                    step_stats["lr"] = float(optimizer.param_groups[0]["lr"])
+                    total_in_batch = logs.get("num_speech", 0.0) + logs.get("num_nospeech", 0.0)
+                    step_stats["speech_frac"] = float(
+                        logs.get("num_speech", 0.0) / total_in_batch) if total_in_batch > 0 else 0.0
+                    ema = update_ema_dict(ema, step_stats, decay=0.95)
 
-                if step_idx % args.log_every == 0 or step_idx == 1 or step_idx == args.epoch_size:
-                    avg_loss = running["loss_total"] / step_idx
-                    print(
-                        f"epoch={epoch:05d} step={step_idx:05d}/{args.epoch_size:05d} global_step={global_step:08d} "
-                        f"loss={logs['loss_total']:.6f} avg={avg_loss:.6f} "
-                        f"speech={int(logs['num_speech'])} nospeech={int(logs['num_nospeech'])} "
-                        f"grad_norm={grad_norm:.4f} lr={optimizer.param_groups[0]['lr']:.3e} "
-                        f"crm_gate={extra_stats.get('crm_gate_mean', float('nan')):.4f} mask_abs={extra_stats.get('mask_abs_mean', float('nan')):.4f}"
-                    )
+                    progress.set_postfix({
+                        "loss": f"{logs['loss_total']:.4f}",
+                        "ema": f"{ema.get('loss_total', logs['loss_total']):.4f}",
+                        "sp": f"{logs.get('loss_speech', 0.0):.3f}",
+                        "ns": f"{logs.get('loss_nospeech', 0.0):.3f}",
+                        "l1": f"{(logs.get('l1_speech', 0.0) + logs.get('l1_nospeech', 0.0)):.3f}",
+                        "sc": f"{logs.get('sc_speech', 0.0):.3f}",
+                        "logm": f"{(logs.get('logmag_speech', 0.0) + logs.get('logmag_nospeech', 0.0)):.3f}",
+                        "gate": f"{last_extra_stats.get('crm_gate_mean', float('nan')):.3f}",
+                        "|M|": f"{last_extra_stats.get('mask_abs_mean', float('nan')):.3f}",
+                        "gn": f"{last_grad_norm:.2f}",
+                        "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                        "sf": f"{step_stats['speech_frac']:.2f}",
+                    })
             progress.close()
 
             elapsed = time.time() - epoch_start
