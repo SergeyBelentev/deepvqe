@@ -158,6 +158,73 @@ def summarize_index(entries: Sequence[Dict[str, Any]], sample_rate: int) -> Dict
     }
 
 
+def save_full_index_json(
+    path: Path,
+    *,
+    speech_entries: Sequence[Dict[str, Any]],
+    nospeech_entries: Sequence[Dict[str, Any]],
+    sample_rate: int,
+    speech_root: Optional[Path],
+    nospeech_root: Optional[Path],
+) -> None:
+    payload = {
+        "version": 1,
+        "sample_rate": int(sample_rate),
+        "speech_root": str(speech_root) if speech_root is not None else None,
+        "nospeech_root": str(nospeech_root) if nospeech_root is not None else None,
+        "speech_entries": list(speech_entries),
+        "nospeech_entries": list(nospeech_entries),
+        "speech_summary": summarize_index(speech_entries, sample_rate),
+        "nospeech_summary": summarize_index(nospeech_entries, sample_rate),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _normalize_loaded_entry(entry: Dict[str, Any], *, kind: str) -> Dict[str, Any]:
+    required = ["id", "mix_path", "ref_path", "trimmed_frames"]
+    for key in required:
+        if key not in entry:
+            raise SegmentIndexError(f"Loaded {kind} index entry is missing key: {key}")
+
+    norm = {
+        "kind": kind,
+        "id": str(entry["id"]),
+        "mix_path": str(entry["mix_path"]),
+        "ref_path": str(entry["ref_path"]),
+        "target_path": str(entry["target_path"]) if entry.get("target_path") is not None else None,
+        "mix_frames": int(entry.get("mix_frames", entry["trimmed_frames"])),
+        "ref_frames": int(entry.get("ref_frames", entry["trimmed_frames"])),
+        "target_frames": int(entry.get("target_frames", 0)),
+        "trimmed_frames": int(entry["trimmed_frames"]),
+        "relpath": str(entry.get("relpath", "")),
+    }
+    return norm
+
+
+def load_full_index_json(path: Path, *, expected_sr: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    sr = int(payload.get("sample_rate", -1))
+    if sr != int(expected_sr):
+        raise SegmentIndexError(f"Index JSON sample_rate={sr} does not match expected sample_rate={expected_sr}: {path}")
+
+    speech_entries = [_normalize_loaded_entry(e, kind="speech") for e in payload.get("speech_entries", [])]
+    nospeech_entries = [_normalize_loaded_entry(e, kind="nospeech") for e in payload.get("nospeech_entries", [])]
+
+    if not speech_entries and not nospeech_entries:
+        raise SegmentIndexError(f"Loaded index JSON contains no entries: {path}")
+
+    meta = {
+        "version": int(payload.get("version", 1)),
+        "sample_rate": sr,
+        "speech_root": payload.get("speech_root"),
+        "nospeech_root": payload.get("nospeech_root"),
+        "speech_summary": payload.get("speech_summary"),
+        "nospeech_summary": payload.get("nospeech_summary"),
+    }
+    return speech_entries, nospeech_entries, meta
+
+
 # ============================================================
 # Audio loading and dataset
 # ============================================================
@@ -455,7 +522,7 @@ def load_checkpoint(
     scaler: Optional[GradScaler],
     device: torch.device,
 ) -> Tuple[int, int]:
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model"], strict=True)
     optimizer.load_state_dict(ckpt["optimizer"])
     if scaler is not None and ckpt.get("scaler") is not None:
@@ -559,12 +626,13 @@ def compute_losses(
     lambda_sc: float,
     lambda_logmag: float,
 ) -> Tuple[Tensor, Dict[str, float]]:
-    estimate = outputs["estimate_waveform"]
-    target = batch["target"]
-    valid_mask = batch["valid_mask"]
-    is_speech = batch["is_speech"]
+    # Losses are always computed in fp32, outside autocast.
+    estimate = outputs["estimate_waveform"].float()
+    target = batch["target"].float()
+    valid_mask = batch["valid_mask"].float()
+    is_speech = batch["is_speech"].bool()
 
-    total_loss = estimate.new_zeros(())
+    total_loss = estimate.new_zeros((), dtype=torch.float32)
     logs: Dict[str, float] = {
         "loss_total": 0.0,
         "loss_speech": 0.0,
@@ -626,6 +694,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--speech-root", type=Path, required=True, help="Path to segs_voice root")
     p.add_argument("--nospeech-root", type=Path, required=True, help="Path to segs root")
     p.add_argument("--out-dir", type=Path, required=True, help="Directory for checkpoints and logs")
+    p.add_argument("--index-json", type=Path, default=None, help="Load full speech/nospeech index from JSON instead of re-indexing WAV files")
+    p.add_argument("--save-index-json", type=Path, default=None, help="Where to save full speech/nospeech index JSON after fresh indexing (default: <out-dir>/index_full.json)")
 
     p.add_argument("--segment-sec", type=float, default=4.0, help="Fixed model input segment length in seconds")
     p.add_argument("--batch", type=int, default=2, help="Batch size")
@@ -668,17 +738,36 @@ def main() -> None:
     cfg = DubSeparatorConfig()
     sample_rate = cfg.sample_rate
 
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+
     print("=== indexing ===")
-    speech_entries = index_speech_segments(args.speech_root, sample_rate)
-    nospeech_entries = index_nospeech_segments(args.nospeech_root, sample_rate)
-    speech_stats = summarize_index(speech_entries, sample_rate)
-    nospeech_stats = summarize_index(nospeech_entries, sample_rate)
+    if args.index_json is not None:
+        speech_entries, nospeech_entries, loaded_meta = load_full_index_json(args.index_json, expected_sr=sample_rate)
+        speech_stats = summarize_index(speech_entries, sample_rate)
+        nospeech_stats = summarize_index(nospeech_entries, sample_rate)
+        print(f"loaded index json: {args.index_json}")
+    else:
+        speech_entries = index_speech_segments(args.speech_root, sample_rate)
+        nospeech_entries = index_nospeech_segments(args.nospeech_root, sample_rate)
+        speech_stats = summarize_index(speech_entries, sample_rate)
+        nospeech_stats = summarize_index(nospeech_entries, sample_rate)
+
+        index_json_path = args.save_index_json if args.save_index_json is not None else (args.out_dir / "index_full.json")
+        save_full_index_json(
+            index_json_path,
+            speech_entries=speech_entries,
+            nospeech_entries=nospeech_entries,
+            sample_rate=sample_rate,
+            speech_root=args.speech_root,
+            nospeech_root=args.nospeech_root,
+        )
+        print(f"saved full index json: {index_json_path}")
+
     print(f"speech   : {speech_stats['count']} items, {human_hours(speech_stats['hours'])}, "
           f"min/mean/max = {speech_stats['min_sec']:.2f}/{speech_stats['mean_sec']:.2f}/{speech_stats['max_sec']:.2f} sec")
     print(f"nospeech : {nospeech_stats['count']} items, {human_hours(nospeech_stats['hours'])}, "
           f"min/mean/max = {nospeech_stats['min_sec']:.2f}/{nospeech_stats['mean_sec']:.2f}/{nospeech_stats['max_sec']:.2f} sec")
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
     index_dump = {
         "speech": speech_stats,
         "nospeech": nospeech_stats,
@@ -686,8 +775,9 @@ def main() -> None:
         "segment_sec": args.segment_sec,
         "speech_root": str(args.speech_root),
         "nospeech_root": str(args.nospeech_root),
+        "index_json": str(args.index_json) if args.index_json is not None else None,
     }
-    (args.out_dir / "index_summary.json").write_text(json.dumps(index_dump, indent=2), encoding="utf-8")
+    (args.out_dir / "index_summary.json").write_text(json.dumps(index_dump, indent=2, ensure_ascii=False), encoding="utf-8")
 
     dataset = MixedSegmentDataset(
         speech_entries=speech_entries,
@@ -786,6 +876,8 @@ def main() -> None:
 
                 with make_autocast(device, args.amp):
                     outputs = model(batch["mix"], batch["ref"])
+
+                with autocast(device_type=device.type if device.type in {"cuda", "cpu"} else "cuda", enabled=False):
                     loss, logs = compute_losses(
                         outputs=outputs,
                         batch=batch,
