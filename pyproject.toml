@@ -11,6 +11,7 @@ dependencies = [
     "onnx==1.17.0",
     "onnxruntime==1.19.2",
     "onnxsim==0.4.36",
+    "pedalboard>=0.9.22",
     "ptflops==0.7.3",
     "pydantic>=2.12.5",
     "soundfile>=0.13.1",
