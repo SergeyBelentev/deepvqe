@@ -23,7 +23,11 @@ from tqdm.auto import tqdm
 
 from dub_separator_optimized import DubSeparator, DubSeparatorConfig
 
+import os
+import pathlib
 
+if os.name != "nt":
+    pathlib.WindowsPath = pathlib.PosixPath  # type: ignore[attr-defined]
 # ============================================================
 # Indexing
 # ============================================================
