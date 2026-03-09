@@ -13,7 +13,7 @@ from torch import Tensor
 from torch.amp import autocast
 from tqdm.auto import tqdm
 
-from dub_separator import BandSpec, DubSeparator, DubSeparatorConfig
+from dub_separator_optimized import BandSpec, DubSeparator, DubSeparatorConfig
 
 
 # ============================================================
