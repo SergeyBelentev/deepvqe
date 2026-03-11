@@ -1116,7 +1116,7 @@ def main() -> None:
         worker_init_fn=seed_worker,
         generator=generator,
         persistent_workers=args.num_workers > 0,
-        prefetch_factor=(args.num_workers * 2) if args.num_workers > 0 else None,
+        prefetch_factor=2 if args.num_workers > 0 else None,
     )
 
     model = DubSeparator(cfg).to(device)
