@@ -1248,15 +1248,6 @@ def main() -> None:
                         "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                     })
 
-                    avg_loss = running["loss_total"] / step_idx
-                    print(
-                        f"epoch={epoch:05d} step={step_idx:05d}/{args.epoch_size:05d} global_step={global_step:08d} "
-                        f"loss={logs['loss_total']:.6f} avg={avg_loss:.6f} "
-                        f"grad_norm={grad_norm:.4f} lr={optimizer.param_groups[0]['lr']:.3e} "
-                        f"crm_gate={extra_stats.get('crm_gate_mean', float('nan')):.4f} "
-                        f"mask_abs={extra_stats.get('mask_abs_mean', float('nan')):.4f}"
-                    )
-
             progress.close()
 
             elapsed = time.time() - epoch_start
