@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass, fields
 from pathlib import Path
+import pathlib
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
@@ -13,6 +15,9 @@ from torch.amp import autocast
 from tqdm.auto import tqdm
 
 from dub_separator_optimized import BandSpec, DubSeparator, DubSeparatorConfig
+
+if os.name == "nt":
+    pathlib.PosixPath = pathlib.WindowsPath   # type: ignore[attr-defined]
 
 
 def build_amp_dtype(amp_mode: str) -> torch.dtype | None:
